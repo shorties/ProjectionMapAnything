@@ -3,12 +3,15 @@
 Uses the calibration mapping (map_x, map_y) produced by Gray code calibration
 to warp a camera-space depth map into projector-space coordinates.
 
+Output convention: near = dark (0), far = bright (1), grayscale (R=G=B).
+This matches VACE's training data from Depth Anything V2.
+
 Two approaches:
 1. warp_depth_to_projector() — warp raw depth float values (legacy)
 2. build_warped_depth_image() — create a depth IMAGE in camera space first
-   (with CLAHE, percentile clip, gamma, etc.) then warp it identically to
-   how RGB is warped.  This is the proven approach from the standalone app
-   that produces ControlNet-optimized depth output.
+   (with optional CLAHE, percentile clip, gamma, etc.) then warp it
+   identically to how RGB is warped.  The proven approach from the
+   standalone app.  Defaults are VACE-optimized (simple min-max range).
 """
 
 from __future__ import annotations

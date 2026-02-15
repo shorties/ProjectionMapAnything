@@ -16,18 +16,20 @@ from scope.core.pipelines.base_schema import (
 
 
 class ProMapAnythingConfig(BasePipelineConfig):
-    """Projection mapping depth preprocessor.
+    """Projection mapping depth preprocessor (VACE-optimized).
 
     Appears in the **Preprocessor** dropdown.  Output feeds directly into the
-    main ControlNet pipeline as depth conditioning.
+    main pipeline as VACE depth conditioning.  Outputs grayscale depth maps
+    with near=dark, far=bright — matching VACE's training data distribution.
     """
 
     pipeline_id = "promapanything-vj-depth"
     pipeline_name = "ProMapAnything VJ Tools"
     pipeline_description = (
         "Projection mapping depth preprocessor — calibrates projector-camera "
-        "geometry via Gray code structured light patterns and outputs a depth "
-        "map re-projected to the projector's perspective for ControlNet conditioning."
+        "geometry via Gray code structured light patterns and outputs a "
+        "VACE-optimized grayscale depth map re-projected to the projector's "
+        "perspective.  Near=dark, far=bright."
     )
 
     supports_prompts = False
@@ -216,30 +218,42 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=14, label="Bit Threshold"),
     )
 
-    # -- ControlNet depth output settings -------------------------------------
+    # -- Depth output settings (VACE-optimized defaults) ----------------------
+    #
+    # VACE was trained on simple min-max normalized depth from Depth Anything V2.
+    # Defaults match that: no CLAHE, full range, no colormap.  Adjust only if
+    # you know what you're doing — changing these alters the depth distribution
+    # that VACE's VAE encoder expects.
 
     depth_equalize: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "Apply CLAHE histogram equalization for maximum contrast in the "
-            "depth output — optimized for ControlNet consumption."
+            "Apply CLAHE histogram equalization.  OFF by default — VACE "
+            "expects simple min-max normalized depth.  Enable only if you "
+            "need extra local contrast (e.g. for ControlNet)."
         ),
         json_schema_extra=ui_field_config(order=20, label="CLAHE Equalize"),
     )
 
     depth_clip_lo: float = Field(
-        default=2.0,
+        default=0.0,
         ge=0.0,
         le=49.0,
-        description="Lower percentile clip — removes darkest outliers",
+        description=(
+            "Lower percentile clip.  0 = use full range (VACE default).  "
+            "Increase to remove dark outliers."
+        ),
         json_schema_extra=ui_field_config(order=21, label="Clip Low %"),
     )
 
     depth_clip_hi: float = Field(
-        default=98.0,
+        default=100.0,
         ge=51.0,
         le=100.0,
-        description="Upper percentile clip — removes brightest outliers",
+        description=(
+            "Upper percentile clip.  100 = use full range (VACE default).  "
+            "Decrease to remove bright outliers."
+        ),
         json_schema_extra=ui_field_config(order=22, label="Clip High %"),
     )
 
@@ -247,7 +261,10 @@ class ProMapAnythingConfig(BasePipelineConfig):
         default=1.0,
         ge=0.2,
         le=5.0,
-        description="Gamma correction (< 1 brightens darks, > 1 darkens darks)",
+        description=(
+            "Gamma correction (< 1 brightens darks, > 1 darkens darks).  "
+            "1.0 = no change (VACE default)."
+        ),
         json_schema_extra=ui_field_config(order=23, label="Gamma"),
     )
 
@@ -255,7 +272,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         default=1.0,
         ge=0.1,
         le=3.0,
-        description="Contrast multiplier for the depth map",
+        description="Contrast multiplier.  1.0 = no change (VACE default).",
         json_schema_extra=ui_field_config(order=24, label="Depth Scale"),
     )
 
@@ -263,7 +280,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         default=0.0,
         ge=-0.5,
         le=0.5,
-        description="Brightness offset added to the depth map",
+        description="Brightness offset.  0.0 = no change (VACE default).",
         json_schema_extra=ui_field_config(order=25, label="Depth Offset"),
     )
 
@@ -272,22 +289,20 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ge=0.0,
         le=20.0,
         description=(
-            "Gaussian blur radius applied to the depth map. Reduces noise "
-            "and flickering between frames."
+            "Gaussian blur radius.  Reduces flicker between frames.  "
+            "0 = sharp (VACE default)."
         ),
         json_schema_extra=ui_field_config(order=26, label="Depth Blur"),
     )
 
     depth_invert: bool = Field(
         default=False,
-        description="Invert the depth map (swap near and far)",
+        description=(
+            "Invert depth polarity (swap near/far).  OFF = near is dark, "
+            "far is bright — matches VACE training data.  Only enable if "
+            "your depth model outputs inverted values."
+        ),
         json_schema_extra=ui_field_config(order=27, label="Invert Depth"),
-    )
-
-    colormap: Literal["grayscale", "turbo", "viridis", "magma"] = Field(
-        default="grayscale",
-        description="Colormap applied to the depth visualization",
-        json_schema_extra=ui_field_config(order=28, label="Colormap"),
     )
 
     temporal_smoothing: float = Field(

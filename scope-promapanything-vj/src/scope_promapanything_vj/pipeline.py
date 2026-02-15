@@ -229,14 +229,13 @@ class ProMapAnythingPipeline(Pipeline):
         depth_offset = kwargs.get("depth_offset", 0.0)
         depth_blur = kwargs.get("depth_blur", 0.0)
         depth_invert = kwargs.get("depth_invert", False)
-        colormap = kwargs.get("colormap", "grayscale")
         temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
         feed_name = kwargs.get("external_app_feed", "depth_bw")
 
-        # ControlNet output settings
-        depth_equalize = kwargs.get("depth_equalize", True)
-        depth_clip_lo = kwargs.get("depth_clip_lo", 2.0)
-        depth_clip_hi = kwargs.get("depth_clip_hi", 98.0)
+        # VACE-optimized depth output settings (defaults match VACE training data)
+        depth_equalize = kwargs.get("depth_equalize", False)
+        depth_clip_lo = kwargs.get("depth_clip_lo", 0.0)
+        depth_clip_hi = kwargs.get("depth_clip_hi", 100.0)
         depth_gamma = kwargs.get("depth_gamma", 1.0)
 
         # Pipeline mode
@@ -246,7 +245,7 @@ class ProMapAnythingPipeline(Pipeline):
         if self._depth_source == "external_app":
             result = self._call_external_app(
                 frame, feed_name, depth_scale, depth_offset,
-                depth_blur, depth_invert, colormap, temporal_smoothing,
+                depth_blur, depth_invert, "grayscale", temporal_smoothing,
             )
             self._update_projector(kwargs, result["video"])
             return result
@@ -318,6 +317,7 @@ class ProMapAnythingPipeline(Pipeline):
         if has_calib and pipeline_mode == "depth_warp_ai":
             # Default: Depth -> Warp -> AI
             # Warp depth to projector perspective, AI generates in projector space
+            # VACE requires grayscale depth (R=G=B), near=dark, far=bright
             rgb = build_warped_depth_image(
                 depth,
                 self._map_x,
@@ -333,7 +333,7 @@ class ProMapAnythingPipeline(Pipeline):
                 equalize=depth_equalize,
                 invert=depth_invert,
                 blur=depth_blur,
-                colormap=colormap,
+                colormap="grayscale",
                 device=self.device,
             )
         else:
@@ -358,18 +358,9 @@ class ProMapAnythingPipeline(Pipeline):
                 ksize = int(depth_blur) * 2 + 1
                 depth_img = cv2.GaussianBlur(depth_img, (ksize, ksize), 0)
 
-            # Apply colormap
+            # Always grayscale for VACE (R=G=B)
             depth_uint8 = (depth_img * 255).clip(0, 255).astype(np.uint8)
-            if colormap == "grayscale":
-                depth_bgr = cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2BGR)
-            else:
-                cv_maps = {
-                    "turbo": cv2.COLORMAP_TURBO,
-                    "viridis": cv2.COLORMAP_VIRIDIS,
-                    "magma": cv2.COLORMAP_MAGMA,
-                }
-                cv_id = cv_maps.get(colormap, cv2.COLORMAP_TURBO)
-                depth_bgr = cv2.applyColorMap(depth_uint8, cv_id)
+            depth_bgr = cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2BGR)
             depth_rgb = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)
             rgb = torch.from_numpy(
                 depth_rgb.astype(np.float32) / 255.0

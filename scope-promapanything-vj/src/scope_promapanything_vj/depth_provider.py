@@ -33,8 +33,9 @@ class DepthProvider(ABC):
         Returns
         -------
         torch.Tensor
-            Shape (H, W), float32, values normalised to [0, 1] where
-            0 = near, 1 = far (or vice-versa depending on model).
+            Shape (H, W), float32, values normalised to [0, 1].
+            Convention: 0 = near (dark), 1 = far (bright).
+            This matches VACE's expected depth polarity.
         """
 
 
