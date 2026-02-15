@@ -360,7 +360,8 @@ def main() -> None:
     idx = min(args.monitor, len(monitors) - 1)
     _mon = monitors[idx]
     _mode = _glfw.get_video_mode(_mon)
-    _mon_name = _glfw.get_monitor_name(_mon)
+    _mon_name_raw = _glfw.get_monitor_name(_mon)
+    _mon_name = _mon_name_raw.decode() if isinstance(_mon_name_raw, bytes) else _mon_name_raw
     projector_config = {
         "width": _mode.size.width,
         "height": _mode.size.height,
