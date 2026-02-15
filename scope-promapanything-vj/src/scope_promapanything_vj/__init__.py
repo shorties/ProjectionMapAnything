@@ -3,12 +3,6 @@ from scope.core.plugins.hookspecs import hookimpl
 
 @hookimpl
 def register_pipelines(register):
-    from .pipeline import (
-        ProMapAnythingEffectsPipeline,
-        ProMapAnythingPipeline,
-        ProMapAnythingPreviewPipeline,
-    )
+    from .pipeline import ProMapAnythingPipeline
 
     register(ProMapAnythingPipeline)
-    register(ProMapAnythingPreviewPipeline)
-    register(ProMapAnythingEffectsPipeline)
