@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import logging
 import sys
 import threading
@@ -280,6 +281,40 @@ class ProjectorDisplay:
 
 
 # ---------------------------------------------------------------------------
+# Resolution reporting
+# ---------------------------------------------------------------------------
+
+
+def _post_config(base_url: str, config: dict) -> bool:
+    """POST projector config to the server's /config endpoint.
+
+    Returns True on success, False on error (non-fatal).
+    """
+    url = base_url.rstrip("/")
+    # Strip /stream suffix to get the base URL
+    if url.endswith("/stream"):
+        url = url[: -len("/stream")]
+    url += "/config"
+
+    body = json.dumps(config).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            if resp.status == 200:
+                logger.info("Posted projector config: %s", config)
+                return True
+            logger.warning("POST /config returned %d", resp.status)
+    except Exception as e:
+        logger.debug("POST /config failed: %s", e)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -318,17 +353,40 @@ def main() -> None:
     # Create projector display (GLFW on main thread)
     display = ProjectorDisplay(monitor_index=args.monitor)
 
+    # Capture monitor resolution for the server
+    import glfw as _glfw
+
+    monitors = _glfw.get_monitors()
+    idx = min(args.monitor, len(monitors) - 1)
+    _mon = monitors[idx]
+    _mode = _glfw.get_video_mode(_mon)
+    _mon_name = _glfw.get_monitor_name(_mon)
+    projector_config = {
+        "width": _mode.size.width,
+        "height": _mode.size.height,
+        "monitor_name": _mon_name,
+    }
+
+    # Initial POST (best-effort)
+    _post_config(url, projector_config)
+
     # Stream reader runs on a background thread
     stream_active = threading.Event()
     stream_active.set()
 
     def stream_thread() -> None:
+        last_config_post = time.monotonic()
         while stream_active.is_set():
             try:
                 for rgb in read_mjpeg_stream(url):
                     if not stream_active.is_set():
                         break
                     display.submit_frame(rgb)
+                    # Re-POST config every 30s (handles server restarts)
+                    now = time.monotonic()
+                    if now - last_config_post >= 30.0:
+                        _post_config(url, projector_config)
+                        last_config_post = now
             except (urllib.error.URLError, OSError, TimeoutError) as e:
                 logger.warning("Stream error: %s — reconnecting in %.0fs", e, args.reconnect_delay)
             except Exception:
@@ -336,6 +394,9 @@ def main() -> None:
 
             if stream_active.is_set():
                 time.sleep(args.reconnect_delay)
+                # Re-POST on reconnect
+                _post_config(url, projector_config)
+                last_config_post = time.monotonic()
 
     t = threading.Thread(target=stream_thread, daemon=True)
     t.start()

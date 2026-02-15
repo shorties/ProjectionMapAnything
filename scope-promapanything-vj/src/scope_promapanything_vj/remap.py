@@ -5,13 +5,6 @@ to warp a camera-space depth map into projector-space coordinates.
 
 Output convention: near = dark (0), far = bright (1), grayscale (R=G=B).
 This matches VACE's training data from Depth Anything V2.
-
-Two approaches:
-1. warp_depth_to_projector() — warp raw depth float values (legacy)
-2. build_warped_depth_image() — create a depth IMAGE in camera space first
-   (with optional CLAHE, percentile clip, gamma, etc.) then warp it
-   identically to how RGB is warped.  The proven approach from the
-   standalone app.  Defaults are VACE-optimized (simple min-max range).
 """
 
 from __future__ import annotations
@@ -20,44 +13,18 @@ import cv2
 import numpy as np
 import torch
 
-# Pre-built colormaps (256 entries, RGB float32)
-_COLORMAP_CACHE: dict[str, torch.Tensor] = {}
-
-
-def _build_colormap(name: str) -> torch.Tensor:
-    """Build a (256, 3) float32 RGB lookup table for a named colormap."""
-    if name in _COLORMAP_CACHE:
-        return _COLORMAP_CACHE[name]
-
-    if name == "grayscale":
-        lut = torch.linspace(0, 1, 256).unsqueeze(1).expand(256, 3)
-    else:
-        cv_maps = {
-            "turbo": cv2.COLORMAP_TURBO,
-            "viridis": cv2.COLORMAP_VIRIDIS,
-            "magma": cv2.COLORMAP_MAGMA,
-        }
-        cv_id = cv_maps.get(name, cv2.COLORMAP_TURBO)
-        idx = np.arange(256, dtype=np.uint8).reshape(1, 256)
-        bgr = cv2.applyColorMap(idx, cv_id).squeeze(0)  # (256, 3) BGR uint8
-        rgb = bgr[:, ::-1].copy().astype(np.float32) / 255.0
-        lut = torch.from_numpy(rgb)
-
-    _COLORMAP_CACHE[name] = lut
-    return lut
-
 
 def apply_depth_output_settings(
     depth_raw: np.ndarray,
     *,
-    clip_lo: float = 2.0,
-    clip_hi: float = 98.0,
+    clip_lo: float = 0.0,
+    clip_hi: float = 100.0,
     brightness: float = 0.0,
     contrast: float = 1.0,
     gamma: float = 1.0,
-    equalize: bool = True,
+    equalize: bool = False,
 ) -> np.ndarray:
-    """Apply ControlNet-optimized output settings to a raw depth map.
+    """Apply output settings to a raw depth map.
 
     Parameters
     ----------
@@ -67,7 +34,7 @@ def apply_depth_output_settings(
     Returns
     -------
     np.ndarray
-        (H, W) float32 in [0, 1], processed for ControlNet consumption.
+        (H, W) float32 in [0, 1], processed for consumption.
     """
     # Percentile-based normalization
     valid_vals = depth_raw[depth_raw > 0] if np.any(depth_raw > 0) else depth_raw.ravel()
@@ -82,7 +49,7 @@ def apply_depth_output_settings(
     depth_norm = (depth_raw - d_lo) / (d_hi - d_lo)
     depth_norm = np.clip(depth_norm, 0.0, 1.0)
 
-    # CLAHE histogram equalization for maximum contrast
+    # CLAHE histogram equalization
     if equalize:
         depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -109,12 +76,12 @@ def build_warped_depth_image(
     proj_h: int,
     proj_w: int,
     *,
-    clip_lo: float = 2.0,
-    clip_hi: float = 98.0,
+    clip_lo: float = 0.0,
+    clip_hi: float = 100.0,
     brightness: float = 0.0,
     contrast: float = 1.0,
     gamma: float = 1.0,
-    equalize: bool = True,
+    equalize: bool = False,
     invert: bool = False,
     blur: float = 0.0,
     colormap: str = "grayscale",
@@ -161,7 +128,7 @@ def build_warped_depth_image(
         equalize=equalize,
     )
 
-    # Scale/invert
+    # Invert
     if invert:
         depth_img = 1.0 - depth_img
 
@@ -170,10 +137,9 @@ def build_warped_depth_image(
         ksize = int(blur) * 2 + 1
         depth_img = cv2.GaussianBlur(depth_img, (ksize, ksize), 0)
 
-    # Step 2: Convert to BGR image (same as RGB pipeline)
+    # Step 2: Convert to BGR image
     depth_uint8 = (depth_img * 255).clip(0, 255).astype(np.uint8)
 
-    # Apply colormap
     if colormap == "grayscale":
         depth_bgr = cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2BGR)
     else:
@@ -193,7 +159,7 @@ def build_warped_depth_image(
         borderValue=0,
     )
 
-    # Step 4: Inpaint holes (same as RGB)
+    # Step 4: Inpaint holes
     depth_holes = np.all(depth_proj_bgr == 0, axis=2).astype(np.uint8) * 255
     if np.any(depth_holes):
         depth_proj_bgr = cv2.inpaint(depth_proj_bgr, depth_holes, 15, cv2.INPAINT_NS)
@@ -203,133 +169,3 @@ def build_warped_depth_image(
     result = torch.from_numpy(depth_proj_rgb.astype(np.float32) / 255.0).to(device)
 
     return result  # (H, W, 3)
-
-
-def warp_frame_to_projector(
-    frame: torch.Tensor,
-    map_x: np.ndarray,
-    map_y: np.ndarray,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Warp a color frame from camera space to projector space.
-
-    Used in the "Depth -> AI -> Warp" pipeline mode to remap an AI-generated
-    RGB frame into projector perspective using the calibration mapping.
-
-    Parameters
-    ----------
-    frame : torch.Tensor
-        (H, W, 3) or (1, H, W, 3) float32 RGB in [0, 1].
-    map_x, map_y : np.ndarray
-        (proj_h, proj_w) float32 camera pixel coordinates from calibration.
-
-    Returns
-    -------
-    torch.Tensor
-        (H_proj, W_proj, 3) float32 RGB in [0, 1].
-    """
-    if device is None:
-        device = frame.device
-
-    f = frame.squeeze(0) if frame.ndim == 4 else frame  # (H, W, 3)
-
-    # Convert to numpy BGR uint8 for cv2.remap
-    rgb_np = (f.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-
-    # Warp using calibration mapping
-    warped_bgr = cv2.remap(
-        bgr_np, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-    # Inpaint holes (zero pixels from unmapped regions)
-    holes = np.all(warped_bgr == 0, axis=2).astype(np.uint8) * 255
-    if np.any(holes):
-        warped_bgr = cv2.inpaint(warped_bgr, holes, 15, cv2.INPAINT_NS)
-
-    # Convert back to torch RGB float32
-    warped_rgb = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(warped_rgb.astype(np.float32) / 255.0).to(device)
-
-
-def warp_depth_to_projector(
-    depth: torch.Tensor,
-    map_x: np.ndarray,
-    map_y: np.ndarray,
-    proj_h: int,
-    proj_w: int,
-) -> torch.Tensor:
-    """Warp a camera-space depth map to projector space (legacy).
-
-    Parameters
-    ----------
-    depth : torch.Tensor
-        (H_cam, W_cam) float32 depth in [0, 1].
-    map_x, map_y : np.ndarray
-        (proj_h, proj_w) float32 camera pixel coordinates.
-
-    Returns
-    -------
-    torch.Tensor
-        (proj_h, proj_w) float32 depth in [0, 1].
-    """
-    depth_np = depth.cpu().numpy()
-    warped = cv2.remap(
-        depth_np,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    return torch.from_numpy(warped).to(depth.device)
-
-
-def apply_depth_adjustments(
-    depth: torch.Tensor,
-    *,
-    scale: float = 1.0,
-    offset: float = 0.0,
-    blur: float = 0.0,
-    invert: bool = False,
-    colormap: str = "grayscale",
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Apply user-controlled adjustments and colormap to a depth map (legacy).
-
-    Parameters
-    ----------
-    depth : torch.Tensor
-        (H, W) float32 depth in [0, 1].
-
-    Returns
-    -------
-    torch.Tensor
-        (H, W, 3) float32 RGB in [0, 1].
-    """
-    if device is None:
-        device = depth.device
-
-    d = depth.clone()
-
-    if scale != 1.0 or offset != 0.0:
-        d = d * scale + offset
-
-    if invert:
-        d = 1.0 - d
-
-    d = d.clamp(0, 1)
-
-    if blur > 0.5:
-        ksize = int(blur) * 2 + 1
-        d_np = d.cpu().numpy()
-        d_np = cv2.GaussianBlur(d_np, (ksize, ksize), 0)
-        d = torch.from_numpy(d_np).to(device)
-
-    lut = _build_colormap(colormap).to(device)  # (256, 3)
-    indices = (d.clamp(0, 1) * 255).long().clamp(0, 255)
-    rgb = lut[indices]  # (H, W, 3)
-
-    return rgb

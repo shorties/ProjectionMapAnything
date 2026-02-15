@@ -4,21 +4,29 @@ Runs a lightweight HTTP server on a background thread.  The pipeline submits
 frames via ``submit_frame(rgb_np)``; connected clients receive them as an
 MJPEG stream.
 
+A module-level **singleton** ensures both preprocessor and postprocessor share
+the same server instance.  During calibration the preprocessor sends patterns
+via ``submit_calibration_frame()`` while normal ``submit_frame()`` calls are
+suppressed.
+
 Endpoints
 ---------
 ``/``        Status page with an embedded ``<img>`` viewer.
 ``/stream``  MJPEG multipart stream (``multipart/x-mixed-replace``).
 ``/frame``   Single JPEG snapshot of the latest frame.
+``POST /config``  Companion app reports its projector resolution.
+``GET  /config``  Returns the current projector config (JSON).
 
 Works through RunPod's port proxy — expose the port and connect from anywhere.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from socketserver import ThreadingMixIn
 
 import cv2
@@ -27,6 +35,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _BOUNDARY = b"promapframe"
+_PROJECTOR_CONFIG_PATH = Path.home() / ".promapanything_projector.json"
 
 
 class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -55,9 +64,57 @@ class FrameStreamer:
         self._thread: threading.Thread | None = None
         self._running = False
 
+        # Calibration priority: when True, submit_frame() is suppressed
+        self._calibration_active = False
+
+        # Client-reported projector config (resolution, monitor name)
+        self._client_config: dict | None = None
+        self._load_persisted_config()
+
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @property
+    def calibration_active(self) -> bool:
+        return self._calibration_active
+
+    @calibration_active.setter
+    def calibration_active(self, value: bool) -> None:
+        self._calibration_active = value
+
+    @property
+    def client_config(self) -> dict | None:
+        """Resolution reported by the companion app, or None."""
+        return self._client_config
+
+    def _load_persisted_config(self) -> None:
+        """Load last-known projector config from disk."""
+        try:
+            if _PROJECTOR_CONFIG_PATH.is_file():
+                self._client_config = json.loads(
+                    _PROJECTOR_CONFIG_PATH.read_text(encoding="utf-8")
+                )
+                logger.info(
+                    "Loaded persisted projector config: %s", self._client_config
+                )
+        except Exception:
+            logger.debug("No persisted projector config found")
+
+    def _persist_config(self) -> None:
+        """Save current client config to disk."""
+        if self._client_config is not None:
+            try:
+                _PROJECTOR_CONFIG_PATH.write_text(
+                    json.dumps(self._client_config, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.debug("Failed to persist projector config", exc_info=True)
 
     def start(self) -> None:
         """Start the HTTP server on a background thread."""
@@ -72,8 +129,17 @@ class FrameStreamer:
                     self_handler._handle_stream()
                 elif self_handler.path == "/frame":
                     self_handler._handle_frame()
+                elif self_handler.path == "/config":
+                    self_handler._handle_get_config()
                 else:
                     self_handler._handle_status()
+
+            def do_POST(self_handler) -> None:  # noqa: N805
+                if self_handler.path == "/config":
+                    self_handler._handle_post_config()
+                else:
+                    self_handler.send_response(404)
+                    self_handler.end_headers()
 
             def _handle_stream(self_handler) -> None:  # noqa: N805
                 """MJPEG multipart stream."""
@@ -145,6 +211,40 @@ class FrameStreamer:
                 self_handler.end_headers()
                 self_handler.wfile.write(html.encode())
 
+            def _handle_get_config(self_handler) -> None:  # noqa: N805
+                """Return current projector config as JSON."""
+                cfg = streamer._client_config or {}
+                body = json.dumps(cfg).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_post_config(self_handler) -> None:  # noqa: N805
+                """Receive projector config from companion app."""
+                try:
+                    length = int(
+                        self_handler.headers.get("Content-Length", 0)
+                    )
+                    body = self_handler.rfile.read(length)
+                    data = json.loads(body)
+                    streamer._client_config = data
+                    streamer._persist_config()
+                    logger.info("Received projector config: %s", data)
+                    self_handler.send_response(200)
+                    self_handler.send_header(
+                        "Access-Control-Allow-Origin", "*"
+                    )
+                    self_handler.end_headers()
+                except Exception:
+                    logger.warning(
+                        "Bad POST /config payload", exc_info=True
+                    )
+                    self_handler.send_response(400)
+                    self_handler.end_headers()
+
             def log_message(self_handler, format, *args) -> None:  # noqa: N805
                 pass  # suppress per-request logging
 
@@ -156,18 +256,33 @@ class FrameStreamer:
         self._thread.start()
         logger.info(
             "FrameStreamer: MJPEG server started on port %d "
-            "(endpoints: /stream, /frame, /)",
+            "(endpoints: /stream, /frame, /config, /)",
             self._port,
         )
 
     def submit_frame(self, rgb: np.ndarray) -> None:
         """Submit an RGB uint8 (H, W, 3) frame for streaming.
 
+        Suppressed when ``calibration_active`` is True — calibration patterns
+        take priority via ``submit_calibration_frame()``.
+
+        Thread-safe — may be called from any thread.
+        """
+        if not self._running or self._calibration_active:
+            return
+        self._encode_and_set(rgb)
+
+    def submit_calibration_frame(self, rgb: np.ndarray) -> None:
+        """Submit a calibration pattern frame. Always accepted.
+
         Thread-safe — may be called from any thread.
         """
         if not self._running:
             return
-        # Encode as JPEG
+        self._encode_and_set(rgb)
+
+    def _encode_and_set(self, rgb: np.ndarray) -> None:
+        """Encode RGB frame as JPEG and update the current frame."""
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         ok, jpeg_buf = cv2.imencode(
             ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self._quality]
@@ -192,3 +307,31 @@ class FrameStreamer:
     def __del__(self) -> None:
         if self._running:
             self.stop()
+
+
+# ── Module-level singleton ──────────────────────────────────────────────────
+
+_shared_streamer: FrameStreamer | None = None
+_shared_lock = threading.Lock()
+
+
+def get_or_create_streamer(port: int = 8765) -> FrameStreamer:
+    """Return the shared FrameStreamer, creating it if necessary.
+
+    If a streamer already exists on a different port, it is stopped and
+    replaced.  Both preprocessor and postprocessor should call this to
+    share a single MJPEG server.
+    """
+    global _shared_streamer
+    with _shared_lock:
+        if _shared_streamer is not None:
+            if _shared_streamer.port == port and _shared_streamer.is_running:
+                return _shared_streamer
+            # Port changed or not running — tear down old one
+            _shared_streamer.stop()
+            _shared_streamer = None
+
+        streamer = FrameStreamer(port=port)
+        streamer.start()
+        _shared_streamer = streamer
+        return streamer

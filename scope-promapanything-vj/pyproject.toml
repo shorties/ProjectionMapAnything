@@ -3,7 +3,7 @@ name = "scope-promapanything-vj"
 version = "0.1.0"
 description = "Projection mapping depth preprocessor — calibrates projector-camera geometry and outputs re-projected depth maps for ControlNet conditioning"
 requires-python = ">=3.12"
-dependencies = ["opencv-python-headless", "transformers", "glfw", "PyOpenGL"]
+dependencies = ["opencv-python-headless", "transformers"]
 
 [project.entry-points."scope"]
 scope_promapanything_vj = "scope_promapanything_vj"
