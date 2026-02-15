@@ -187,22 +187,68 @@ class FrameStreamer:
                     self_handler.end_headers()
 
             def _handle_status(self_handler) -> None:  # noqa: N805
-                """Status page with embedded MJPEG viewer."""
+                """Projector viewer page — acts as a browser-based companion app.
+
+                Features:
+                - Click anywhere to enter fullscreen
+                - ESC to exit fullscreen
+                - Auto-POSTs screen resolution to /config
+                - Re-POSTs every 30s (handles server restarts)
+                - Hidden cursor in fullscreen
+                - Black background, no UI chrome
+                """
                 html = (
                     "<!DOCTYPE html>\n"
-                    "<html><head><title>ProMapAnything Projector Stream</title>\n"
+                    "<html><head>\n"
+                    "<title>ProMapAnything Projector</title>\n"
                     "<style>\n"
-                    "  body { margin:0; background:#000; display:flex;\n"
-                    "         justify-content:center; align-items:center;\n"
-                    "         height:100vh; font-family:sans-serif; }\n"
-                    "  img  { max-width:100%; max-height:100vh;\n"
-                    "         object-fit:contain; }\n"
-                    "  .info { position:fixed; top:10px; left:10px;\n"
-                    "          color:#555; font-size:12px; }\n"
-                    "</style></head><body>\n"
-                    '<div class="info">ProMapAnything Projector Stream '
-                    "&mdash; fullscreen: F11</div>\n"
-                    '<img src="/stream" />\n'
+                    "  * { margin:0; padding:0; }\n"
+                    "  body { background:#000; overflow:hidden;\n"
+                    "         width:100vw; height:100vh;\n"
+                    "         display:flex; justify-content:center;\n"
+                    "         align-items:center; }\n"
+                    "  body.fs { cursor:none; }\n"
+                    "  img { width:100vw; height:100vh;\n"
+                    "        object-fit:contain; display:block; }\n"
+                    "  #hint { position:fixed; bottom:30px;\n"
+                    "          left:50%; transform:translateX(-50%);\n"
+                    "          color:#444; font:14px sans-serif;\n"
+                    "          pointer-events:none;\n"
+                    "          transition:opacity 0.5s; }\n"
+                    "  body.fs #hint { opacity:0; }\n"
+                    "</style>\n"
+                    "</head><body>\n"
+                    '<img id="stream" src="/stream" />\n'
+                    '<div id="hint">Click to go fullscreen &mdash; '
+                    "drag this window to your projector first</div>\n"
+                    "<script>\n"
+                    "// Click to enter fullscreen\n"
+                    "document.body.addEventListener('click', () => {\n"
+                    "  if (!document.fullscreenElement) {\n"
+                    "    document.documentElement.requestFullscreen()\n"
+                    "      .catch(() => {});\n"
+                    "  }\n"
+                    "});\n"
+                    "document.addEventListener('fullscreenchange', () => {\n"
+                    "  document.body.classList.toggle('fs',\n"
+                    "    !!document.fullscreenElement);\n"
+                    "});\n"
+                    "\n"
+                    "// POST screen resolution to /config\n"
+                    "function postConfig() {\n"
+                    "  const s = window.screen;\n"
+                    "  fetch('/config', {\n"
+                    "    method: 'POST',\n"
+                    "    headers: {'Content-Type': 'application/json'},\n"
+                    "    body: JSON.stringify({\n"
+                    "      width: s.width, height: s.height,\n"
+                    "      monitor_name: 'browser'\n"
+                    "    })\n"
+                    "  }).catch(() => {});\n"
+                    "}\n"
+                    "postConfig();\n"
+                    "setInterval(postConfig, 30000);\n"
+                    "</script>\n"
                     "</body></html>"
                 )
                 self_handler.send_response(200)
