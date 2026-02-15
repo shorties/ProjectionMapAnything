@@ -888,3 +888,101 @@ class ProMapAnythingEffectsConfig(BasePipelineConfig):
         ),
         json_schema_extra=ui_field_config(order=113, label="Stream Port"),
     )
+
+
+# =============================================================================
+# Projector Output postprocessor
+# =============================================================================
+
+
+class ProMapAnythingProjectorConfig(BasePipelineConfig):
+    """Projector output postprocessor.
+
+    Appears in the **Postprocessor** dropdown.  Receives the final output
+    from the main pipeline (e.g. Krea) and streams it to a local projector
+    via MJPEG.  Pass-through — does not modify the image unless projector
+    warp is enabled.
+    """
+
+    pipeline_id = "promapanything-projector"
+    pipeline_name = "ProMapAnything Projector"
+    pipeline_description = (
+        "Streams the final pipeline output to a projector. Enable the MJPEG "
+        "stream for remote use (RunPod) or the local projector window for "
+        "direct display. Optionally warps the output to projector perspective."
+    )
+
+    supports_prompts = False
+    modes = {"video": ModeDefaults(default=True)}
+    usage = [UsageType.POSTPROCESSOR]
+
+    # -- Projector warp -------------------------------------------------------
+
+    projector_warp: bool = Field(
+        default=False,
+        description=(
+            "Warp the output to projector perspective using calibration data. "
+            "Use this in 'Depth -> AI -> Warp' mode where the AI generates in "
+            "camera space and the output needs perspective correction."
+        ),
+        json_schema_extra=ui_field_config(order=1, label="Projector Warp"),
+    )
+
+    calibration_file: str = Field(
+        default="",
+        description=(
+            "Path to a calibration JSON file. If empty, falls back to "
+            "~/.promapanything_calibration.json."
+        ),
+        json_schema_extra=ui_field_config(
+            order=2,
+            label="Calibration File",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
+    # -- Local projector output -----------------------------------------------
+
+    projector_output: bool = Field(
+        default=False,
+        description=(
+            "Open a fullscreen window on the selected monitor to display the "
+            "output directly on a locally connected projector."
+        ),
+        json_schema_extra=ui_field_config(order=10, label="Projector Output"),
+    )
+
+    projector_monitor: int = Field(
+        default=1,
+        ge=0,
+        le=8,
+        description=(
+            "Monitor index for the projector output window. 0 = primary, "
+            "1 = first secondary, etc."
+        ),
+        json_schema_extra=ui_field_config(order=11, label="Projector Monitor"),
+    )
+
+    # -- Remote projector stream ----------------------------------------------
+
+    projector_stream: bool = Field(
+        default=False,
+        description=(
+            "Start an MJPEG streaming server so a remote client (or browser) "
+            "can display the output on a projector. Use this when running "
+            "Scope on a remote GPU (e.g. RunPod)."
+        ),
+        json_schema_extra=ui_field_config(order=12, label="Projector Stream"),
+    )
+
+    projector_stream_port: int = Field(
+        default=8765,
+        ge=1024,
+        le=65535,
+        description=(
+            "Port for the MJPEG streaming server. On RunPod, expose this port "
+            "and connect to https://<pod-id>-<port>.proxy.runpod.net/"
+        ),
+        json_schema_extra=ui_field_config(order=13, label="Stream Port"),
+    )

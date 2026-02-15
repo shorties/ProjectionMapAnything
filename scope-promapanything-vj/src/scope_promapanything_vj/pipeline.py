@@ -1,9 +1,12 @@
 """ProMapAnything VJ Tools — pipelines.
 
-Three pipelines registered from one plugin:
-1. ProMapAnythingPipeline      — preprocessor (calibration + depth -> ControlNet)
-2. ProMapAnythingPreviewPipeline — same as above but visible on screen
-3. ProMapAnythingEffectsPipeline — standalone VJ effects on any video input
+Registered pipelines:
+1. ProMapAnythingPipeline          — preprocessor (calibration + depth -> ControlNet)
+2. ProMapAnythingProjectorPipeline — postprocessor (streams final output to projector)
+
+Internal (not registered):
+- ProMapAnythingPreviewPipeline  — preview variant of preprocessor
+- ProMapAnythingEffectsPipeline  — standalone VJ effects
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from .schema import (
     ProMapAnythingConfig,
     ProMapAnythingEffectsConfig,
     ProMapAnythingPreviewConfig,
+    ProMapAnythingProjectorConfig,
 )
 
 if TYPE_CHECKING:
@@ -801,7 +805,143 @@ class ProMapAnythingEffectsPipeline(Pipeline):
             if self._streamer is not None and self._streamer.is_running:
                 self._streamer.submit_frame(rgb_np)
 
-    def __del__(self) -> None:
+    def __del__(self) -> None:  # Effects pipeline cleanup
+        if self._projector is not None:
+            self._projector.stop()
+            self._projector = None
+        if self._streamer is not None:
+            self._streamer.stop()
+            self._streamer = None
+
+
+# =============================================================================
+# Projector output postprocessor
+# =============================================================================
+
+
+class ProMapAnythingProjectorPipeline(Pipeline):
+    """Postprocessor that streams the final pipeline output to a projector.
+
+    Receives the finished frame from the main pipeline (e.g. Krea), optionally
+    warps it to projector perspective, and forwards it to a local GLFW window
+    and/or an MJPEG stream for a remote companion app.  The video tensor is
+    passed through unmodified (or warped) so downstream pipelines still work.
+    """
+
+    @classmethod
+    def get_config_class(cls) -> type["BasePipelineConfig"]:
+        return ProMapAnythingProjectorConfig
+
+    def __init__(self, device=None, **kwargs):
+        self.device = device or torch.device("cpu")
+
+        # Projector window (local GLFW)
+        self._projector: ProjectorOutput | None = None
+        self._projector_enabled = False
+        self._projector_monitor = 1
+
+        # MJPEG stream (remote)
+        self._streamer: FrameStreamer | None = None
+        self._stream_enabled = False
+        self._stream_port = 8765
+
+        # Calibration mapping for projector warp
+        self._map_x: np.ndarray | None = None
+        self._map_y: np.ndarray | None = None
+
+        calibration_file: str = kwargs.get("calibration_file", "")
+        if calibration_file:
+            cal_path = Path(calibration_file)
+        else:
+            cal_path = Path.home() / ".promapanything_calibration.json"
+        if cal_path.is_file():
+            mx, my, _pw, _ph = load_calibration(cal_path)
+            self._map_x = mx
+            self._map_y = my
+            logger.info("Projector postprocessor: loaded calibration from %s", cal_path)
+
+    def prepare(self, **kwargs) -> Requirements:
+        return Requirements(input_size=1)
+
+    def __call__(self, **kwargs) -> dict:
+        video = kwargs.get("video")
+        if video is None:
+            raise ValueError("Projector postprocessor received no video input")
+
+        # Normalize input to (H, W, C) float32 [0, 1]
+        frame = video[0].squeeze(0).to(device=self.device, dtype=torch.float32)
+        if frame.max() > 1.5:
+            frame = frame / 255.0
+
+        # Optional projector warp
+        projector_warp = kwargs.get("projector_warp", False)
+        if projector_warp and self._map_x is not None and self._map_y is not None:
+            frame = warp_frame_to_projector(
+                frame, self._map_x, self._map_y, device=self.device,
+            )
+
+        output = frame.unsqueeze(0).clamp(0, 1)  # (1, H, W, C)
+        self._update_projector(kwargs, output)
+        return {"video": output}
+
+    def _update_projector(self, kwargs: dict, output_tensor: torch.Tensor) -> None:
+        """Manage projector window + MJPEG stream, submit frames."""
+        enabled = kwargs.get("projector_output", False)
+        monitor = kwargs.get("projector_monitor", 1)
+        stream_enabled = kwargs.get("projector_stream", False)
+        stream_port = kwargs.get("projector_stream_port", 8765)
+
+        # -- Local GLFW window ------------------------------------------------
+        if enabled and not self._projector_enabled:
+            self._projector = ProjectorOutput()
+            self._projector.start(monitor_index=monitor)
+            self._projector_enabled = True
+            self._projector_monitor = monitor
+            logger.info("Projector postprocessor: output started on monitor %d", monitor)
+        elif not enabled and self._projector_enabled:
+            if self._projector is not None:
+                self._projector.stop()
+                self._projector = None
+            self._projector_enabled = False
+        elif enabled and monitor != self._projector_monitor:
+            if self._projector is not None:
+                self._projector.stop()
+            self._projector = ProjectorOutput()
+            self._projector.start(monitor_index=monitor)
+            self._projector_monitor = monitor
+
+        # -- Remote MJPEG stream ----------------------------------------------
+        if stream_enabled and not self._stream_enabled:
+            self._streamer = FrameStreamer(port=stream_port)
+            self._streamer.start()
+            self._stream_enabled = True
+            self._stream_port = stream_port
+        elif not stream_enabled and self._stream_enabled:
+            if self._streamer is not None:
+                self._streamer.stop()
+                self._streamer = None
+            self._stream_enabled = False
+        elif stream_enabled and stream_port != self._stream_port:
+            if self._streamer is not None:
+                self._streamer.stop()
+            self._streamer = FrameStreamer(port=stream_port)
+            self._streamer.start()
+            self._stream_port = stream_port
+
+        # -- Submit frame to active outputs -----------------------------------
+        has_output = (
+            (self._projector is not None and self._projector.is_running)
+            or (self._streamer is not None and self._streamer.is_running)
+        )
+        if has_output:
+            t = output_tensor.squeeze(0) if output_tensor.ndim == 4 else output_tensor
+            rgb_np = (t.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            if self._projector is not None and self._projector.is_running:
+                self._projector.submit_frame(rgb_np)
+            if self._streamer is not None and self._streamer.is_running:
+                self._streamer.submit_frame(rgb_np)
+
+    def __del__(self) -> None:  # Projector postprocessor cleanup
         if self._projector is not None:
             self._projector.stop()
             self._projector = None
