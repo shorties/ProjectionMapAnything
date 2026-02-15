@@ -1,0 +1,13 @@
+[project]
+name = "promapanything-projector-client"
+version = "0.1.0"
+description = "Companion app — receives MJPEG stream from RunPod and displays fullscreen on a local projector"
+requires-python = ">=3.10"
+dependencies = ["glfw", "PyOpenGL", "opencv-python-headless", "numpy"]
+
+[project.scripts]
+projector-client = "projector_client:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
