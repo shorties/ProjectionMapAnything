@@ -1,0 +1,232 @@
+# ProMapAnything — Projection Mapping System
+
+A complete projection mapping solution: camera-projector calibration via structured light, real-time depth estimation, and AI-powered VJ effects projected onto physical surfaces. Inspired by Microsoft's RoomAlive Toolkit.
+
+## Repository Structure
+
+```
+ProjectionMapAnything/
+├── promapanything-app/              # Standalone desktop app (Windows)
+│   └── src/promapanything/
+│       ├── app.py                   # Main app (dual-window GLFW, event loop)
+│       ├── state.py                 # Central state (AppState, AppMode, CalibrationPhase)
+│       ├── ui.py                    # ImGui interface panels
+│       ├── calibration.py           # Gray code generation/decoding (CalibrationRunner)
+│       ├── procam_calibration.py    # Intrinsics + stereo calibration (RANSAC + LM)
+│       ├── depth.py                 # Depth Anything V2 model wrapper
+│       ├── camera.py                # OpenCV VideoCapture wrapper
+│       ├── ndi_camera.py            # NDI network camera support
+│       ├── reproject.py             # Depth reprojection camera→projector
+│       ├── spout_output.py          # SpoutGL texture sharing
+│       └── renderer/
+│           ├── scene.py             # 3D scene (point cloud, mesh, frustum)
+│           └── shaders/             # GLSL shaders (effects, pointcloud, mesh, etc.)
+│
+├── scope-promapanything-vj/         # Daydream Scope plugin (3 pipelines)
+│   └── src/scope_promapanything_vj/
+│       ├── __init__.py              # Plugin entry (hookimpl, registers 3 pipelines)
+│       ├── schema.py                # Pydantic configs with UI annotations
+│       ├── pipeline.py              # 3 pipeline classes (calibrate, depth, projector)
+│       ├── calibration.py           # Gray code state machine (CalibrationState)
+│       ├── depth_provider.py        # Depth estimation (built-in or transformers)
+│       ├── remap.py                 # Depth warp camera→projector
+│       ├── effects.py               # GPU effects (pure torch, no loops)
+│       └── frame_server.py          # MJPEG HTTP server (singleton FrameStreamer)
+│
+├── projector-client/                # Companion app for local projector display
+│   └── projector_client.py          # MJPEG receiver + fullscreen GLFW window
+│
+├── ProCamCalibration/               # Microsoft RoomAlive Toolkit reference (C#)
+│
+└── .claude/skills/
+    ├── structured-light/SKILL.md    # 61KB calibration theory reference
+    └── create-scope-plugin/         # Scope plugin scaffolding skill
+        ├── SKILL.md                 # Plugin creation guide
+        ├── reference.md             # Complete Scope plugin API spec
+        └── examples/vfx-pack.md     # Working plugin example
+```
+
+## Scope Plugin — 3 Pipeline Architecture
+
+### Pipelines
+
+| Pipeline | Role | Config Class | Pipeline Class |
+|----------|------|--------------|----------------|
+| ProMapAnything Calibrate | **Main pipeline** | `ProMapAnythingCalibrateConfig` | `ProMapAnythingCalibratePipeline` |
+| ProMapAnything Depth | **Preprocessor** | `ProMapAnythingConfig` | `ProMapAnythingPipeline` |
+| ProMapAnything Projector | **Postprocessor** | `ProMapAnythingProjectorConfig` | `ProMapAnythingProjectorPipeline` |
+
+### Workflow
+
+```
+CALIBRATION (standalone — no pre/post needed):
+  Select "ProMapAnything Calibrate" as main pipeline → hit play
+  Grey test card on projector → user toggles "Start Calibration"
+  Gray code patterns → camera captures → decode → save calibration
+  Uploads result images to Scope gallery for VACE conditioning
+
+NORMAL VJ MODE:
+  Main: Krea/VACE    Pre: ProMapAnything Depth    Post: ProMapAnything Projector
+  Camera → depth estimation → warp to projector perspective → AI generation → MJPEG stream
+```
+
+### Calibration Pipeline Details
+
+**State machine phases**: `IDLE → WHITE → BLACK → PATTERNS → DECODING → DONE`
+
+- Shows grey test card before calibration (prevents camera-projector feedback loop)
+- `settle_frames=6` between patterns for camera/projector sync (~200ms at 30fps)
+- `capture_frames=3` per pattern (averaged for noise rejection)
+- Per-bit reliability thresholding + spatial consistency filtering
+- Gaussian splat fill + inpainting for dense correspondence
+- Saves to `~/.promapanything_calibration.json` with UTC timestamp
+- Publishes downloadable results via frame_server + uploads to Scope asset gallery
+
+### Depth Preprocessor Details
+
+- Loads calibration automatically from `~/.promapanything_calibration.json`
+- Uses Depth Anything V2 (tries Scope built-in first, falls back to transformers)
+- Warps depth from camera→projector perspective using calibration maps
+- Output: grayscale RGB (near=dark, far=bright) matching VACE training data
+- Temporal smoothing + Gaussian blur for flicker/noise reduction
+- Resizes to generation resolution (quarter/half/native of projector res)
+
+### Projector Postprocessor Details
+
+- Streams final AI output to projector via MJPEG
+- Optionally upscales to projector resolution (from companion app config)
+- Shares singleton FrameStreamer with calibration pipeline
+
+## Frame Server (MJPEG HTTP)
+
+Module-level singleton `FrameStreamer` in `frame_server.py`. Both calibration and projector pipelines share the same instance via `get_or_create_streamer()`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /` | Control panel (Scope URL, projector button, preview, status) |
+| `GET /projector` | Fullscreen MJPEG viewer (drag to projector, click fullscreen) |
+| `GET /stream` | MJPEG multipart stream |
+| `GET /frame` | Single JPEG snapshot |
+| `GET/POST /config` | Projector resolution from browser |
+| `GET /calibration/status` | Calibration completion status + file list |
+| `GET /calibration/download/<name>` | Download calibration result files |
+
+**Calibration priority**: When `calibration_active=True`, normal `submit_frame()` is suppressed — only `submit_calibration_frame()` goes through.
+
+**Auto-download overlay**: Projector page (`/projector`) polls `/calibration/status` every 2s and shows download overlay with calibration.json, coverage_map.png, warped_camera.png when calibration completes.
+
+## Schema Field Placement
+
+Fields use `category` in `ui_field_config()` to control panel placement:
+
+- `category="input"` → **Left panel** (input side) — runtime controls users adjust frequently
+- `category="configuration"` → **Right panel** (settings) — load-time config set once
+
+Current layout:
+- **Input side**: Start Calibration toggle, Temporal Smoothing, Depth Blur, Upscale to Projector
+- **Settings side**: Projector Width/Height, Stream Port, Projector URL, Calibration File, Gen Resolution
+
+## Critical Implementation Notes
+
+### Frame Format Ambiguity
+Scope video input may arrive as **float [0,1] OR uint8 [0,255]**. Always detect and convert:
+```python
+# WRONG: .astype(np.uint8) on float [0,1] produces ALL ZEROS
+img = tensor.numpy().astype(np.uint8)  # BUG!
+
+# RIGHT: check and scale first
+img = tensor.numpy()
+if img.dtype != np.uint8:
+    if img.max() <= 1.5:
+        img = (img * 255.0).clip(0, 255)
+    img = img.astype(np.uint8)
+```
+
+### Feedback Loop Prevention
+Never show camera feed on the projector before calibration — the camera sees the projector which shows the camera, creating infinite feedback. Show a neutral grey test card instead.
+
+### Scope Plugin Conventions
+- **Input format**: List of tensors `(1, H, W, C)` — may be float [0,1] or uint8 [0,255]
+- **Output format**: `{"video": tensor}` — THWC `(T, H, W, C)` float32 [0, 1]
+- **Runtime params**: Read from `kwargs.get("param_name", default)` in `__call__()`, never from `self`
+- **Load-time params**: Passed to `__init__()` via `**kwargs`, require pipeline reload
+- **Lazy imports**: Import pipeline classes inside `register_pipelines()`, not at module level
+- **`**kwargs` everywhere**: Always accept in `__init__()`, `prepare()`, `__call__()`
+
+### Scope Asset Gallery / VACE Integration
+- Scope has `ref_images` field and `supports_vace` flag in `BasePipelineConfig`
+- Asset upload via `POST /api/v1/assets` (multipart form data)
+- After calibration, warped images are uploaded to gallery for VACE conditioning
+- `vace_context_scale` controls VACE hint injection strength (0.0–2.0)
+
+## Data Files
+
+### Calibration (`~/.promapanything_calibration.json`)
+```json
+{
+  "version": 1,
+  "projector_width": 1920,
+  "projector_height": 1080,
+  "timestamp": "2026-02-15T12:00:00+00:00",
+  "map_x": [[...]],     // proj_h × proj_w — maps projector pixels to camera X
+  "map_y": [[...]]      // proj_h × proj_w — maps projector pixels to camera Y
+}
+```
+Note: Standalone app version also includes `K_cam`, `dist_cam`, `K_proj`, `dist_proj`, `R`, `T`.
+
+### Live Export (`~/.promapanything_live/`)
+- `depth_bw.npy` — (H, W) float32 grayscale depth
+- `depth_color.npy` — (H, W, 3) uint8 colormapped depth
+- `projector_rgb.npy` — (H, W, 3) uint8 projector output
+- `meta.json` — timestamp + availability
+
+### Spout Outputs (standalone app only)
+- `ProMap-DepthMap` — Normalized B&W depth [0-1]
+- `ProMap-ColorMap` — Camera feed
+- `ProMap-Projector` — Final projector output
+
+## RunPod Deployment
+
+- **SSH setup**: `mkdir -p /run/sshd && /usr/sbin/sshd` (add to `.bashrc` for persistence)
+- **Port 8765**: Must be explicitly exposed in RunPod settings for MJPEG streamer
+- **URL pattern**: `https://{pod-id}-{port}.proxy.runpod.net/`
+- **Auto-detect**: Uses `RUNPOD_POD_ID` env var for URL construction
+- **Plugin install**: `git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=scope-promapanything-vj`
+- **Caution**: Killing Scope process (PID) restarts the entire container
+
+## Technology Stack
+
+| Component | Stack |
+|-----------|-------|
+| Standalone App | Python 3.12+, GLFW, ModernGL, imgui-bundle, PyTorch, SpoutGL, OpenCV, PyGLM |
+| Scope Plugin | Python 3.12+, PyTorch, OpenCV, Pydantic, transformers (fallback depth) |
+| Projector Client | Python 3.10+, GLFW, PyOpenGL, OpenCV |
+| Reference (C#) | .NET, DirectX, SharpDX, Kinect v2 SDK |
+
+## Coding Conventions
+
+- **Type hints**: Full annotations, use `from __future__ import annotations`
+- **Imports**: Stdlib → third-party → local, alphabetical within groups
+- **Line length**: 100 chars soft limit
+- **GPU code**: Pure torch operations in `effects.py`, no Python loops over pixels
+- **Shaders**: GLSL 330 core, standard uniforms: `mvp`, `tex`, `time`, `resolution`
+- **Validation**: Use `ge=1` (not `ge=640`) for resolution fields — digit-by-digit typing triggers validation on every keystroke
+
+## Common Tasks
+
+### Adding a VJ Effect
+1. Add params to `EffectSettings` in `state.py` (standalone) or `schema.py` (Scope)
+2. Add UI controls in `ui.py` or schema field definitions
+3. Implement in `effects.py` (pure torch)
+4. Add to effects chain in `pipeline.py` or `effects.frag`
+
+### Modifying Calibration
+- Gray code logic: `calibration.py` in either app
+- Intrinsics/stereo: `procam_calibration.py` (standalone only)
+- State machine: `CalibrationState` (plugin) or `CalibrationRunner` (standalone)
+- The standalone app uses time-based settling (200ms), the plugin uses frame-counting (6 frames)
+
+### Testing
+- **Standalone**: Run app → verify calibration → check Spout output in OBS/Resolume
+- **Scope plugin**: Install in Scope → select pipeline → test with camera
+- **Calibration validation**: Check decode coverage % and inspect warped_camera.png output
