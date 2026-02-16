@@ -608,11 +608,14 @@ def save_procam(
 
 def load_procam(path: str | Path) -> ProCamCalibration:
     """Load ProCam calibration from JSON."""
+    from .calibration import sanitize_correspondence_maps
+
     data = json.loads(Path(path).read_text())
 
     cal = ProCamCalibration()
-    cal.map_x = np.array(data["map_x"], dtype=np.float32)
-    cal.map_y = np.array(data["map_y"], dtype=np.float32)
+    map_x = np.array(data["map_x"], dtype=np.float32)
+    map_y = np.array(data["map_y"], dtype=np.float32)
+    cal.map_x, cal.map_y = sanitize_correspondence_maps(map_x, map_y)
 
     if data.get("version", 1) >= 2:
         cal.K_cam = np.array(data["K_cam"], dtype=np.float64)

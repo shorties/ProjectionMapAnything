@@ -800,8 +800,6 @@ class ProMapAnythingApp:
                     self.state.calibration_file = str(save_path)
                     logger.info("Full ProCam calibration saved to %s", save_path)
 
-                    self._build_depth_reprojector()
-
                     # Also try stereo triangulation depth (secondary — only if stereo is good)
                     if stereo_ok and stereo_err < 5.0:
                         self._build_metric_projector_depth(map_x, map_y, proj_valid_mask)
@@ -814,6 +812,9 @@ class ProMapAnythingApp:
                     self._save_2d_calibration(map_x, map_y, pw, ph)
             else:
                 self._save_2d_calibration(map_x, map_y, pw, ph)
+
+            # Build depth reprojector from correspondence maps (works for all calibration types)
+            self._build_depth_reprojector()
 
         except Exception as e:
             logger.error("Calibration decode/stereo failed: %s", e)
@@ -842,38 +843,26 @@ class ProMapAnythingApp:
             self._scene.build_frustum(pw, ph, focal)
 
     def _build_depth_reprojector(self) -> None:
-        """Create the DepthReprojector from current ProCam calibration."""
-        procam = self.state.procam
-        if procam.K_cam is None or procam.R is None:
-            logger.warning("Cannot build depth reprojector: missing K_cam or R")
+        """Create the DepthReprojector from Gray code correspondence maps."""
+        map_x = self.state.calib_map_x
+        map_y = self.state.calib_map_y
+        if map_x is None or map_y is None:
+            logger.warning("Cannot build depth reprojector: no correspondence maps")
             return
-        # Get camera resolution from current frame
-        frame = self.state.camera_frame
-        if frame is None:
-            logger.warning("Cannot build depth reprojector: no camera frame")
-            return
-        cam_h, cam_w = frame.shape[:2]
+
         proj_w = self.state.calibration.projector_width
         proj_h = self.state.calibration.projector_height
 
-        logger.info(f"Building depth reprojector:")
-        logger.info(f"  Camera: {cam_w}x{cam_h}")
+        logger.info(f"Building depth reprojector (cv2.remap):")
         logger.info(f"  Projector: {proj_w}x{proj_h}")
-        logger.info(f"  K_cam:\n{procam.K_cam}")
-        logger.info(f"  K_proj:\n{procam.K_proj}")
-        logger.info(f"  R:\n{procam.R}")
-        logger.info(f"  T: {procam.T.flatten()}")
+        logger.info(f"  Map shape: {map_x.shape}")
 
         try:
             self._depth_reprojector = DepthReprojector(
-                procam.K_cam, procam.dist_cam,
-                procam.K_proj, procam.dist_proj,
-                procam.R, procam.T,
-                cam_w, cam_h,
-                proj_w, proj_h,
+                map_x, map_y, proj_w, proj_h,
             )
-            logger.info("Depth reprojector initialized successfully (%dx%d → %dx%d)",
-                         cam_w, cam_h, proj_w, proj_h)
+            logger.info("Depth reprojector initialized successfully (%dx%d)",
+                         proj_w, proj_h)
         except Exception as e:
             logger.error(f"Failed to build depth reprojector: {e}")
             self._depth_reprojector = None
@@ -941,10 +930,10 @@ class ProMapAnythingApp:
         # ── Step 2: Warp depth image to projector (same as RGB) ───────
         depth_proj_bgr = cv2.remap(depth_bgr_cam, map_x, map_y, cv2.INTER_LINEAR,
                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # Inpaint holes the same way as RGB
+        # Only inpaint small internal holes — large uncovered regions stay black
         depth_holes = np.all(depth_proj_bgr == 0, axis=2).astype(np.uint8) * 255
         if np.any(depth_holes):
-            depth_proj_bgr = cv2.inpaint(depth_proj_bgr, depth_holes, 15, cv2.INPAINT_NS)
+            depth_proj_bgr = self._inpaint_small_holes(depth_proj_bgr, depth_holes)
 
         # Extract single-channel result
         depth_proj_uint8 = depth_proj_bgr[:, :, 0]  # all channels are the same
@@ -970,7 +959,7 @@ class ProMapAnythingApp:
                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         rgb_holes = np.all(rgb_proj == 0, axis=2).astype(np.uint8) * 255
         if np.any(rgb_holes):
-            rgb_proj = cv2.inpaint(rgb_proj, rgb_holes, 15, cv2.INPAINT_NS)
+            rgb_proj = self._inpaint_small_holes(rgb_proj, rgb_holes)
         rgb_path = save_dir / "projector_rgb_view.png"
         cv2.imwrite(str(rgb_path), rgb_proj)
         logger.info("Projector RGB view saved: %s", rgb_path)
@@ -980,6 +969,27 @@ class ProMapAnythingApp:
 
         coverage = float(np.count_nonzero(depth_proj_uint8 > 0)) / max(depth_proj_uint8.size, 1)
         logger.info("Warped depth map complete: %.1f%% coverage", coverage * 100)
+
+    @staticmethod
+    def _inpaint_small_holes(
+        image: np.ndarray, hole_mask: np.ndarray, max_pct: float = 0.005,
+    ) -> np.ndarray:
+        """Inpaint only small holes; leave large uncovered regions as-is.
+
+        Prevents fold-over artifacts from extrapolating into regions the
+        camera never covered.
+        """
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            hole_mask, connectivity=8,
+        )
+        max_area = max(int(image.shape[0] * image.shape[1] * max_pct), 100)
+        small_mask = np.zeros_like(hole_mask)
+        for label_id in range(1, num_labels):
+            if stats[label_id, cv2.CC_STAT_AREA] < max_area:
+                small_mask[labels == label_id] = 255
+        if np.any(small_mask):
+            return cv2.inpaint(image, small_mask, 5, cv2.INPAINT_NS)
+        return image
 
     def _apply_depth_output_settings(self, depth_raw: np.ndarray) -> np.ndarray:
         """Apply user-adjustable output settings to raw depth.
@@ -1076,7 +1086,7 @@ class ProMapAnythingApp:
                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         depth_holes = np.all(depth_proj_bgr == 0, axis=2).astype(np.uint8) * 255
         if np.any(depth_holes):
-            depth_proj_bgr = cv2.inpaint(depth_proj_bgr, depth_holes, 15, cv2.INPAINT_NS)
+            depth_proj_bgr = self._inpaint_small_holes(depth_proj_bgr, depth_holes)
 
         depth_proj_uint8 = depth_proj_bgr[:, :, 0]
         depth_norm = depth_proj_uint8.astype(np.float32) / 255.0
@@ -1240,16 +1250,18 @@ to update the RGB texture while keeping the same geometry.
             self.state.calibration_file = str(path)
             self.state.calib_phase = CalibrationPhase.DONE
 
-            if procam.K_cam is not None and procam.R is not None:
+            # Build depth reprojector from correspondence maps
+            if procam.map_x is not None:
                 self._build_depth_reprojector()
-                # Try to load static depth map
                 self._load_static_depth_map()
-                if self._scene is not None:
-                    self._scene.build_frustum_from_intrinsics(
-                        procam.K_proj, procam.R, procam.T,
-                        self.state.calibration.projector_width,
-                        self.state.calibration.projector_height,
-                    )
+
+            # Build 3D frustum for scene preview
+            if procam.K_cam is not None and procam.R is not None and self._scene is not None:
+                self._scene.build_frustum_from_intrinsics(
+                    procam.K_proj, procam.R, procam.T,
+                    self.state.calibration.projector_width,
+                    self.state.calibration.projector_height,
+                )
             elif procam.map_x is not None and self._scene is not None:
                 dw = self._depth_texture.width if self._depth_texture else 640
                 focal = max(dw, 480) * 0.8

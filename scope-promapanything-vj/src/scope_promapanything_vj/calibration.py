@@ -405,12 +405,23 @@ class CalibrationState:
         # Store validity mask BEFORE inpainting
         self.proj_valid_mask = valid_proj.copy()
 
-        # Inpaint remaining holes for complete coverage
+        # Inpaint only small internal holes — NOT large uncovered boundary regions
+        # (blanket inpainting of large regions causes fold-overs / distortion)
         hole_mask = (~valid_proj).astype(np.uint8) * 255
         if np.any(~valid_proj):
-            inpaint_r = max(fk, 10)
-            map_x = cv2.inpaint(map_x, hole_mask, inpaint_r, cv2.INPAINT_NS)
-            map_y = cv2.inpaint(map_y, hole_mask, inpaint_r, cv2.INPAINT_NS)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                hole_mask, connectivity=8,
+            )
+            max_small_area = max(int(self.proj_w * self.proj_h * 0.005), 100)
+            small_hole_mask = np.zeros_like(hole_mask)
+            for label_id in range(1, num_labels):
+                area = stats[label_id, cv2.CC_STAT_AREA]
+                if area < max_small_area:
+                    small_hole_mask[labels == label_id] = 255
+            if np.any(small_hole_mask):
+                inpaint_r = max(fk, 5)
+                map_x = cv2.inpaint(map_x, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
+                map_y = cv2.inpaint(map_y, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
 
         self.map_x = map_x
         self.map_y = map_y

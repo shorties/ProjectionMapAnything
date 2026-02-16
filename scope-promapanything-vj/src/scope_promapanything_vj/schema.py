@@ -51,6 +51,43 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         ),
     )
 
+    open_dashboard: bool = Field(
+        default=False,
+        description="Toggle ON to open the control panel dashboard in your browser.",
+        json_schema_extra=ui_field_config(
+            order=1,
+            label="Open Dashboard",
+            category="input",
+        ),
+    )
+
+    live_depth_preview: bool = Field(
+        default=False,
+        description=(
+            "EXPERIMENTAL: Show live depth map on the projector instead of "
+            "test card. Requires calibration to be loaded. GPU-intensive."
+        ),
+        json_schema_extra=ui_field_config(
+            order=2,
+            label="Live Depth Preview (Alpha)",
+            category="input",
+        ),
+    )
+
+    reset_calibration: bool = Field(
+        default=False,
+        description=(
+            "Toggle ON to reset calibration state and start fresh. "
+            "Clears all captured data so you can recalibrate without "
+            "reloading the pipeline."
+        ),
+        json_schema_extra=ui_field_config(
+            order=3,
+            label="Reset Calibration",
+            category="input",
+        ),
+    )
+
     # -- Configuration (settings panel) ---------------------------------------
 
     projector_width: int = Field(
@@ -135,13 +172,31 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     # -- Input-side controls (left panel) -------------------------------------
 
+    output_mode: Literal[
+        "warped_depth", "warped_camera", "depth_from_warped", "camera_rgb"
+    ] = Field(
+        default="warped_depth",
+        description=(
+            "What to send to the AI generator as conditioning input. "
+            "'warped_depth' = depth map warped to projector POV, "
+            "'warped_camera' = camera RGB warped to projector POV, "
+            "'depth_from_warped' = depth estimated from the warped camera image, "
+            "'camera_rgb' = raw unwarped camera feed."
+        ),
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="Output Mode",
+            category="input",
+        ),
+    )
+
     temporal_smoothing: float = Field(
         default=0.5,
         ge=0.0,
         le=0.99,
         description="Blend factor with the previous depth frame. Higher = smoother.",
         json_schema_extra=ui_field_config(
-            order=0,
+            order=1,
             label="Temporal Smoothing",
             category="input",
         ),
@@ -153,7 +208,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         le=20.0,
         description="Gaussian blur radius on the depth map. 0 = sharp.",
         json_schema_extra=ui_field_config(
-            order=1,
+            order=2,
             label="Depth Blur",
             category="input",
         ),
@@ -175,6 +230,19 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ),
     )
 
+    stream_port: int = Field(
+        default=8765,
+        ge=1024,
+        le=65535,
+        description="MJPEG stream port for the dashboard input preview.",
+        json_schema_extra=ui_field_config(
+            order=1,
+            label="Stream Port",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
     generation_resolution: Literal["quarter", "half", "native"] = Field(
         default="half",
         description=(
@@ -183,7 +251,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "'native' = full projector res (slow, highest quality)."
         ),
         json_schema_extra=ui_field_config(
-            order=1,
+            order=2,
             label="Generation Resolution",
             is_load_param=True,
             category="configuration",

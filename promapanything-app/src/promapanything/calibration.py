@@ -341,14 +341,133 @@ class CalibrationRunner:
         # Store validity mask BEFORE inpainting
         self.proj_valid_mask = valid_proj.copy()
 
-        # Inpaint remaining holes for complete coverage
+        # Only inpaint small internal holes — NOT large uncovered boundary
+        # regions.  Inpainting large holes extrapolates coordinates, creating
+        # fold-overs that distort the entire output.  Small internal holes
+        # (< 0.5% of image) are safe to fill via inpainting.
         hole_mask = (~valid_proj).astype(np.uint8) * 255
         if np.any(~valid_proj):
-            inpaint_r = max(fk, 10)
-            map_x = cv2.inpaint(map_x, hole_mask, inpaint_r, cv2.INPAINT_NS)
-            map_y = cv2.inpaint(map_y, hole_mask, inpaint_r, cv2.INPAINT_NS)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                hole_mask, connectivity=8,
+            )
+            max_small_area = max(int(self.proj_w * self.proj_h * 0.005), 100)
+            small_hole_mask = np.zeros_like(hole_mask)
+            for label_id in range(1, num_labels):
+                area = stats[label_id, cv2.CC_STAT_AREA]
+                if area < max_small_area:
+                    small_hole_mask[labels == label_id] = 255
+            if np.any(small_hole_mask):
+                inpaint_r = max(fk, 5)
+                map_x = cv2.inpaint(map_x, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
+                map_y = cv2.inpaint(map_y, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
 
         return map_x, map_y
+
+
+# ── Map cleanup ──────────────────────────────────────────────────────────────
+
+
+def sanitize_correspondence_maps(
+    map_x: np.ndarray, map_y: np.ndarray,
+    max_deviation: float = 20.0,
+    iterations: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove fold-overs from correspondence maps via iterative outlier removal.
+
+    Uses weighted local smoothing to estimate what the map *should* look
+    like, then removes pixels that deviate significantly.  Each iteration
+    refines the estimate as outliers are excluded from the smooth, so the
+    prediction gets more accurate and subtler fold-overs get caught.
+
+    Preserves the original per-pixel accuracy in valid regions.
+    """
+    h, w = map_x.shape
+    valid = (map_x >= 0) & (map_y >= 0)
+    had_valid = valid.copy()
+
+    if not np.any(valid):
+        return map_x, map_y
+
+    ksize = 101
+    ksize = ksize if ksize % 2 == 1 else ksize + 1
+
+    map_x = map_x.copy().astype(np.float64)
+    map_y = map_y.copy().astype(np.float64)
+
+    for it in range(iterations):
+        # Weighted Gaussian smooth: only valid pixels contribute
+        mask_f = valid.astype(np.float64)
+        wx = np.where(valid, map_x, 0.0) * mask_f
+        wy = np.where(valid, map_y, 0.0) * mask_f
+
+        smooth_wx = cv2.GaussianBlur(wx, (ksize, ksize), 0)
+        smooth_wy = cv2.GaussianBlur(wy, (ksize, ksize), 0)
+        smooth_count = cv2.GaussianBlur(mask_f, (ksize, ksize), 0)
+
+        # Avoid div by zero — only check where we have local data
+        has_data = smooth_count > 0.01
+        safe_count = np.where(has_data, smooth_count, 1.0)
+        pred_x = smooth_wx / safe_count
+        pred_y = smooth_wy / safe_count
+
+        # Compare original to local prediction
+        diff = np.sqrt(
+            (map_x - pred_x) ** 2 + (map_y - pred_y) ** 2
+        )
+        newly_bad = (diff > max_deviation) & valid
+
+        n_removed = int(newly_bad.sum())
+        if n_removed == 0:
+            break
+
+        valid = valid & ~newly_bad
+
+    # ── Enforce per-row / per-column monotonicity ───────────────────
+    # map_x must be non-decreasing along each row (left → right).
+    # map_y must be non-decreasing along each column (top → bottom).
+    # The running-maximum approach catches fold-overs that the smooth
+    # missed (gradual reversals within a large neighborhood).
+    noise_tol = 3.0
+    for y in range(h):
+        idx = np.where(valid[y])[0]
+        if len(idx) < 2:
+            continue
+        vals = map_x[y, idx]
+        cummax = np.maximum.accumulate(vals)
+        back = (cummax - vals) > noise_tol
+        for i in np.where(back)[0]:
+            valid[y, idx[i]] = False
+
+    for x in range(w):
+        idx = np.where(valid[:, x])[0]
+        if len(idx) < 2:
+            continue
+        vals = map_y[idx, x]
+        cummax = np.maximum.accumulate(vals)
+        back = (cummax - vals) > noise_tol
+        for i in np.where(back)[0]:
+            valid[idx[i], x] = False
+
+    total_removed = int((had_valid & ~valid).sum())
+    if total_removed == 0:
+        return map_x.astype(np.float32), map_y.astype(np.float32)
+
+    # Small dilation to clean ragged edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    inv_u8 = (~valid & had_valid).astype(np.uint8) * 255
+    inv_u8 = cv2.dilate(inv_u8, kernel, iterations=1)
+    valid = valid & ~(inv_u8 > 0)
+
+    map_x[~valid] = -1.0
+    map_y[~valid] = -1.0
+
+    kept = int(np.count_nonzero(map_x >= 0))
+    total = h * w
+    removed = int((had_valid & ~valid).sum())
+    print(f"[calibration] sanitize_maps: removed {removed} bad pixels, "
+          f"kept {kept}/{total} ({100*kept/total:.1f}%)")
+
+    return map_x.astype(np.float32), map_y.astype(np.float32)
 
 
 # ── File I/O ─────────────────────────────────────────────────────────────────
@@ -372,4 +491,5 @@ def load_calibration(path: str | Path) -> tuple[np.ndarray, np.ndarray, int, int
     data = json.loads(Path(path).read_text())
     map_x = np.array(data["map_x"], dtype=np.float32)
     map_y = np.array(data["map_y"], dtype=np.float32)
+    map_x, map_y = sanitize_correspondence_maps(map_x, map_y)
     return map_x, map_y, data["projector_width"], data["projector_height"]
