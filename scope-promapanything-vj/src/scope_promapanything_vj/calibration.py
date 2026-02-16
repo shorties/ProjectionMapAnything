@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
 
@@ -445,15 +446,22 @@ def save_calibration(
         "version": 1,
         "projector_width": proj_w,
         "projector_height": proj_h,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "map_x": map_x.tolist(),
         "map_y": map_y.tolist(),
     }
     Path(path).write_text(json.dumps(data))
 
 
-def load_calibration(path: str | Path) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """Load calibration mapping from a JSON file."""
+def load_calibration(
+    path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, int, int, str]:
+    """Load calibration mapping from a JSON file.
+
+    Returns (map_x, map_y, proj_w, proj_h, timestamp_iso).
+    """
     data = json.loads(Path(path).read_text())
     map_x = np.array(data["map_x"], dtype=np.float32)
     map_y = np.array(data["map_y"], dtype=np.float32)
-    return map_x, map_y, data["projector_width"], data["projector_height"]
+    timestamp = data.get("timestamp", "unknown")
+    return map_x, map_y, data["projector_width"], data["projector_height"], timestamp

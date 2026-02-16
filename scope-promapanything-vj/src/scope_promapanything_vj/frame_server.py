@@ -11,12 +11,14 @@ suppressed.
 
 Endpoints
 ---------
-``/``           Control panel — paste RunPod URL, iframe Scope UI, projector status.
-``/projector``  Fullscreen MJPEG viewer — drag to projector monitor, click for fullscreen.
-``/stream``     MJPEG multipart stream (``multipart/x-mixed-replace``).
-``/frame``      Single JPEG snapshot of the latest frame.
-``POST /config``  Companion app reports its projector resolution.
-``GET  /config``  Returns the current projector config (JSON).
+``/``                        Control panel — paste RunPod URL, iframe Scope UI, projector status.
+``/projector``               Fullscreen MJPEG viewer — drag to projector monitor, click for fullscreen.
+``/stream``                  MJPEG multipart stream (``multipart/x-mixed-replace``).
+``/frame``                   Single JPEG snapshot of the latest frame.
+``POST /config``             Companion app reports its projector resolution.
+``GET  /config``             Returns the current projector config (JSON).
+``GET  /calibration/status`` Returns calibration completion status and available files.
+``GET  /calibration/download/<name>``  Download a calibration result file.
 
 Works through RunPod's port proxy — expose the port and connect from anywhere.
 """
@@ -57,7 +59,7 @@ _PROJECTOR_HTML = """\
          display:flex; justify-content:center;
          align-items:center; }
   body.fs { cursor:none; }
-  img { width:100vw; height:100vh;
+  img#stream { width:100vw; height:100vh;
         object-fit:contain; display:block; }
   #hint { position:fixed; bottom:30px;
           left:50%; transform:translateX(-50%);
@@ -65,12 +67,44 @@ _PROJECTOR_HTML = """\
           pointer-events:none;
           transition:opacity 0.5s; }
   body.fs #hint { opacity:0; }
+
+  /* Calibration download overlay */
+  #calib-overlay { display:none; position:fixed; inset:0;
+    background:rgba(0,0,0,0.85); z-index:100;
+    flex-direction:column; align-items:center; justify-content:center; gap:16px; }
+  #calib-overlay.show { display:flex; }
+  #calib-overlay h2 { color:#4ecca3; font:bold 24px sans-serif; }
+  #calib-overlay .ts { color:#888; font:12px sans-serif; }
+  #calib-overlay .files { display:flex; flex-direction:column; gap:8px;
+    background:rgba(255,255,255,0.05); border-radius:8px; padding:16px; min-width:320px; }
+  #calib-overlay .file-row { display:flex; align-items:center; justify-content:space-between;
+    gap:12px; }
+  #calib-overlay .fname { color:#ddd; font:13px monospace; }
+  #calib-overlay .dl-btn { padding:6px 14px; border:none; border-radius:4px;
+    background:#4ecca3; color:#000; font:bold 12px sans-serif; cursor:pointer; }
+  #calib-overlay .dl-btn:hover { background:#3db893; }
+  #calib-overlay .dl-all { margin-top:8px; padding:10px 24px; border:none; border-radius:6px;
+    background:#e94560; color:#fff; font:bold 14px sans-serif; cursor:pointer; }
+  #calib-overlay .dl-all:hover { background:#c73652; }
+  #calib-overlay .dismiss { margin-top:4px; background:none; border:1px solid #555;
+    border-radius:4px; padding:6px 16px; color:#888; font:12px sans-serif; cursor:pointer; }
+  #calib-overlay .dismiss:hover { border-color:#aaa; color:#aaa; }
 </style>
 </head><body>
 <img id="stream" src="/stream" />
 <div id="hint">Click to go fullscreen &mdash; drag this window to your projector first</div>
+
+<div id="calib-overlay">
+  <h2>Calibration Complete</h2>
+  <div class="ts" id="calib-ts"></div>
+  <div class="files" id="calib-files"></div>
+  <button class="dl-all" onclick="downloadAll()">Download All</button>
+  <button class="dismiss" onclick="dismissOverlay()">Dismiss</button>
+</div>
+
 <script>
-document.body.addEventListener('click', () => {
+document.body.addEventListener('click', (e) => {
+  if (e.target.closest('#calib-overlay')) return;
   if (!document.fullscreenElement) {
     document.documentElement.requestFullscreen().catch(() => {});
   }
@@ -88,6 +122,72 @@ function postConfig() {
 }
 postConfig();
 setInterval(postConfig, 30000);
+
+// Calibration completion detection
+let calibShown = false;
+let calibDismissed = false;
+let lastCalibTs = '';
+
+function triggerDownload(name) {
+  const a = document.createElement('a');
+  a.href = '/calibration/download/' + encodeURIComponent(name);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function downloadAll() {
+  const rows = document.querySelectorAll('#calib-files .fname');
+  let delay = 0;
+  rows.forEach(el => {
+    setTimeout(() => triggerDownload(el.textContent), delay);
+    delay += 300;
+  });
+}
+
+function dismissOverlay() {
+  document.getElementById('calib-overlay').classList.remove('show');
+  calibDismissed = true;
+}
+
+function showCalibResults(data) {
+  if (calibDismissed && data.timestamp === lastCalibTs) return;
+  lastCalibTs = data.timestamp || '';
+  calibDismissed = false;
+
+  const filesDiv = document.getElementById('calib-files');
+  filesDiv.innerHTML = '';
+  (data.files || []).forEach(name => {
+    const row = document.createElement('div');
+    row.className = 'file-row';
+    row.innerHTML = '<span class="fname">' + name + '</span>' +
+      '<button class="dl-btn" onclick="triggerDownload(\\'' +
+      name.replace(/'/g, "\\\\'") + '\\')">Download</button>';
+    filesDiv.appendChild(row);
+  });
+
+  const tsEl = document.getElementById('calib-ts');
+  tsEl.textContent = data.timestamp ? 'Captured: ' + new Date(data.timestamp).toLocaleString() : '';
+
+  document.getElementById('calib-overlay').classList.add('show');
+  calibShown = true;
+}
+
+async function pollCalibration() {
+  try {
+    const r = await fetch('/calibration/status');
+    const data = await r.json();
+    if (data.complete) {
+      showCalibResults(data);
+    } else {
+      calibShown = false;
+      calibDismissed = false;
+      document.getElementById('calib-overlay').classList.remove('show');
+    }
+  } catch {}
+}
+setInterval(pollCalibration, 2000);
 </script>
 </body></html>
 """
@@ -268,6 +368,11 @@ class FrameStreamer:
         # Calibration priority: when True, submit_frame() is suppressed
         self._calibration_active = False
 
+        # Calibration results for download
+        self._calibration_files: dict[str, bytes] = {}
+        self._calibration_complete = False
+        self._calibration_timestamp: str = ""
+
         # Client-reported projector config (resolution, monitor name)
         self._client_config: dict | None = None
         self._load_persisted_config()
@@ -292,6 +397,20 @@ class FrameStreamer:
     def client_config(self) -> dict | None:
         """Resolution reported by the companion app, or None."""
         return self._client_config
+
+    def set_calibration_results(
+        self, files: dict[str, bytes], timestamp: str = ""
+    ) -> None:
+        """Store calibration result files for download via the projector page."""
+        self._calibration_files = files
+        self._calibration_complete = True
+        self._calibration_timestamp = timestamp
+
+    def clear_calibration_results(self) -> None:
+        """Clear stored calibration results (e.g. when starting a new calibration)."""
+        self._calibration_files = {}
+        self._calibration_complete = False
+        self._calibration_timestamp = ""
 
     def _load_persisted_config(self) -> None:
         """Load last-known projector config from disk."""
@@ -326,14 +445,19 @@ class FrameStreamer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self_handler) -> None:  # noqa: N805
-                if self_handler.path == "/stream":
+                path = self_handler.path.split("?")[0]
+                if path == "/stream":
                     self_handler._handle_stream()
-                elif self_handler.path == "/frame":
+                elif path == "/frame":
                     self_handler._handle_frame()
-                elif self_handler.path == "/config":
+                elif path == "/config":
                     self_handler._handle_get_config()
-                elif self_handler.path == "/projector":
+                elif path == "/projector":
                     self_handler._handle_projector()
+                elif path == "/calibration/status":
+                    self_handler._handle_calibration_status()
+                elif path.startswith("/calibration/download/"):
+                    self_handler._handle_calibration_download(path)
                 else:
                     self_handler._handle_control_panel()
 
@@ -454,6 +578,48 @@ class FrameStreamer:
                     )
                     self_handler.send_response(400)
                     self_handler.end_headers()
+
+            def _handle_calibration_status(self_handler) -> None:  # noqa: N805
+                """Return calibration completion status and file list."""
+                data = {
+                    "complete": streamer._calibration_complete,
+                    "files": list(streamer._calibration_files.keys()),
+                    "timestamp": streamer._calibration_timestamp,
+                }
+                body = json.dumps(data).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.send_header("Cache-Control", "no-cache")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_calibration_download(self_handler, path: str) -> None:  # noqa: N805
+                """Serve a calibration result file for download."""
+                from urllib.parse import unquote
+                name = unquote(path.split("/calibration/download/", 1)[-1])
+                data = streamer._calibration_files.get(name)
+                if data is None:
+                    self_handler.send_response(404)
+                    self_handler.end_headers()
+                    return
+                # Determine content type
+                if name.endswith(".json"):
+                    ct = "application/json"
+                elif name.endswith(".png"):
+                    ct = "image/png"
+                else:
+                    ct = "application/octet-stream"
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", ct)
+                self_handler.send_header("Content-Length", str(len(data)))
+                self_handler.send_header(
+                    "Content-Disposition", f'attachment; filename="{name}"'
+                )
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(data)
 
             def log_message(self_handler, format, *args) -> None:  # noqa: N805
                 pass  # suppress per-request logging

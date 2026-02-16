@@ -77,6 +77,9 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self._calibrating = False
         self._done = False
 
+        # Build the grey test card (shown on projector before calibration)
+        self._test_card = self._build_test_card()
+
         # Compute the projector URL (RunPod auto-detect)
         import os
         pod_id = os.environ.get("RUNPOD_POD_ID", "")
@@ -90,6 +93,45 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self.proj_w, self.proj_h, self._projector_url,
         )
 
+    def _build_test_card(self) -> torch.Tensor:
+        """Build a grey test card image at projector resolution.
+
+        Shown on the projector before calibration starts to avoid
+        camera-projector feedback loops.  Returns (H, W, 3) float32 [0,1].
+        """
+        card = np.full((self.proj_h, self.proj_w, 3), 128, dtype=np.uint8)
+
+        # Thin white border
+        cv2.rectangle(card, (2, 2), (self.proj_w - 3, self.proj_h - 3),
+                       (200, 200, 200), 1)
+
+        # Centre crosshair
+        cx, cy = self.proj_w // 2, self.proj_h // 2
+        arm = min(self.proj_w, self.proj_h) // 20
+        cv2.line(card, (cx - arm, cy), (cx + arm, cy), (200, 200, 200), 1)
+        cv2.line(card, (cx, cy - arm), (cx, cy + arm), (200, 200, 200), 1)
+
+        # Text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = min(self.proj_w, self.proj_h) / 800.0
+        thick = max(1, int(scale * 2))
+
+        msg1 = "READY TO CALIBRATE"
+        sz1 = cv2.getTextSize(msg1, font, scale, thick)[0]
+        cv2.putText(card, msg1,
+                    (cx - sz1[0] // 2, cy - sz1[1] - 10),
+                    font, scale, (220, 220, 220), thick, cv2.LINE_AA)
+
+        msg2 = "Toggle Start Calibration to begin"
+        scale2 = scale * 0.5
+        thick2 = max(1, int(scale2 * 2))
+        sz2 = cv2.getTextSize(msg2, font, scale2, thick2)[0]
+        cv2.putText(card, msg2,
+                    (cx - sz2[0] // 2, cy + sz2[1] + 20),
+                    font, scale2, (180, 180, 180), thick2, cv2.LINE_AA)
+
+        return torch.from_numpy(card.astype(np.float32) / 255.0).to(self.device)
+
     def prepare(self, **kwargs) -> Requirements:
         return Requirements(input_size=1)
 
@@ -101,21 +143,20 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         frame = video[0]  # (1, H, W, C) [0, 255]
         start = kwargs.get("start_calibration", False)
 
-        # -- Not started yet: pass through camera feed -----------------------
+        # -- Not started yet: show grey test card (avoids feedback loop) ------
         if not start and not self._calibrating:
             self._done = False
-            out = frame.squeeze(0).to(dtype=torch.float32)
-            if out.max() > 1.5:
-                out = out / 255.0
-            # Send camera feed to streamer (projector pop-out shows camera)
-            self._submit_to_streamer(out)
-            return {"video": out.unsqueeze(0).clamp(0, 1)}
+            # Send test card to streamer (projector shows neutral grey)
+            self._submit_to_streamer(self._test_card)
+            return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
 
         # -- Start calibration on first toggle ON ----------------------------
         if start and not self._calibrating and not self._done:
             self._calib = CalibrationState(self.proj_w, self.proj_h)
             self._calib.start()
             self._calibrating = True
+            if self._streamer is not None:
+                self._streamer.clear_calibration_results()
             logger.info(
                 "Calibration started (%d patterns)", self._calib.total_patterns
             )
@@ -136,11 +177,14 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                         "Calibration complete — saved to %s",
                         _DEFAULT_CALIBRATION_PATH,
                     )
+                    self._publish_calibration_results(
+                        map_x, map_y, frame,
+                    )
                 else:
                     logger.warning("Calibration finished but mapping was None")
                 self._calibrating = False
                 self._done = True
-                # Fall through to camera passthrough
+                # Fall through to test card
 
             elif pattern is not None:
                 # Output the pattern — Scope displays it in the viewer
@@ -151,7 +195,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 self._submit_calibration_to_streamer(t)
                 return {"video": t.unsqueeze(0).clamp(0, 1)}
 
-        # -- Done or toggled off: camera passthrough -------------------------
+        # -- Done or toggled off: show test card again -------------------------
         if not start:
             self._calibrating = False
             self._done = False
@@ -160,11 +204,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         if self._streamer is not None:
             self._streamer.calibration_active = False
 
-        out = frame.squeeze(0).to(dtype=torch.float32)
-        if out.max() > 1.5:
-            out = out / 255.0
-        self._submit_to_streamer(out)
-        return {"video": out.unsqueeze(0).clamp(0, 1)}
+        self._submit_to_streamer(self._test_card)
+        return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
 
     def _submit_to_streamer(self, frame_01: torch.Tensor) -> None:
         """Send a [0,1] float tensor to the MJPEG streamer."""
@@ -178,6 +219,63 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._streamer.calibration_active = True
             rgb_np = (frame_01.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
             self._streamer.submit_calibration_frame(rgb_np)
+
+    def _publish_calibration_results(
+        self,
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        last_frame: torch.Tensor,
+    ) -> None:
+        """Generate downloadable calibration artifacts and push to streamer."""
+        if self._streamer is None:
+            return
+
+        from datetime import datetime, timezone
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        files: dict[str, bytes] = {}
+
+        # 1. Calibration JSON
+        try:
+            files["calibration.json"] = _DEFAULT_CALIBRATION_PATH.read_bytes()
+        except Exception:
+            logger.warning("Could not read calibration JSON for download")
+
+        # 2. Coverage map — green where valid, black where inpainted
+        if self._calib is not None and self._calib.proj_valid_mask is not None:
+            coverage = np.zeros(
+                (self.proj_h, self.proj_w, 3), dtype=np.uint8
+            )
+            coverage[self._calib.proj_valid_mask] = [0, 200, 100]
+            ok, buf = cv2.imencode(".png", cv2.cvtColor(coverage, cv2.COLOR_RGB2BGR))
+            if ok:
+                files["coverage_map.png"] = buf.tobytes()
+
+        # 3. Warped camera image — proves calibration alignment
+        try:
+            cam_np = last_frame.squeeze(0).cpu().numpy()
+            if cam_np.max() > 1.5:
+                cam_np = cam_np.astype(np.uint8)
+            else:
+                cam_np = (cam_np * 255).clip(0, 255).astype(np.uint8)
+            warped = cv2.remap(
+                cam_np, map_x, map_y,
+                cv2.INTER_LINEAR, borderValue=0,
+            )
+            ok, buf = cv2.imencode(
+                ".png", cv2.cvtColor(warped, cv2.COLOR_RGB2BGR)
+            )
+            if ok:
+                files["warped_camera.png"] = buf.tobytes()
+        except Exception:
+            logger.warning("Could not generate warped camera image", exc_info=True)
+
+        if files:
+            self._streamer.set_calibration_results(files, timestamp)
+            logger.info(
+                "Calibration results published for download: %s",
+                list(files.keys()),
+            )
 
 
 # =============================================================================
@@ -227,12 +325,15 @@ class ProMapAnythingPipeline(Pipeline):
         # Load calibration (explicit path or default)
         cal_path = Path(calibration_file) if calibration_file else _DEFAULT_CALIBRATION_PATH
         if cal_path.is_file():
-            mx, my, pw, ph = load_calibration(cal_path)
+            mx, my, pw, ph, ts = load_calibration(cal_path)
             self._map_x = mx
             self._map_y = my
             self.proj_w = pw
             self.proj_h = ph
-            logger.info("Loaded calibration from %s (%dx%d)", cal_path, pw, ph)
+            logger.info(
+                "Calibration loaded from %s (%dx%d, captured %s)",
+                cal_path, pw, ph, ts,
+            )
         else:
             logger.warning(
                 "No calibration found at %s — output will be un-warped camera depth",
