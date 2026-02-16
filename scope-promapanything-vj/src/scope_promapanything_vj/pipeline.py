@@ -226,10 +226,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         map_y: np.ndarray,
         last_frame: torch.Tensor,
     ) -> None:
-        """Generate downloadable calibration artifacts and push to streamer."""
-        if self._streamer is None:
-            return
-
+        """Generate calibration artifacts, push to streamer, and upload to Scope gallery."""
         from datetime import datetime, timezone
 
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -252,6 +249,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 files["coverage_map.png"] = buf.tobytes()
 
         # 3. Warped camera image — proves calibration alignment
+        warped_png: bytes | None = None
         try:
             cam_np = last_frame.squeeze(0).cpu().numpy()
             if cam_np.max() > 1.5:
@@ -266,16 +264,64 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 ".png", cv2.cvtColor(warped, cv2.COLOR_RGB2BGR)
             )
             if ok:
-                files["warped_camera.png"] = buf.tobytes()
+                warped_png = buf.tobytes()
+                files["warped_camera.png"] = warped_png
         except Exception:
             logger.warning("Could not generate warped camera image", exc_info=True)
 
-        if files:
+        # Push to streamer for download overlay
+        if files and self._streamer is not None:
             self._streamer.set_calibration_results(files, timestamp)
             logger.info(
                 "Calibration results published for download: %s",
                 list(files.keys()),
             )
+
+        # Upload warped image + coverage to Scope's asset gallery for VACE
+        self._upload_to_scope_gallery(files)
+
+    def _upload_to_scope_gallery(self, files: dict[str, bytes]) -> None:
+        """Upload calibration images to Scope's asset gallery for VACE use."""
+        import io
+        import urllib.request
+
+        scope_url = "http://localhost:8000"
+        upload_url = f"{scope_url}/api/v1/assets"
+
+        for name, data in files.items():
+            if not name.endswith(".png"):
+                continue
+            try:
+                # Build multipart form data
+                boundary = b"----ProMapBoundary"
+                body = b"--" + boundary + b"\r\n"
+                body += (
+                    f'Content-Disposition: form-data; name="file"; '
+                    f'filename="{name}"\r\n'
+                ).encode()
+                body += b"Content-Type: image/png\r\n\r\n"
+                body += data + b"\r\n"
+                body += b"--" + boundary + b"--\r\n"
+
+                req = urllib.request.Request(
+                    upload_url,
+                    data=body,
+                    headers={
+                        "Content-Type": f"multipart/form-data; boundary={boundary.decode()}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    logger.info(
+                        "Uploaded %s to Scope gallery (status %d)",
+                        name, resp.status,
+                    )
+            except Exception:
+                logger.debug(
+                    "Could not upload %s to Scope gallery (API may not be available)",
+                    name,
+                    exc_info=True,
+                )
 
 
 # =============================================================================

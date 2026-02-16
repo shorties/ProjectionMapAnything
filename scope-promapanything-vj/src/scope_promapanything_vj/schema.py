@@ -21,7 +21,8 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
     Appears in the **main pipeline** selector.  Select it, hit play, position
     the Scope viewer on the projector, then toggle **Start Calibration**.
     Patterns are displayed in the viewer and captured by the camera.
-    When done, the calibration mapping saves automatically.
+    When done, the calibration mapping saves automatically and the result
+    is uploaded to the media gallery for VACE conditioning.
     """
 
     pipeline_id = "promapanything-calibrate"
@@ -35,7 +36,22 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
     supports_prompts = False
     modes = {"video": ModeDefaults(default=True)}
 
-    # -- Load-time parameters -------------------------------------------------
+    # -- Input-side controls (left panel) -------------------------------------
+
+    start_calibration: bool = Field(
+        default=False,
+        description=(
+            "Toggle to start calibration. Position the viewer on the "
+            "projector first, then flip this ON."
+        ),
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="Start Calibration",
+            category="input",
+        ),
+    )
+
+    # -- Configuration (settings panel) ---------------------------------------
 
     projector_width: int = Field(
         default=1920,
@@ -91,17 +107,6 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         ),
     )
 
-    # -- Runtime controls -----------------------------------------------------
-
-    start_calibration: bool = Field(
-        default=False,
-        description=(
-            "Toggle to start calibration. First open the projector URL "
-            "above in a browser, then flip this ON."
-        ),
-        json_schema_extra=ui_field_config(order=10, label="Start Calibration"),
-    )
-
 
 # =============================================================================
 # Depth preprocessor
@@ -128,7 +133,33 @@ class ProMapAnythingConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
     usage = [UsageType.PREPROCESSOR]
 
-    # -- Load-time parameters -------------------------------------------------
+    # -- Input-side controls (left panel) -------------------------------------
+
+    temporal_smoothing: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=0.99,
+        description="Blend factor with the previous depth frame. Higher = smoother.",
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="Temporal Smoothing",
+            category="input",
+        ),
+    )
+
+    depth_blur: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=20.0,
+        description="Gaussian blur radius on the depth map. 0 = sharp.",
+        json_schema_extra=ui_field_config(
+            order=1,
+            label="Depth Blur",
+            category="input",
+        ),
+    )
+
+    # -- Configuration (settings panel) ---------------------------------------
 
     calibration_file: str = Field(
         default="",
@@ -159,24 +190,6 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ),
     )
 
-    # -- Runtime controls -----------------------------------------------------
-
-    temporal_smoothing: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=0.99,
-        description="Blend factor with the previous depth frame. Higher = smoother.",
-        json_schema_extra=ui_field_config(order=10, label="Temporal Smoothing"),
-    )
-
-    depth_blur: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=20.0,
-        description="Gaussian blur radius on the depth map. 0 = sharp.",
-        json_schema_extra=ui_field_config(order=11, label="Depth Blur"),
-    )
-
 
 # =============================================================================
 # Projector Output postprocessor
@@ -201,6 +214,23 @@ class ProMapAnythingProjectorConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
     usage = [UsageType.POSTPROCESSOR]
 
+    # -- Input-side controls (left panel) -------------------------------------
+
+    upscale_to_projector: bool = Field(
+        default=True,
+        description=(
+            "Upscale output to projector resolution before streaming. "
+            "Uses resolution from the companion app or calibration."
+        ),
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="Upscale to Projector",
+            category="input",
+        ),
+    )
+
+    # -- Configuration (settings panel) ---------------------------------------
+
     stream_port: int = Field(
         default=8765,
         ge=1024,
@@ -212,13 +242,4 @@ class ProMapAnythingProjectorConfig(BasePipelineConfig):
             is_load_param=True,
             category="configuration",
         ),
-    )
-
-    upscale_to_projector: bool = Field(
-        default=True,
-        description=(
-            "Upscale output to projector resolution before streaming. "
-            "Uses resolution from the companion app or calibration."
-        ),
-        json_schema_extra=ui_field_config(order=1, label="Upscale to Projector"),
     )
