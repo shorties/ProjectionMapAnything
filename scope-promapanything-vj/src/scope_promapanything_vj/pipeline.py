@@ -77,17 +77,17 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self._calibrating = False
         self._done = False
 
-        # Log the control panel URL
+        # Compute the projector URL (RunPod auto-detect)
         import os
         pod_id = os.environ.get("RUNPOD_POD_ID", "")
         if pod_id:
-            url = f"https://{pod_id}-{port}.proxy.runpod.net/"
+            self._projector_url = f"https://{pod_id}-{port}.proxy.runpod.net/"
         else:
-            url = f"http://localhost:{port}/"
+            self._projector_url = f"http://localhost:{port}/"
         logger.info(
             "Calibration pipeline ready: %dx%d projector — "
             "open %s for projector pop-out",
-            self.proj_w, self.proj_h, url,
+            self.proj_w, self.proj_h, self._projector_url,
         )
 
     def prepare(self, **kwargs) -> Requirements:

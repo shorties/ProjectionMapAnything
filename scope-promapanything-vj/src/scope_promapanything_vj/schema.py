@@ -67,13 +67,25 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         default=8765,
         ge=1024,
         le=65535,
-        description=(
-            "MJPEG stream port. Open the control panel in your browser "
-            "to pop out a fullscreen projector window."
-        ),
+        description="MJPEG stream port for projector pop-out window.",
         json_schema_extra=ui_field_config(
             order=2,
             label="Stream Port",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
+    projector_url: str = Field(
+        default="http://localhost:8765/",
+        description=(
+            "Open this URL in a browser to get the projector pop-out. "
+            "On RunPod this is auto-detected. Drag the window to your "
+            "projector, click to fullscreen, then start calibration."
+        ),
+        json_schema_extra=ui_field_config(
+            order=3,
+            label="Projector URL (open in browser)",
             is_load_param=True,
             category="configuration",
         ),
@@ -84,8 +96,8 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
     start_calibration: bool = Field(
         default=False,
         description=(
-            "Toggle to start calibration. First open the projector window "
-            "from the control panel, then flip this ON."
+            "Toggle to start calibration. First open the projector URL "
+            "above in a browser, then flip this ON."
         ),
         json_schema_extra=ui_field_config(order=10, label="Start Calibration"),
     )
