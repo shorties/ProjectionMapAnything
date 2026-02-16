@@ -102,7 +102,7 @@ class CalibrationState:
         self,
         proj_w: int,
         proj_h: int,
-        settle_frames: int = 3,
+        settle_frames: int = 6,
         capture_frames: int = 3,
         decode_threshold: float = 20.0,
         bit_threshold: float = 3.0,
@@ -156,8 +156,16 @@ class CalibrationState:
         self.proj_valid_mask = None
 
     def _camera_to_gray(self, frame_tensor: torch.Tensor) -> np.ndarray:
-        """Convert a (1, H, W, C) [0,255] tensor to a grayscale numpy array."""
-        img = frame_tensor.squeeze(0).cpu().numpy().astype(np.uint8)
+        """Convert a (1, H, W, C) tensor to a grayscale uint8 numpy array.
+
+        Handles both float [0,1] and uint8 [0,255] input formats.
+        """
+        img = frame_tensor.squeeze(0).cpu().numpy()
+        # Convert float [0,1] to uint8 [0,255]
+        if img.dtype != np.uint8:
+            if img.max() <= 1.5:
+                img = (img * 255.0).clip(0, 255)
+            img = img.astype(np.uint8)
         if img.ndim == 3 and img.shape[2] == 3:
             img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         return img
