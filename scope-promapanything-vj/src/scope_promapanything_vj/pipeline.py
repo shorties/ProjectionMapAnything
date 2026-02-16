@@ -68,14 +68,26 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self.proj_w: int = kwargs.get("projector_width", 1920)
         self.proj_h: int = kwargs.get("projector_height", 1080)
 
+        # Start the MJPEG streamer for the projector pop-out window
+        port = kwargs.get("stream_port", 8765)
+        self._streamer = get_or_create_streamer(port)
+
         # Calibration state — created lazily when start_calibration is toggled
         self._calib: CalibrationState | None = None
         self._calibrating = False
         self._done = False
 
+        # Log the control panel URL
+        import os
+        pod_id = os.environ.get("RUNPOD_POD_ID", "")
+        if pod_id:
+            url = f"https://{pod_id}-{port}.proxy.runpod.net/"
+        else:
+            url = f"http://localhost:{port}/"
         logger.info(
-            "Calibration pipeline ready: %dx%d projector",
-            self.proj_w, self.proj_h,
+            "Calibration pipeline ready: %dx%d projector — "
+            "open %s for projector pop-out",
+            self.proj_w, self.proj_h, url,
         )
 
     def prepare(self, **kwargs) -> Requirements:
@@ -95,6 +107,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             out = frame.squeeze(0).to(dtype=torch.float32)
             if out.max() > 1.5:
                 out = out / 255.0
+            # Send camera feed to streamer (projector pop-out shows camera)
+            self._submit_to_streamer(out)
             return {"video": out.unsqueeze(0).clamp(0, 1)}
 
         # -- Start calibration on first toggle ON ----------------------------
@@ -133,6 +147,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 t = pattern.squeeze(0) if pattern.ndim == 4 else pattern
                 if t.max() > 1.5:
                     t = t / 255.0
+                # Also send pattern to the streamer (projector pop-out)
+                self._submit_calibration_to_streamer(t)
                 return {"video": t.unsqueeze(0).clamp(0, 1)}
 
         # -- Done or toggled off: camera passthrough -------------------------
@@ -141,10 +157,27 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._done = False
             self._calib = None
 
+        if self._streamer is not None:
+            self._streamer.calibration_active = False
+
         out = frame.squeeze(0).to(dtype=torch.float32)
         if out.max() > 1.5:
             out = out / 255.0
+        self._submit_to_streamer(out)
         return {"video": out.unsqueeze(0).clamp(0, 1)}
+
+    def _submit_to_streamer(self, frame_01: torch.Tensor) -> None:
+        """Send a [0,1] float tensor to the MJPEG streamer."""
+        if self._streamer is not None and self._streamer.is_running:
+            rgb_np = (frame_01.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            self._streamer.submit_frame(rgb_np)
+
+    def _submit_calibration_to_streamer(self, frame_01: torch.Tensor) -> None:
+        """Send a calibration pattern to the streamer (bypasses suppression)."""
+        if self._streamer is not None and self._streamer.is_running:
+            self._streamer.calibration_active = True
+            rgb_np = (frame_01.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            self._streamer.submit_calibration_frame(rgb_np)
 
 
 # =============================================================================

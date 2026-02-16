@@ -63,14 +63,29 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         ),
     )
 
+    stream_port: int = Field(
+        default=8765,
+        ge=1024,
+        le=65535,
+        description=(
+            "MJPEG stream port. Open the control panel in your browser "
+            "to pop out a fullscreen projector window."
+        ),
+        json_schema_extra=ui_field_config(
+            order=2,
+            label="Stream Port",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
     # -- Runtime controls -----------------------------------------------------
 
     start_calibration: bool = Field(
         default=False,
         description=(
-            "Toggle to start calibration. Position the Scope viewer on "
-            "the projector first, then flip this ON. Patterns will be "
-            "projected and captured automatically."
+            "Toggle to start calibration. First open the projector window "
+            "from the control panel, then flip this ON."
         ),
         json_schema_extra=ui_field_config(order=10, label="Start Calibration"),
     )

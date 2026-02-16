@@ -96,202 +96,144 @@ _CONTROL_PANEL_HTML = """\
 <!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<title>ProMapAnything Control Panel</title>
+<title>ProMapAnything</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#1a1a2e; color:#e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; height:100vh; display:flex; }
+  body { background:#1a1a2e; color:#e0e0e0;
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         height:100vh; display:flex; flex-direction:column;
+         align-items:center; justify-content:center; gap:24px; }
+  h1 { font-size:22px; color:#e94560; }
+  .sub { font-size:13px; color:#888; margin-top:4px; }
+  .env-badge { display:inline-block; padding:2px 8px; border-radius:4px;
+               font-size:11px; font-weight:600; margin-left:8px; }
+  .env-local { background:#1a4a1a; color:#4ecca3; }
+  .env-remote { background:#4a1a1a; color:#e94560; }
 
-  /* Sidebar */
-  .sidebar { width:320px; min-width:320px; background:#16213e; padding:20px;
-             display:flex; flex-direction:column; gap:16px; overflow-y:auto; border-right: 1px solid #0f3460; }
-  .sidebar h1 { font-size:18px; color:#e94560; margin-bottom:4px; }
-  .sidebar .subtitle { font-size:12px; color:#888; margin-bottom:8px; }
+  .big-btn { display:flex; align-items:center; justify-content:center; gap:10px;
+             padding:16px 32px; border:none; border-radius:10px;
+             font-size:18px; font-weight:700; cursor:pointer;
+             background:#e94560; color:#fff; transition:background 0.2s;
+             box-shadow:0 4px 20px rgba(233,69,96,0.3); }
+  .big-btn:hover { background:#c73652; }
 
-  /* Cards */
-  .card { background:#0f3460; border-radius:8px; padding:14px; }
-  .card h2 { font-size:13px; color:#e94560; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; }
-  .card label { font-size:12px; color:#aaa; display:block; margin-bottom:4px; }
-  .card input[type=text] { width:100%; padding:8px 10px; border:1px solid #1a1a4e; border-radius:4px;
-                           background:#16213e; color:#fff; font-size:13px; outline:none; }
-  .card input[type=text]:focus { border-color:#e94560; }
-  .card input[type=text]::placeholder { color:#555; }
+  .preview { border-radius:8px; overflow:hidden; background:#000;
+             width:480px; max-width:90vw; aspect-ratio:16/9; }
+  .preview img { width:100%; height:100%; object-fit:contain; }
 
-  /* Buttons */
-  .btn { display:inline-flex; align-items:center; justify-content:center; gap:6px;
-         padding:8px 14px; border:none; border-radius:6px; font-size:13px; font-weight:600;
-         cursor:pointer; transition: background 0.2s; text-decoration:none; }
-  .btn-primary { background:#e94560; color:#fff; }
-  .btn-primary:hover { background:#c73652; }
-  .btn-secondary { background:#1a1a4e; color:#ddd; border:1px solid #333; }
-  .btn-secondary:hover { background:#252560; }
-  .btn-sm { padding:6px 10px; font-size:12px; }
-  .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+  .status { display:flex; align-items:center; gap:8px; font-size:13px; }
+  .dot { width:10px; height:10px; border-radius:50%; }
+  .dot.green { background:#4ecca3; box-shadow:0 0 6px #4ecca3; }
+  .dot.yellow { background:#f0c040; box-shadow:0 0 6px #f0c040; }
+  .dot.red { background:#e94560; }
+  .detail { font-size:11px; color:#666; }
 
-  /* Status indicators */
-  .status-row { display:flex; align-items:center; gap:8px; margin:6px 0; }
-  .status-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-  .status-dot.green { background:#4ecca3; box-shadow:0 0 6px #4ecca3; }
-  .status-dot.yellow { background:#f0c040; box-shadow:0 0 6px #f0c040; }
-  .status-dot.red { background:#e94560; box-shadow:0 0 6px #e94560; }
-  .status-text { font-size:13px; }
-  .status-detail { font-size:11px; color:#888; margin-left:18px; }
+  .links { font-size:12px; color:#555; }
+  .links a { color:#4ecca3; }
 
-  /* Preview */
-  .preview-container { position:relative; border-radius:6px; overflow:hidden;
-                       background:#000; aspect-ratio:16/9; }
-  .preview-container img { width:100%; height:100%; object-fit:contain; }
-  .preview-label { position:absolute; top:6px; left:8px; font-size:10px; color:#888;
-                   background:rgba(0,0,0,0.6); padding:2px 6px; border-radius:3px; }
-
-  /* Main area */
-  .main { flex:1; display:flex; flex-direction:column; }
-  .iframe-bar { display:flex; align-items:center; gap:10px; padding:8px 16px;
-                background:#16213e; border-bottom:1px solid #0f3460; }
-  .iframe-bar .url-display { flex:1; font-size:12px; color:#888; overflow:hidden;
-                             text-overflow:ellipsis; white-space:nowrap; }
-  .iframe-container { flex:1; position:relative; }
-  .iframe-container iframe { width:100%; height:100%; border:none; }
-  .iframe-placeholder { position:absolute; inset:0; display:flex; flex-direction:column;
-                        align-items:center; justify-content:center; gap:16px; color:#555; }
-  .iframe-placeholder .icon { font-size:48px; }
-  .iframe-placeholder p { font-size:14px; max-width:400px; text-align:center; line-height:1.5; }
+  .scope-section { display:flex; align-items:center; gap:8px; }
+  .scope-section input { padding:6px 10px; border:1px solid #333; border-radius:4px;
+                         background:#16213e; color:#fff; font-size:12px; width:300px; outline:none; }
+  .scope-section input:focus { border-color:#e94560; }
+  .scope-btn { padding:6px 12px; border:none; border-radius:4px;
+               font-size:12px; font-weight:600; cursor:pointer;
+               background:#0f3460; color:#ddd; transition:background 0.2s; }
+  .scope-btn:hover { background:#1a4a80; }
 </style>
 </head><body>
 
-<div class="sidebar">
-  <div>
-    <h1>ProMapAnything</h1>
-    <div class="subtitle">Control Panel</div>
-  </div>
-
-  <!-- Scope Connection -->
-  <div class="card">
-    <h2>Scope Instance</h2>
-    <label for="scope-url">RunPod / Scope URL</label>
-    <input type="text" id="scope-url" placeholder="https://xxxxx-8000.proxy.runpod.net" spellcheck="false" />
-    <div style="margin-top:10px;" class="btn-row">
-      <button class="btn btn-primary btn-sm" onclick="loadScope()">Load</button>
-      <button class="btn btn-secondary btn-sm" onclick="openScopeTab()">Open in Tab</button>
-    </div>
-  </div>
-
-  <!-- Projector Output -->
-  <div class="card">
-    <h2>Projector Output</h2>
-    <div class="btn-row" style="margin-bottom:10px;">
-      <button class="btn btn-primary" onclick="openProjector()">Open Projector Window</button>
-    </div>
-    <div class="status-row">
-      <div class="status-dot" id="proj-dot"></div>
-      <span class="status-text" id="proj-status">Checking...</span>
-    </div>
-    <div class="status-detail" id="proj-resolution"></div>
-    <div class="status-detail" id="proj-calibration"></div>
-  </div>
-
-  <!-- Stream Preview -->
-  <div class="card">
-    <h2>Stream Preview</h2>
-    <div class="preview-container">
-      <img id="preview" src="/frame" />
-      <div class="preview-label">Live</div>
-    </div>
-    <div style="margin-top:8px; text-align:center;">
-      <button class="btn btn-secondary btn-sm" onclick="refreshPreview()">Refresh</button>
-    </div>
-  </div>
-
-  <!-- Quick Links -->
-  <div class="card">
-    <h2>Endpoints</h2>
-    <div style="font-size:12px; line-height:1.8;">
-      <a href="/stream" target="_blank" style="color:#4ecca3;">/stream</a> &mdash; MJPEG stream<br>
-      <a href="/frame" target="_blank" style="color:#4ecca3;">/frame</a> &mdash; JPEG snapshot<br>
-      <a href="/config" target="_blank" style="color:#4ecca3;">/config</a> &mdash; Projector config (JSON)<br>
-      <a href="/projector" target="_blank" style="color:#4ecca3;">/projector</a> &mdash; Fullscreen viewer
-    </div>
-  </div>
+<div>
+  <h1>ProMapAnything <span class="env-badge" id="env-badge"></span></h1>
+  <div class="sub">Drag this window to your main monitor. Pop out the projector below.</div>
 </div>
 
-<div class="main">
-  <div class="iframe-bar">
-    <span class="url-display" id="iframe-url-display">No Scope URL configured</span>
-    <button class="btn btn-secondary btn-sm" onclick="reloadIframe()">Reload</button>
-  </div>
-  <div class="iframe-container">
-    <div class="iframe-placeholder" id="placeholder">
-      <div class="icon">&#127916;</div>
-      <p>Paste your RunPod Scope URL in the sidebar and click <strong>Load</strong> to embed the Scope interface here.</p>
-      <p style="font-size:12px; color:#444;">e.g. https://xxxxx-8000.proxy.runpod.net</p>
-    </div>
-    <iframe id="scope-iframe" style="display:none;" allow="camera;microphone;fullscreen"></iframe>
-  </div>
+<button class="big-btn" onclick="openProjector()">
+  Open Projector Window
+</button>
+
+<div class="preview">
+  <img id="preview" src="/frame" />
+</div>
+
+<div class="status">
+  <div class="dot" id="proj-dot"></div>
+  <span id="proj-status">Checking...</span>
+</div>
+<div class="detail" id="proj-resolution"></div>
+
+<div class="scope-section">
+  <input type="text" id="scope-url" placeholder="Scope URL (auto-detected or paste RunPod URL)" spellcheck="false" />
+  <button class="scope-btn" onclick="openScope()">Open Scope</button>
+</div>
+
+<div class="links">
+  <a href="/projector" target="_blank">/projector</a> &middot;
+  <a href="/stream" target="_blank">/stream</a> &middot;
+  <a href="/frame" target="_blank">/frame</a> &middot;
+  <a href="/config" target="_blank">/config</a>
 </div>
 
 <script>
-const initialConfig = __CONFIG_JSON__;
+// Auto-detect environment
+const host = window.location.hostname;
+const isRunPod = host.includes('.proxy.runpod.net');
+const badge = document.getElementById('env-badge');
+badge.textContent = isRunPod ? 'RunPod' : 'Local';
+badge.className = 'env-badge ' + (isRunPod ? 'env-remote' : 'env-local');
 
-// Persist Scope URL in localStorage
-const urlInput = document.getElementById('scope-url');
-const saved = localStorage.getItem('promap_scope_url');
-if (saved) { urlInput.value = saved; loadScope(); }
-
-function loadScope() {
-  const url = urlInput.value.trim();
-  if (!url) return;
-  localStorage.setItem('promap_scope_url', url);
-  const iframe = document.getElementById('scope-iframe');
-  const ph = document.getElementById('placeholder');
-  document.getElementById('iframe-url-display').textContent = url;
-  iframe.src = url;
-  iframe.style.display = 'block';
-  ph.style.display = 'none';
+// Auto-fill Scope URL
+const scopeInput = document.getElementById('scope-url');
+const savedScope = localStorage.getItem('promap_scope_url');
+if (savedScope) {
+  scopeInput.value = savedScope;
+} else if (isRunPod) {
+  // Derive Scope URL: replace port in RunPod proxy URL
+  // e.g. https://xxx-8765.proxy.runpod.net -> https://xxx-8000.proxy.runpod.net
+  const m = host.match(/^(.+)-\\d+\\.proxy\\.runpod\\.net$/);
+  if (m) scopeInput.value = 'https://' + m[1] + '-8000.proxy.runpod.net';
+} else {
+  scopeInput.value = 'http://localhost:8000';
 }
 
-function openScopeTab() {
-  const url = urlInput.value.trim();
-  if (url) window.open(url, '_blank');
-}
-
-function reloadIframe() {
-  const iframe = document.getElementById('scope-iframe');
-  if (iframe.src) iframe.src = iframe.src;
+function openScope() {
+  const url = scopeInput.value.trim();
+  if (url) {
+    localStorage.setItem('promap_scope_url', url);
+    window.open(url, '_blank');
+  }
 }
 
 function openProjector() {
+  // Open projector in a new window - user drags to projector monitor
   const w = window.open('/projector', 'promap-projector',
     'width=960,height=540,menubar=no,toolbar=no,location=no,status=no');
   if (w) w.focus();
 }
 
-// Preview refresh
-let previewTimer = null;
-function refreshPreview() {
+// Preview auto-refresh
+setInterval(() => {
   document.getElementById('preview').src = '/frame?t=' + Date.now();
-}
-// Auto-refresh preview every 2s
-previewTimer = setInterval(refreshPreview, 2000);
+}, 2000);
 
 // Poll projector status
 function updateStatus() {
   fetch('/config').then(r => r.json()).then(cfg => {
     const dot = document.getElementById('proj-dot');
-    const status = document.getElementById('proj-status');
+    const st = document.getElementById('proj-status');
     const res = document.getElementById('proj-resolution');
-    const cal = document.getElementById('proj-calibration');
     if (cfg && cfg.width) {
-      dot.className = 'status-dot green';
-      status.textContent = 'Projector connected';
+      dot.className = 'dot green';
+      st.textContent = 'Projector connected';
       res.textContent = cfg.width + ' x ' + cfg.height +
         (cfg.monitor_name ? ' (' + cfg.monitor_name + ')' : '');
     } else {
-      dot.className = 'status-dot yellow';
-      status.textContent = 'Waiting for projector...';
-      res.textContent = 'Open the projector window and drag it to your projector monitor';
+      dot.className = 'dot yellow';
+      st.textContent = 'Waiting for projector window...';
+      res.textContent = '';
     }
   }).catch(() => {
-    document.getElementById('proj-dot').className = 'status-dot red';
-    document.getElementById('proj-status').textContent = 'Stream server unreachable';
+    document.getElementById('proj-dot').className = 'dot red';
+    document.getElementById('proj-status').textContent = 'Unreachable';
     document.getElementById('proj-resolution').textContent = '';
   });
 }
