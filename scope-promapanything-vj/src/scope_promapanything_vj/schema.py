@@ -145,13 +145,13 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
     )
 
     settle_frames: int = Field(
-        default=15,
+        default=30,
         ge=1,
         le=120,
         description=(
             "Frames to wait after each pattern change before capturing. "
             "Increase for high-latency setups (remote/RunPod). "
-            "Local: 6–10, Remote: 15–30."
+            "Local: 6–10, Remote: 30–60."
         ),
         json_schema_extra=ui_field_config(
             order=4,

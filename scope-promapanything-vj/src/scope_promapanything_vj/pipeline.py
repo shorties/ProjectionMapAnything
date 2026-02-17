@@ -166,9 +166,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         try:
             return self._call_inner(**kwargs)
         except Exception as exc:
-            print(f"[ProMap Calibrate] __call__ CRASHED: {type(exc).__name__}: {exc}", flush=True)
-            import traceback
-            traceback.print_exc()
+            logger.error("__call__ CRASHED: %s: %s", type(exc).__name__, exc, exc_info=True)
             # Return test card as fallback so pipeline doesn't go silent
             return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
 
@@ -256,14 +254,12 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 mapping = self._calib.get_mapping()
                 if mapping is not None:
                     map_x, map_y = mapping
+                    logger.info("Saving calibration to %s ...", _DEFAULT_CALIBRATION_PATH)
                     save_calibration(
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
                         self.proj_w, self.proj_h,
                     )
-                    logger.info(
-                        "Calibration complete — saved to %s",
-                        _DEFAULT_CALIBRATION_PATH,
-                    )
+                    logger.info("Calibration saved.")
 
                     # Compute coverage %
                     coverage_pct = 0.0
@@ -436,6 +432,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         """Generate calibration artifacts, push to streamer, and upload to Scope gallery."""
         from datetime import datetime, timezone
 
+        logger.info("Publishing calibration results (coverage=%.1f%%) ...", coverage_pct)
         timestamp = datetime.now(timezone.utc).isoformat()
         files: dict[str, bytes] = {}
 
@@ -474,37 +471,34 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         except Exception:
             logger.warning("Could not generate warped camera image", exc_info=True)
 
-        # 4. Warped depth map — depth from projector's perspective
-        try:
-            # Reuse existing depth provider to avoid loading model twice / OOM
-            depth_prov = self._live_depth_provider
-            if depth_prov is None:
-                from .depth_provider import create_depth_provider
-                depth_prov = create_depth_provider("auto", self.device, model_size="small")
-                self._live_depth_provider = depth_prov
+        # 4. Warped depth map — only if depth provider is already loaded
+        #    (skip downloading a model here — it blocks the pipeline for minutes)
+        if self._live_depth_provider is not None:
+            try:
+                frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
+                if frame_f.max() > 1.5:
+                    frame_f = frame_f / 255.0
 
-            frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
-            if frame_f.max() > 1.5:
-                frame_f = frame_f / 255.0
+                depth = self._live_depth_provider.estimate(frame_f)  # (H, W)
 
-            depth = depth_prov.estimate(frame_f)  # (H, W)
+                depth_rgb = build_warped_depth_image(
+                    depth, map_x, map_y,
+                    self._calib.proj_valid_mask if self._calib else None,
+                    self.proj_h, self.proj_w,
+                    device=self.device,
+                )  # (H, W, 3) float32 [0,1]
 
-            depth_rgb = build_warped_depth_image(
-                depth, map_x, map_y,
-                self._calib.proj_valid_mask if self._calib else None,
-                self.proj_h, self.proj_w,
-                device=self.device,
-            )  # (H, W, 3) float32 [0,1]
-
-            depth_np = (depth_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            ok, buf = cv2.imencode(
-                ".png", cv2.cvtColor(depth_np, cv2.COLOR_RGB2BGR)
-            )
-            if ok:
-                files["warped_depth.png"] = buf.tobytes()
-                logger.info("Generated warped_depth.png")
-        except Exception:
-            logger.error("Could not generate warped depth image", exc_info=True)
+                depth_np = (depth_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                ok, buf = cv2.imencode(
+                    ".png", cv2.cvtColor(depth_np, cv2.COLOR_RGB2BGR)
+                )
+                if ok:
+                    files["warped_depth.png"] = buf.tobytes()
+                    logger.info("Generated warped_depth.png")
+            except Exception:
+                logger.error("Could not generate warped depth image", exc_info=True)
+        else:
+            logger.info("Skipping warped_depth.png (depth provider not loaded)")
 
         # Push to streamer for dashboard
         if files and self._streamer is not None:
