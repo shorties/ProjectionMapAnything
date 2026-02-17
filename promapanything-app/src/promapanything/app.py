@@ -979,6 +979,8 @@ class ProMapAnythingApp:
         Prevents fold-over artifacts from extrapolating into regions the
         camera never covered.
         """
+        import cv2
+
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             hole_mask, connectivity=8,
         )

@@ -17,6 +17,7 @@ Ported from the standalone app with improvements:
 from __future__ import annotations
 
 import json
+import logging
 import math
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -25,6 +26,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # -- Gray code utilities ------------------------------------------------------
@@ -209,6 +212,14 @@ class CalibrationState:
         self._captures[cap_idx].append(gray.astype(np.float32))
         self._frame_count += 1
 
+        # Debug: log first capture stats for white/black references
+        if cap_idx <= 1 and self._frame_count == 1:
+            label = "WHITE" if cap_idx == 0 else "BLACK"
+            logger.info(
+                "Captured %s reference: shape=%s min=%.1f max=%.1f mean=%.1f",
+                label, gray.shape, gray.min(), gray.max(), gray.mean(),
+            )
+
         # Check if we have enough frames for this pattern
         if self._frame_count < self.capture_frames:
             # Need more frames — keep projecting the same pattern (no settle)
@@ -287,7 +298,31 @@ class CalibrationState:
 
         h, w = white_f.shape[:2]
         diff = white_f - black_f
+
+        # Debug: report capture statistics
+        logger.info(
+            "Decode: camera resolution %dx%d, projector %dx%d",
+            w, h, self.proj_w, self.proj_h,
+        )
+        logger.info(
+            "  WHITE ref: min=%.1f max=%.1f mean=%.1f",
+            white_f.min(), white_f.max(), white_f.mean(),
+        )
+        logger.info(
+            "  BLACK ref: min=%.1f max=%.1f mean=%.1f",
+            black_f.min(), black_f.max(), black_f.mean(),
+        )
+        logger.info(
+            "  DIFF (white-black): min=%.1f max=%.1f mean=%.1f, threshold=%.1f",
+            diff.min(), diff.max(), diff.mean(), self.decode_threshold,
+        )
+
         valid_mask = diff > self.decode_threshold
+        n_valid_diff = int(np.count_nonzero(valid_mask))
+        logger.info(
+            "  Pixels passing white-black threshold: %d/%d (%.1f%%)",
+            n_valid_diff, h * w, 100.0 * n_valid_diff / max(h * w, 1),
+        )
 
         # Decode X (column) Gray codes with per-bit reliability
         base = 2  # skip white + black
@@ -304,6 +339,17 @@ class CalibrationState:
                 if self.bit_threshold > 0:
                     bit_diff = np.abs(pos_f - neg_f)
                     x_reliable &= (bit_diff >= self.bit_threshold)
+                # Log first 3 bits for debugging
+                if bit_idx < 3:
+                    bd = np.abs(pos_f - neg_f)
+                    logger.info(
+                        "  X bit %d: pos_mean=%.1f neg_mean=%.1f "
+                        "abs_diff: min=%.1f max=%.1f mean=%.1f",
+                        bit_idx, pos_f.mean(), neg_f.mean(),
+                        bd.min(), bd.max(), bd.mean(),
+                    )
+            else:
+                logger.warning("  X bit %d: missing captures!", bit_idx)
 
         # Decode Y (row) Gray codes with per-bit reliability
         base_y = base + self.bits_x * 2
@@ -320,10 +366,26 @@ class CalibrationState:
                 if self.bit_threshold > 0:
                     bit_diff = np.abs(pos_f - neg_f)
                     y_reliable &= (bit_diff >= self.bit_threshold)
+                if bit_idx < 3:
+                    bd = np.abs(pos_f - neg_f)
+                    logger.info(
+                        "  Y bit %d: pos_mean=%.1f neg_mean=%.1f "
+                        "abs_diff: min=%.1f max=%.1f mean=%.1f",
+                        bit_idx, pos_f.mean(), neg_f.mean(),
+                        bd.min(), bd.max(), bd.mean(),
+                    )
+            else:
+                logger.warning("  Y bit %d: missing captures!", bit_idx)
 
         # Apply bit reliability mask
         if self.bit_threshold > 0:
+            n_before = int(np.count_nonzero(valid_mask))
             valid_mask = valid_mask & x_reliable & y_reliable
+            n_after = int(np.count_nonzero(valid_mask))
+            logger.info(
+                "  After bit reliability filter: %d → %d pixels (removed %d)",
+                n_before, n_after, n_before - n_after,
+            )
 
         # Vectorized Gray-to-binary decode (much faster than per-pixel loop)
         binary_x = decoded_x.copy()
@@ -346,12 +408,15 @@ class CalibrationState:
 
         # -- Post-processing on camera-space decode --
         if self.morph_cleanup:
+            n_pre = int(np.count_nonzero(valid_mask))
             k = self.morph_kernel_size
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
             mask_u8 = valid_mask.astype(np.uint8) * 255
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
             valid_mask = mask_u8 > 127
+            n_post = int(np.count_nonzero(valid_mask))
+            logger.info("  After morph cleanup: %d → %d pixels", n_pre, n_post)
 
         if self.spatial_consistency:
             ksize = max(self.morph_kernel_size, 5)
@@ -372,7 +437,12 @@ class CalibrationState:
             diff_y = np.abs(decoded_y.astype(np.float32) - local_mean_y)
             consistent = ((diff_x <= self.consistency_max_diff) &
                           (diff_y <= self.consistency_max_diff))
+            n_pre_sc = int(np.count_nonzero(valid_mask))
             valid_mask = valid_mask & consistent
+            n_post_sc = int(np.count_nonzero(valid_mask))
+            logger.info(
+                "  After spatial consistency: %d → %d pixels", n_pre_sc, n_post_sc,
+            )
 
         # -- Build inverse mapping: projector pixel -> camera pixel --
         # Accumulate weighted sums for Gaussian splat
@@ -383,6 +453,10 @@ class CalibrationState:
         cam_ys, cam_xs = np.where(valid_mask)
         proj_xs = decoded_x[cam_ys, cam_xs]
         proj_ys = decoded_y[cam_ys, cam_xs]
+        logger.info(
+            "  Valid camera pixels for mapping: %d/%d (%.1f%%)",
+            len(cam_ys), h * w, 100.0 * len(cam_ys) / max(h * w, 1),
+        )
 
         np.add.at(sum_cx, (proj_ys, proj_xs), cam_xs.astype(np.float32))
         np.add.at(sum_cy, (proj_ys, proj_xs), cam_ys.astype(np.float32))
@@ -404,6 +478,12 @@ class CalibrationState:
 
         # Store validity mask BEFORE inpainting
         self.proj_valid_mask = valid_proj.copy()
+        n_valid_proj = int(np.count_nonzero(valid_proj))
+        total_proj = self.proj_h * self.proj_w
+        logger.info(
+            "  Projector pixels with correspondence: %d/%d (%.1f%%)",
+            n_valid_proj, total_proj, 100.0 * n_valid_proj / max(total_proj, 1),
+        )
 
         # Inpaint only small internal holes — NOT large uncovered boundary regions
         # (blanket inpainting of large regions causes fold-overs / distortion)
