@@ -478,7 +478,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         except Exception:
             logger.warning("Could not generate warped camera image", exc_info=True)
 
-        # 4. Warped depth map — load depth provider if not already loaded
+        # 4. Depth maps — two approaches for comparison
         #    (model is pre-cached in background at plugin load time)
         if self._live_depth_provider is None:
             try:
@@ -491,29 +491,58 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 logger.warning("Could not load depth provider", exc_info=True)
 
         if self._live_depth_provider is not None:
+            frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
+            if frame_f.max() > 1.5:
+                frame_f = frame_f / 255.0
+
+            # 4a. depth_then_warp: estimate depth from raw camera, warp result
+            #     Depth model sees a natural camera image (best depth quality),
+            #     then the depth map is remapped to projector perspective.
             try:
-                frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
-                if frame_f.max() > 1.5:
-                    frame_f = frame_f / 255.0
-
                 depth = self._live_depth_provider.estimate(frame_f)  # (H, W)
-
                 depth_rgb = build_warped_depth_image(
                     depth, map_x, map_y,
                     self._calib.proj_valid_mask if self._calib else None,
                     self.proj_h, self.proj_w,
                     device=self.device,
                 )  # (H, W, 3) float32 [0,1]
-
                 depth_np = (depth_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                 ok, buf = cv2.imencode(
                     ".png", cv2.cvtColor(depth_np, cv2.COLOR_RGB2BGR)
                 )
                 if ok:
-                    files["warped_depth.png"] = buf.tobytes()
-                    logger.info("Generated warped_depth.png")
+                    files["depth_then_warp.png"] = buf.tobytes()
+                    logger.info("Generated depth_then_warp.png")
             except Exception:
-                logger.error("Could not generate warped depth image", exc_info=True)
+                logger.error("Could not generate depth_then_warp", exc_info=True)
+
+            # 4b. warp_then_depth: warp camera RGB to projector, then estimate depth
+            #     Depth model sees the scene from projector's perspective,
+            #     which may produce more spatially coherent depth for VACE.
+            try:
+                warped_f = cv2.remap(
+                    frame_f.cpu().numpy(), map_x, map_y,
+                    cv2.INTER_LINEAR, borderValue=0,
+                )
+                warped_t = torch.from_numpy(warped_f).to(self.device)
+                depth_w = self._live_depth_provider.estimate(warped_t)  # (H, W)
+
+                # Normalise to [0, 1] grayscale RGB
+                d_min, d_max = depth_w.min(), depth_w.max()
+                if d_max - d_min > 1e-6:
+                    depth_norm = (depth_w - d_min) / (d_max - d_min)
+                else:
+                    depth_norm = torch.zeros_like(depth_w)
+                depth_u8 = (depth_norm.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                depth_rgb2 = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2RGB)
+                ok, buf = cv2.imencode(
+                    ".png", cv2.cvtColor(depth_rgb2, cv2.COLOR_RGB2BGR)
+                )
+                if ok:
+                    files["warp_then_depth.png"] = buf.tobytes()
+                    logger.info("Generated warp_then_depth.png")
+            except Exception:
+                logger.error("Could not generate warp_then_depth", exc_info=True)
 
         # Push to streamer for dashboard
         if files and self._streamer is not None:
