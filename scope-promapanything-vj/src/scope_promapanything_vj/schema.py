@@ -203,13 +203,28 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     # -- Input-side controls (left panel) -------------------------------------
 
+    depth_mode: Literal["depth_then_warp", "warp_then_depth", "warped_rgb"] = Field(
+        default="depth_then_warp",
+        description=(
+            "What to send to the AI model as conditioning input. "
+            "'depth_then_warp' = depth from camera, warped to projector. "
+            "'warp_then_depth' = camera warped to projector, then depth. "
+            "'warped_rgb' = camera RGB warped to projector (no depth)."
+        ),
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="Depth Mode",
+            category="input",
+        ),
+    )
+
     temporal_smoothing: float = Field(
         default=0.5,
         ge=0.0,
         le=0.99,
         description="Blend factor with the previous depth frame. Higher = smoother.",
         json_schema_extra=ui_field_config(
-            order=0,
+            order=1,
             label="Temporal Smoothing",
             category="input",
         ),
@@ -221,7 +236,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         le=20.0,
         description="Gaussian blur radius on the depth map. 0 = sharp.",
         json_schema_extra=ui_field_config(
-            order=1,
+            order=2,
             label="Depth Blur",
             category="input",
         ),

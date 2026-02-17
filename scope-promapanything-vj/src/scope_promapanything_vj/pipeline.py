@@ -683,6 +683,7 @@ class ProMapAnythingPipeline(Pipeline):
 
         frame = video[0]  # (1, H, W, C) [0, 255]
 
+        depth_mode = kwargs.get("depth_mode", "depth_then_warp")
         temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
         depth_blur = kwargs.get("depth_blur", 0.0)
 
@@ -691,43 +692,17 @@ class ProMapAnythingPipeline(Pipeline):
         if frame_f.max() > 1.5:
             frame_f = frame_f / 255.0
 
-        # Estimate depth from camera
-        depth = self._depth.estimate(frame_f)
+        has_calib = self._map_x is not None and self._map_y is not None
 
-        # Temporal smoothing
-        if temporal_smoothing > 0 and self._prev_depth is not None:
-            if self._prev_depth.shape == depth.shape:
-                depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
-        self._prev_depth = depth.clone()
-
-        # Warp to projector perspective if calibration available
-        if self._map_x is not None and self._map_y is not None:
-            rgb = build_warped_depth_image(
-                depth,
-                self._map_x,
-                self._map_y,
-                self._proj_valid_mask,
-                self.proj_h,
-                self.proj_w,
-                blur=depth_blur,
-                colormap="grayscale",
-                device=self.device,
-            )
+        if depth_mode == "warped_rgb" and has_calib:
+            # Warp camera RGB to projector perspective (no depth estimation)
+            rgb = self._warped_rgb(frame_f)
+        elif depth_mode == "warp_then_depth" and has_calib:
+            # Warp camera RGB to projector perspective, then estimate depth
+            rgb = self._warp_then_depth(frame_f, depth_blur, temporal_smoothing)
         else:
-            # No calibration — output camera-space depth as grayscale
-            depth_np = depth.cpu().numpy()
-            d_min, d_max = depth_np.min(), depth_np.max()
-            if d_max - d_min > 1e-6:
-                depth_norm = (depth_np - d_min) / (d_max - d_min)
-            else:
-                depth_norm = np.zeros_like(depth_np)
-            if depth_blur > 0.5:
-                ksize = int(depth_blur) * 2 + 1
-                depth_norm = cv2.GaussianBlur(depth_norm, (ksize, ksize), 0)
-            depth_uint8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-            rgb = torch.from_numpy(
-                cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
-            ).to(self.device)
+            # Estimate depth from raw camera, then warp to projector
+            rgb = self._depth_then_warp(frame_f, depth_blur, temporal_smoothing)
 
         # Submit full-resolution preview to dashboard before resizing
         self._submit_input_preview(rgb)
@@ -741,6 +716,81 @@ class ProMapAnythingPipeline(Pipeline):
             rgb = torch.from_numpy(rgb_np.astype(np.float32) / 255.0).to(self.device)
 
         return {"video": rgb.unsqueeze(0).clamp(0, 1)}
+
+    def _depth_then_warp(
+        self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
+    ) -> torch.Tensor:
+        """Estimate depth from raw camera, then warp to projector perspective."""
+        depth = self._depth.estimate(frame_f)
+
+        # Temporal smoothing
+        if temporal_smoothing > 0 and self._prev_depth is not None:
+            if self._prev_depth.shape == depth.shape:
+                depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
+        self._prev_depth = depth.clone()
+
+        if self._map_x is not None and self._map_y is not None:
+            return build_warped_depth_image(
+                depth,
+                self._map_x,
+                self._map_y,
+                self._proj_valid_mask,
+                self.proj_h,
+                self.proj_w,
+                blur=depth_blur,
+                colormap="grayscale",
+                device=self.device,
+            )
+
+        # No calibration — output camera-space depth as grayscale
+        return self._depth_to_grayscale(depth, depth_blur)
+
+    def _warp_then_depth(
+        self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
+    ) -> torch.Tensor:
+        """Warp camera RGB to projector perspective, then estimate depth."""
+        # Warp camera to projector view
+        warped_np = cv2.remap(
+            frame_f.cpu().numpy(), self._map_x, self._map_y,
+            cv2.INTER_LINEAR, borderValue=0,
+        )
+        warped_t = torch.from_numpy(warped_np).to(self.device)
+
+        # Estimate depth from the warped (projector-perspective) image
+        depth = self._depth.estimate(warped_t)
+
+        # Temporal smoothing
+        if temporal_smoothing > 0 and self._prev_depth is not None:
+            if self._prev_depth.shape == depth.shape:
+                depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
+        self._prev_depth = depth.clone()
+
+        # Already in projector space — just convert to grayscale RGB
+        return self._depth_to_grayscale(depth, depth_blur)
+
+    def _warped_rgb(self, frame_f: torch.Tensor) -> torch.Tensor:
+        """Warp camera RGB to projector perspective (no depth estimation)."""
+        warped_np = cv2.remap(
+            frame_f.cpu().numpy(), self._map_x, self._map_y,
+            cv2.INTER_LINEAR, borderValue=0,
+        )
+        return torch.from_numpy(warped_np).to(self.device)
+
+    def _depth_to_grayscale(self, depth: torch.Tensor, blur: float) -> torch.Tensor:
+        """Convert depth tensor to grayscale RGB (near=dark, far=bright)."""
+        depth_np = depth.cpu().numpy()
+        d_min, d_max = depth_np.min(), depth_np.max()
+        if d_max - d_min > 1e-6:
+            depth_norm = (depth_np - d_min) / (d_max - d_min)
+        else:
+            depth_norm = np.zeros_like(depth_np)
+        if blur > 0.5:
+            ksize = int(blur) * 2 + 1
+            depth_norm = cv2.GaussianBlur(depth_norm, (ksize, ksize), 0)
+        depth_uint8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+        return torch.from_numpy(
+            cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+        ).to(self.device)
 
     def _submit_input_preview(self, rgb: torch.Tensor) -> None:
         """Send the preprocessor output to the streamer for dashboard preview."""
