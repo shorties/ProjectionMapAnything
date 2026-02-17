@@ -659,7 +659,8 @@ class ProMapAnythingPipeline(Pipeline):
                 f.write(f"[{ts}] PreProc __init__: {msg}\n")
 
         try:
-            _dbg(f"kwargs={{{k}: {v} for k, v in kwargs.items() if k != 'device'}}}")
+            non_dev = {k: v for k, v in kwargs.items() if k != "device"}
+            _dbg(f"kwargs={non_dev}")
             self.device = (
                 device
                 if device is not None
