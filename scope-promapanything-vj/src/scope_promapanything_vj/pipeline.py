@@ -650,58 +650,80 @@ class ProMapAnythingPipeline(Pipeline):
     _RESOLUTION_SCALES = {"quarter": 0.25, "half": 0.5, "native": 1.0}
 
     def __init__(self, device: torch.device | None = None, **kwargs):
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        # File-based debug log so we can always see what happened
+        _dbg_path = Path("/tmp/promap_init_debug.log")
+        def _dbg(msg: str) -> None:
+            import datetime
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with open(_dbg_path, "a") as f:
+                f.write(f"[{ts}] PreProc __init__: {msg}\n")
 
-        self._gen_res: str = kwargs.get("generation_resolution", "half")
-        self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
+        try:
+            _dbg(f"kwargs={{{k}: {v} for k, v in kwargs.items() if k != 'device'}}}")
+            self.device = (
+                device
+                if device is not None
+                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            _dbg(f"device={self.device}")
 
-        # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
-        self._depth = None
+            self._gen_res: str = kwargs.get("generation_resolution", "half")
+            self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
+            _dbg(f"depth_mode={self._depth_mode}, gen_res={self._gen_res}")
 
-        # Static calibration image cache
-        self._static_frame: torch.Tensor | None = None
+            # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
+            self._depth = None
 
-        # MJPEG streamer for input preview on dashboard
-        port = kwargs.get("stream_port", 8765)
-        self._streamer = get_or_create_streamer(port)
+            # Static calibration image cache
+            self._static_frame: torch.Tensor | None = None
 
-        # Calibration mapping
-        self._map_x: np.ndarray | None = None
-        self._map_y: np.ndarray | None = None
-        self._proj_valid_mask: np.ndarray | None = None
-        self.proj_w: int = 1920
-        self.proj_h: int = 1080
+            # MJPEG streamer for input preview on dashboard
+            port = kwargs.get("stream_port", 8765)
+            _dbg(f"Getting streamer on port {port}...")
+            self._streamer = get_or_create_streamer(port)
+            _dbg("Streamer OK")
 
-        # Temporal smoothing buffer
-        self._prev_depth: torch.Tensor | None = None
+            # Calibration mapping
+            self._map_x: np.ndarray | None = None
+            self._map_y: np.ndarray | None = None
+            self._proj_valid_mask: np.ndarray | None = None
+            self.proj_w: int = 1920
+            self.proj_h: int = 1080
 
-        # Log init kwargs for debugging
-        logger.info(
-            "Depth preprocessor __init__ kwargs: %s",
-            {k: v for k, v in kwargs.items() if k != "device"},
-        )
+            # Temporal smoothing buffer
+            self._prev_depth: torch.Tensor | None = None
 
-        # Load calibration
-        cal_path = _DEFAULT_CALIBRATION_PATH
-        if cal_path.is_file():
-            mx, my, pw, ph, ts = load_calibration(cal_path)
-            self._map_x = mx
-            self._map_y = my
-            self.proj_w = pw
-            self.proj_h = ph
+            # Log init kwargs for debugging
             logger.info(
-                "Calibration loaded from %s (%dx%d, captured %s)",
-                cal_path, pw, ph, ts,
+                "Depth preprocessor __init__ kwargs: %s",
+                {k: v for k, v in kwargs.items() if k != "device"},
             )
-        else:
-            logger.warning(
-                "No calibration found at %s — output will be un-warped camera depth",
-                cal_path,
-            )
+
+            # Load calibration
+            cal_path = _DEFAULT_CALIBRATION_PATH
+            if cal_path.is_file():
+                mx, my, pw, ph, ts = load_calibration(cal_path)
+                self._map_x = mx
+                self._map_y = my
+                self.proj_w = pw
+                self.proj_h = ph
+                _dbg(f"Calibration loaded: {pw}x{ph}")
+                logger.info(
+                    "Calibration loaded from %s (%dx%d, captured %s)",
+                    cal_path, pw, ph, ts,
+                )
+            else:
+                _dbg(f"No calibration at {cal_path}")
+                logger.warning(
+                    "No calibration found at %s — output will be un-warped camera depth",
+                    cal_path,
+                )
+            _dbg("__init__ complete OK")
+        except Exception as exc:
+            import traceback
+            _dbg(f"__init__ CRASHED: {type(exc).__name__}: {exc}")
+            _dbg(traceback.format_exc())
+            raise
 
     def _get_generation_resolution(self) -> tuple[int, int]:
         """Compute generation resolution from projector res + preset."""
