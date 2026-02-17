@@ -220,6 +220,17 @@ class CalibrationState:
         Returns the pattern to project as (1, H, W, 3) [0,1], or None if
         calibration just finished.
         """
+        # Run decode on a separate frame so the pipeline can push progress
+        # updates ("Decoding...") to the dashboard before we block.
+        if self.phase == CalibrationPhase.DECODING:
+            logger.info("Running Gray code decode ...")
+            self._decode()
+            self.phase = CalibrationPhase.DONE
+            return None
+
+        if self.phase in (CalibrationPhase.IDLE, CalibrationPhase.DONE):
+            return None
+
         # Handle settle: wait for the camera to actually see the new pattern.
         # Uses STRUCTURAL baseline comparison: captures the camera frame at the
         # start of settle (still showing old pattern), then watches for pixel-level
@@ -294,6 +305,13 @@ class CalibrationState:
         # Capture frame (accumulate for multi-frame averaging)
         gray = self._camera_to_gray(camera_frame)
         cap_idx = self._current_capture_index()
+        if cap_idx >= len(self._captures):
+            # Safety: pattern_index overshot (should not happen with DECODING guard)
+            logger.error(
+                "Capture index %d out of range (%d slots), phase=%s idx=%d — skipping",
+                cap_idx, len(self._captures), self.phase.name, self._pattern_index,
+            )
+            return None
         self._captures[cap_idx].append(gray.astype(np.float32))
         self._frame_count += 1
 
@@ -325,9 +343,9 @@ class CalibrationState:
         if self.phase == CalibrationPhase.PATTERNS:
             self._pattern_index += 1
             if self._pattern_index >= 2 * (self.bits_x + self.bits_y):
+                # Enter DECODING phase — actual decode runs on the NEXT
+                # step() call so the pipeline can push a progress update first.
                 self.phase = CalibrationPhase.DECODING
-                self._decode()
-                self.phase = CalibrationPhase.DONE
                 return None
             self._begin_settle()
             return self._current_pattern(device)
@@ -384,11 +402,6 @@ class CalibrationState:
         h, w = white_f.shape[:2]
         diff = white_f - black_f
 
-        # Debug: report capture statistics (print for Scope visibility)
-        print(f"[ProMap Cal] Decode: cam {w}x{h}, proj {self.proj_w}x{self.proj_h}", flush=True)
-        print(f"[ProMap Cal]   WHITE: min={white_f.min():.1f} max={white_f.max():.1f} mean={white_f.mean():.1f}", flush=True)
-        print(f"[ProMap Cal]   BLACK: min={black_f.min():.1f} max={black_f.max():.1f} mean={black_f.mean():.1f}", flush=True)
-        print(f"[ProMap Cal]   DIFF: min={diff.min():.1f} max={diff.max():.1f} mean={diff.mean():.1f} thresh={self.decode_threshold}", flush=True)
         logger.info(
             "Decode: camera resolution %dx%d, projector %dx%d",
             w, h, self.proj_w, self.proj_h,

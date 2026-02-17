@@ -1,22 +1,28 @@
+import logging
 import threading
 import time
 
 from scope.core.plugins.hookspecs import hookimpl
 
+logger = logging.getLogger(__name__)
+
+# Seconds to wait after registration before pre-caching the depth model,
+# giving Scope time to finish importing all plugins (concurrent imports of
+# transformers cause partial-module errors).
+_PRECACHE_DELAY_SECONDS = 15
+
 
 def _precache_depth_model():
     """Download Depth Anything V2 Small in the background so it's ready on first use."""
-    # Wait for plugin registration to finish first — concurrent imports of
-    # transformers cause partial-module errors.
-    time.sleep(15)
+    time.sleep(_PRECACHE_DELAY_SECONDS)
     try:
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
         model_id = "depth-anything/Depth-Anything-V2-Small-hf"
         AutoImageProcessor.from_pretrained(model_id)
         AutoModelForDepthEstimation.from_pretrained(model_id)
-    except Exception:
-        pass  # non-critical — will retry when pipeline loads
+    except Exception as exc:
+        logger.debug("Depth model precache failed: %s", exc)
 
 
 @hookimpl

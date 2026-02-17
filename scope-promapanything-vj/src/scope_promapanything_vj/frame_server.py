@@ -32,6 +32,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from urllib.parse import unquote
 
 import cv2
 import numpy as np
@@ -80,33 +81,30 @@ _PROJECTOR_HTML = """\
 <script>
 const img = document.getElementById('view');
 const statusEl = document.getElementById('status');
-let connected = false;
-let errorCount = 0;
 
-// Frame polling with auto-reconnect (survives server restarts)
-function refresh() {
-  const t = Date.now();
-  const probe = new Image();
-  probe.onload = () => {
-    img.src = probe.src;
-    if (!connected) {
-      connected = true;
-      errorCount = 0;
-      statusEl.textContent = '';
-    }
-    setTimeout(refresh, 33);  // ~30fps
-  };
-  probe.onerror = () => {
-    connected = false;
-    errorCount++;
-    // Back off: 500ms for first few failures, then 2s
-    const delay = errorCount < 5 ? 500 : 2000;
-    statusEl.textContent = 'Reconnecting...';
-    setTimeout(refresh, delay);
-  };
-  probe.src = '/frame?t=' + t;
+// MJPEG stream with auto-reconnect on failure
+function startStream() {
+  img.src = '/stream?t=' + Date.now();
+  statusEl.textContent = '';
 }
-refresh();
+
+img.onerror = () => {
+  statusEl.textContent = 'Reconnecting...';
+  setTimeout(startStream, 1000);
+};
+
+// Detect stalled stream (no new frame for 5s)
+let lastCheck = 0;
+setInterval(() => {
+  // img.complete && img.naturalHeight > 0 means it has decoded at least one frame
+  if (img.src.includes('/stream') && img.naturalHeight === 0) {
+    // Stream never started — reconnect
+    statusEl.textContent = 'Reconnecting...';
+    startStream();
+  }
+}, 3000);
+
+startStream();
 
 document.body.addEventListener('click', () => {
   if (!document.fullscreenElement) {
@@ -433,11 +431,7 @@ function updateCalibrationUI(data) {
     idleEl.classList.remove('hidden');
     activeEl.classList.add('hidden');
 
-    if (data.live_depth_active) {
-      idleEl.textContent = 'Live depth preview active';
-    } else {
-      idleEl.textContent = 'Idle \\u2014 toggle Start Calibration in Scope to begin';
-    }
+    idleEl.textContent = 'Idle \\u2014 toggle Start Calibration in Scope to begin';
   } else {
     // Complete
     idleEl.classList.remove('hidden');
@@ -535,7 +529,7 @@ class FrameStreamer:
         streamer.stop()
     """
 
-    def __init__(self, port: int = 8765, jpeg_quality: int = 85) -> None:
+    def __init__(self, port: int = 8765, jpeg_quality: int = 70) -> None:
         self._port = port
         self._quality = jpeg_quality
         self._frame_jpeg: bytes | None = None
@@ -544,6 +538,11 @@ class FrameStreamer:
         self._server: _ThreadedHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+
+        # Non-blocking encode guard: submit_frame skips if an encode is
+        # already in progress (keeps the pipeline thread fast without
+        # background threads that complicate plugin lifecycle).
+        self._encoding = threading.Lock()
 
         # Calibration priority: when True, submit_frame() is suppressed
         self._calibration_active = False
@@ -559,7 +558,6 @@ class FrameStreamer:
         self._calibration_pattern_info: str = ""
         self._calibration_errors: list[str] = []
         self._calibration_coverage_pct: float = 0.0
-        self._calibration_live_depth: bool = False
 
         # Input preview (VACE conditioning) — separate from projector output
         self._input_preview_jpeg: bytes | None = None
@@ -806,7 +804,6 @@ class FrameStreamer:
                     "pattern_info": streamer._calibration_pattern_info,
                     "errors": streamer._calibration_errors,
                     "coverage_pct": streamer._calibration_coverage_pct,
-                    "live_depth_active": streamer._calibration_live_depth,
                     "files": list(streamer._calibration_files.keys()),
                     "timestamp": streamer._calibration_timestamp,
                 }
@@ -821,7 +818,6 @@ class FrameStreamer:
 
             def _handle_calibration_download(self_handler, path: str) -> None:  # noqa: N805
                 """Serve a calibration result file for download."""
-                from urllib.parse import unquote
                 name = unquote(path.split("/calibration/download/", 1)[-1])
                 data = streamer._calibration_files.get(name)
                 if data is None:
@@ -847,7 +843,6 @@ class FrameStreamer:
 
             def _handle_calibration_preview(self_handler, path: str) -> None:  # noqa: N805
                 """Serve a calibration result image inline (for thumbnails)."""
-                from urllib.parse import unquote
                 name = unquote(path.split("/calibration/preview/", 1)[-1])
                 data = streamer._calibration_files.get(name)
                 if data is None or not name.endswith(".png"):
@@ -910,7 +905,9 @@ class FrameStreamer:
                     pass
 
             def log_message(self_handler, format, *args) -> None:  # noqa: N805
-                pass  # suppress per-request logging
+                # Suppress per-request HTTP logging — the MJPEG stream fires
+                # dozens of requests per second and would flood stdout.
+                pass
 
         self._running = True
         self._server = _ThreadedHTTPServer(("0.0.0.0", self._port), Handler)
@@ -918,67 +915,95 @@ class FrameStreamer:
             target=self._server.serve_forever, name="frame-streamer", daemon=True
         )
         self._thread.start()
+
         logger.info(
             "FrameStreamer: MJPEG server started on port %d "
             "(endpoints: /stream, /frame, /config, /)",
             self._port,
         )
 
-    def submit_frame(self, rgb: np.ndarray) -> None:
+    def submit_frame(
+        self, rgb: np.ndarray, target_size: tuple[int, int] | None = None,
+    ) -> None:
         """Submit an RGB uint8 (H, W, 3) frame for streaming.
 
-        Suppressed when ``calibration_active`` is True — calibration patterns
-        take priority via ``submit_calibration_frame()``.
+        Uses a try-lock so the pipeline thread is never blocked: if a
+        previous encode is still in progress the frame is silently dropped.
+        Suppressed when ``calibration_active`` is True.
+
+        Parameters
+        ----------
+        rgb : np.ndarray
+            RGB uint8 (H, W, 3) frame.
+        target_size : tuple[int, int] | None
+            Optional (width, height) to resize to before encoding.
 
         Thread-safe — may be called from any thread.
         """
         if not self._running or self._calibration_active:
             return
-        self._encode_and_set(rgb)
+        # Try-lock: skip this frame if we're already encoding one
+        if not self._encoding.acquire(blocking=False):
+            return
+        try:
+            if target_size is not None:
+                tw, th = target_size
+                h, w = rgb.shape[:2]
+                if (w, h) != (tw, th):
+                    rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LINEAR)
+            jpeg = self._encode_jpeg(rgb)
+            if jpeg is not None:
+                with self._lock:
+                    self._frame_jpeg = jpeg
+                self._new_frame.set()
+        finally:
+            self._encoding.release()
 
     def submit_calibration_frame(self, rgb: np.ndarray) -> None:
         """Submit a calibration pattern frame. Always accepted.
 
+        Encodes synchronously since calibration patterns are infrequent
+        and need to arrive reliably.
+
         Thread-safe — may be called from any thread.
         """
         if not self._running:
             return
-        self._encode_and_set(rgb)
+        jpeg = self._encode_jpeg(rgb)
+        if jpeg is not None:
+            with self._lock:
+                self._frame_jpeg = jpeg
+            self._new_frame.set()
 
     def submit_input_preview(self, rgb: np.ndarray) -> None:
         """Submit a VACE input preview frame (preprocessor output).
 
-        Stored separately from the projector stream so the dashboard can
-        show what the AI generator is actually receiving.
+        Encodes synchronously.  Does not block the pipeline thread if the
+        input lock is already held (frame is dropped instead).
 
         Thread-safe — may be called from any thread.
         """
         if not self._running:
             return
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        ok, jpeg_buf = cv2.imencode(
-            ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self._quality]
-        )
-        if ok:
+        jpeg = self._encode_jpeg(rgb)
+        if jpeg is not None:
             with self._input_lock:
-                self._input_preview_jpeg = jpeg_buf.tobytes()
+                self._input_preview_jpeg = jpeg
             self._input_new_frame.set()
 
-    def _encode_and_set(self, rgb: np.ndarray) -> None:
-        """Encode RGB frame as JPEG and update the current frame."""
+    def _encode_jpeg(self, rgb: np.ndarray) -> bytes | None:
+        """Encode an RGB uint8 array as JPEG. Returns bytes or None on failure."""
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         ok, jpeg_buf = cv2.imencode(
             ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self._quality]
         )
-        if ok:
-            with self._lock:
-                self._frame_jpeg = jpeg_buf.tobytes()
-            self._new_frame.set()
+        return jpeg_buf.tobytes() if ok else None
 
     def stop(self) -> None:
-        """Shut down the server and join the background thread."""
+        """Shut down the server and join the server thread."""
         self._running = False
-        self._new_frame.set()  # wake up any waiting handlers
+        self._new_frame.set()
+        self._input_new_frame.set()
         if self._server is not None:
             self._server.shutdown()
             self._server = None

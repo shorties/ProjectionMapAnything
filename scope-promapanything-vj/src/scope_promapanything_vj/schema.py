@@ -53,7 +53,7 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
 
     open_dashboard: bool = Field(
         default=False,
-        description="Toggle ON to open the control panel dashboard in your browser.",
+        description="Enable to open the control panel dashboard in your browser.",
         json_schema_extra=ui_field_config(
             order=1,
             label="Open Dashboard",
@@ -61,23 +61,10 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         ),
     )
 
-    live_depth_preview: bool = Field(
-        default=False,
-        description=(
-            "EXPERIMENTAL: Show live depth map on the projector instead of "
-            "test card. Requires calibration to be loaded. GPU-intensive."
-        ),
-        json_schema_extra=ui_field_config(
-            order=2,
-            label="Live Depth Preview (Alpha)",
-            category="input",
-        ),
-    )
-
     reset_calibration: bool = Field(
         default=False,
         description=(
-            "Toggle ON to reset calibration state and start fresh. "
+            "Enable to reset calibration state and start fresh. "
             "Clears all captured data so you can recalibrate without "
             "reloading the pipeline."
         ),
@@ -206,15 +193,19 @@ class ProMapAnythingConfig(BasePipelineConfig):
     # "input" category fields are invisible for preprocessor pipelines.
 
     depth_mode: Literal[
-        "depth_then_warp", "warp_then_depth", "warped_rgb", "static_calibration",
+        "depth_then_warp",
+        "warp_then_depth",
+        "warped_rgb",
+        "static_depth_warped",
+        "static_depth_from_warped",
+        "static_warped_camera",
     ] = Field(
-        default="depth_then_warp",
+        default="static_depth_warped",
         description=(
-            "What to send to the AI model as conditioning input. "
-            "'depth_then_warp' = depth from camera, warped to projector. "
-            "'warp_then_depth' = camera warped to projector, then depth. "
-            "'warped_rgb' = camera RGB warped to projector (no depth). "
-            "'static_calibration' = use saved depth from calibration (no live depth model)."
+            "Conditioning input for the AI model. "
+            "LIVE: depth_then_warp, warp_then_depth, warped_rgb (need GPU depth model). "
+            "STATIC: static_depth_warped, static_depth_from_warped, "
+            "static_warped_camera (from calibration, no GPU needed)."
         ),
         json_schema_extra=ui_field_config(
             order=0,
@@ -248,13 +239,76 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ),
     )
 
+    edge_erosion: int = Field(
+        default=0,
+        ge=0,
+        le=50,
+        description=(
+            "Erode the valid depth region by this many pixels. "
+            "Trims overshoot at object edges where depth bleeds "
+            "onto background surfaces. 0 = no erosion."
+        ),
+        json_schema_extra=ui_field_config(
+            order=3,
+            label="Edge Erosion",
+            category="configuration",
+        ),
+    )
+
+    depth_contrast: float = Field(
+        default=1.0,
+        ge=0.5,
+        le=5.0,
+        description=(
+            "Contrast multiplier for the depth map. Values > 1 sharpen "
+            "depth transitions at object edges. 1.0 = no change."
+        ),
+        json_schema_extra=ui_field_config(
+            order=4,
+            label="Depth Contrast",
+            category="configuration",
+        ),
+    )
+
+    depth_near_clip: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Clip depth values below this threshold (0-1 normalized). "
+            "Pixels closer than this become black. Useful for isolating "
+            "foreground objects."
+        ),
+        json_schema_extra=ui_field_config(
+            order=5,
+            label="Near Clip",
+            category="configuration",
+        ),
+    )
+
+    depth_far_clip: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Clip depth values above this threshold (0-1 normalized). "
+            "Pixels farther than this become black. Useful for removing "
+            "background surfaces."
+        ),
+        json_schema_extra=ui_field_config(
+            order=6,
+            label="Far Clip",
+            category="configuration",
+        ),
+    )
+
     stream_port: int = Field(
         default=8765,
         ge=1024,
         le=65535,
         description="MJPEG stream port for the dashboard input preview.",
         json_schema_extra=ui_field_config(
-            order=3,
+            order=10,
             label="Stream Port",
             is_load_param=True,
             category="configuration",
@@ -269,7 +323,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "'native' = full projector res (slow, highest quality)."
         ),
         json_schema_extra=ui_field_config(
-            order=4,
+            order=11,
             label="Generation Resolution",
             is_load_param=True,
             category="configuration",
@@ -300,7 +354,9 @@ class ProMapAnythingProjectorConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
     usage = [UsageType.POSTPROCESSOR]
 
-    # -- Input-side controls (left panel) -------------------------------------
+    # -- Configuration (settings panel) ---------------------------------------
+    # NOTE: Scope only renders "configuration" fields for postprocessors.
+    # "input" category fields are invisible for postprocessor pipelines.
 
     upscale_to_projector: bool = Field(
         default=True,
@@ -311,11 +367,9 @@ class ProMapAnythingProjectorConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=0,
             label="Upscale to Projector",
-            category="input",
+            category="configuration",
         ),
     )
-
-    # -- Configuration (settings panel) ---------------------------------------
 
     stream_port: int = Field(
         default=8765,
@@ -323,7 +377,7 @@ class ProMapAnythingProjectorConfig(BasePipelineConfig):
         le=65535,
         description="Port for the MJPEG streaming server.",
         json_schema_extra=ui_field_config(
-            order=0,
+            order=1,
             label="Stream Port",
             is_load_param=True,
             category="configuration",

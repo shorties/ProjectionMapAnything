@@ -9,6 +9,10 @@ Registered pipelines:
 from __future__ import annotations
 
 import logging
+import os
+import urllib.request
+import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,18 +90,10 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self._done = False
         self._reset_armed = False
 
-        # Live depth preview (lazy-loaded)
-        self._live_depth_provider = None
-        self._live_map_x: np.ndarray | None = None
-        self._live_map_y: np.ndarray | None = None
-        self._live_proj_w: int = self.proj_w
-        self._live_proj_h: int = self.proj_h
-
         # Build the grey test card (shown on projector before calibration)
         self._test_card = self._build_test_card()
 
         # Compute the projector URL (RunPod auto-detect)
-        import os
         pod_id = os.environ.get("RUNPOD_POD_ID", "")
         if pod_id:
             self._projector_url = f"https://{pod_id}-{port}.proxy.runpod.net/"
@@ -112,7 +108,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         # Auto-open control panel in browser (local only, no-op on RunPod)
         if not pod_id:
             try:
-                import webbrowser
                 webbrowser.open(self._projector_url)
             except Exception:
                 pass
@@ -177,7 +172,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
         frame = video[0]  # (1, H, W, C) [0, 255]
         start = kwargs.get("start_calibration", False)
-        live_depth = kwargs.get("live_depth_preview", False)
         reset = kwargs.get("reset_calibration", False)
 
         # Update projector resolution from input-side fields
@@ -195,9 +189,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._calib = None
             self._calibrating = False
             self._done = False
-            self._live_map_x = None
-            self._live_map_y = None
-            self._live_depth_provider = None
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
                 self._streamer.calibration_active = False
@@ -210,25 +201,17 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         if open_dash and not self._browser_opened:
             self._browser_opened = True
             try:
-                import webbrowser
                 webbrowser.open(self._projector_url)
             except Exception:
                 pass
         elif not open_dash:
             self._browser_opened = False
 
-        # -- Not started yet: show test card or live depth --------------------
+        # -- Not started yet: show test card -----------------------------------
         if not start and not self._calibrating:
             self._done = False
             if self._streamer is not None:
                 self._streamer.calibration_active = False
-                self._streamer._calibration_live_depth = live_depth
-
-            if live_depth:
-                depth_frame = self._get_live_depth_frame(frame)
-                if depth_frame is not None:
-                    self._submit_to_streamer(depth_frame)
-                    return {"video": depth_frame.unsqueeze(0).clamp(0, 1)}
 
             # Send test card to streamer (projector shows neutral grey)
             self._submit_to_streamer(self._test_card)
@@ -245,7 +228,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._calibrating = True
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
-                self._streamer._calibration_live_depth = False
             logger.info(
                 "Calibration started (%d patterns)", self._calib.total_patterns
             )
@@ -274,6 +256,14 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                         total = self._calib.proj_valid_mask.size
                         valid = np.count_nonzero(self._calib.proj_valid_mask)
                         coverage_pct = (valid / total) * 100.0 if total > 0 else 0.0
+
+                    # Push "generating results" so dashboard doesn't look stuck
+                    if self._streamer is not None:
+                        self._streamer.update_calibration_progress(
+                            0.99, "Generating results...",
+                            pattern_info="Saving calibration images",
+                            coverage_pct=coverage_pct,
+                        )
 
                     self._publish_calibration_results(
                         map_x, map_y, frame, coverage_pct,
@@ -309,7 +299,9 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._done = False
             self._calib = None
 
-        if self._streamer is not None:
+        # Only clear calibration_active when we're truly done, not during
+        # the decode/publish gap between PATTERNS→DECODING→DONE.
+        if self._streamer is not None and not self._calibrating:
             self._streamer.calibration_active = False
 
         self._submit_to_streamer(self._test_card)
@@ -361,74 +353,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
         self._streamer.update_calibration_progress(progress, phase, pattern_info)
 
-    def _get_live_depth_frame(self, camera_frame: torch.Tensor) -> torch.Tensor | None:
-        """Estimate depth from camera and warp to projector perspective.
-
-        Returns (H, W, 3) float32 [0,1] or None on failure.
-        """
-        # Lazy-load depth provider
-        if self._live_depth_provider is None:
-            try:
-                from .depth_provider import create_depth_provider
-                self._live_depth_provider = create_depth_provider(
-                    "auto", self.device, model_size="small",
-                )
-                logger.info("Live depth preview: depth provider loaded")
-            except Exception:
-                logger.warning("Failed to load depth provider for live preview", exc_info=True)
-                return None
-
-        # Lazy-load calibration
-        if self._live_map_x is None:
-            if _DEFAULT_CALIBRATION_PATH.is_file():
-                try:
-                    mx, my, pw, ph, _ = load_calibration(_DEFAULT_CALIBRATION_PATH)
-                    self._live_map_x = mx
-                    self._live_map_y = my
-                    self._live_proj_w = pw
-                    self._live_proj_h = ph
-                    logger.info("Live depth preview: calibration loaded (%dx%d)", pw, ph)
-                except Exception:
-                    logger.warning("Failed to load calibration for live preview", exc_info=True)
-            else:
-                logger.debug("No calibration file for live depth preview")
-
-        # Estimate depth
-        try:
-            frame_f = camera_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
-            if frame_f.max() > 1.5:
-                frame_f = frame_f / 255.0
-            depth = self._live_depth_provider.estimate(frame_f)  # (H, W)
-        except Exception:
-            logger.warning("Depth estimation failed in live preview", exc_info=True)
-            return None
-
-        # Warp to projector perspective if calibration available
-        if self._live_map_x is not None and self._live_map_y is not None:
-            rgb = build_warped_depth_image(
-                depth,
-                self._live_map_x,
-                self._live_map_y,
-                None,
-                self._live_proj_h,
-                self._live_proj_w,
-                device=self.device,
-            )
-        else:
-            # No calibration — output camera-space depth as grayscale
-            depth_np = depth.cpu().numpy()
-            d_min, d_max = depth_np.min(), depth_np.max()
-            if d_max - d_min > 1e-6:
-                depth_norm = (depth_np - d_min) / (d_max - d_min)
-            else:
-                depth_norm = np.zeros_like(depth_np)
-            depth_uint8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-            rgb = torch.from_numpy(
-                cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
-            ).to(self.device)
-
-        return rgb
-
     def _publish_calibration_results(
         self,
         map_x: np.ndarray,
@@ -437,8 +361,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         coverage_pct: float = 0.0,
     ) -> None:
         """Generate calibration artifacts, push to streamer, and upload to Scope gallery."""
-        from datetime import datetime, timezone
-
         logger.info("Publishing calibration results (coverage=%.1f%%) ...", coverage_pct)
         timestamp = datetime.now(timezone.utc).isoformat()
         files: dict[str, bytes] = {}
@@ -459,7 +381,10 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             if ok:
                 files["coverage_map.png"] = buf.tobytes()
 
-        # 3. Warped camera image — proves calibration alignment
+        # 3. Warped camera image + grayscale depth-like images.
+        # Neural depth is NOT loaded here — it would block calibration for
+        # 30+ seconds downloading/loading the model.  Use a live depth mode
+        # in the preprocessor if you need true neural depth.
         try:
             cam_np = last_frame.squeeze(0).cpu().numpy()
             if cam_np.max() > 1.5:
@@ -475,96 +400,18 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             )
             if ok:
                 files["warped_camera.png"] = buf.tobytes()
+
+            # Grayscale luminance as depth-like conditioning signal
+            gray = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+            gray = cv2.bilateralFilter(gray, 9, 75, 75)
+            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            ok, buf = cv2.imencode(".png", gray_bgr)
+            if ok:
+                files["depth_then_warp.png"] = buf.tobytes()
+                files["warp_then_depth.png"] = buf.tobytes()
+                logger.info("Generated grayscale depth images from warped camera")
         except Exception:
-            logger.warning("Could not generate warped camera image", exc_info=True)
-
-        # 4. Depth maps — two approaches for comparison
-        #    Write debug log to /tmp so we can always check what happened
-        _debug_log = Path("/tmp/promap_depth_debug.log")
-        def _dbg(msg: str) -> None:
-            import datetime
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            with open(_debug_log, "a") as f:
-                f.write(f"[{ts}] {msg}\n")
-
-        _dbg(f"Starting depth generation. device={self.device}")
-        _dbg(f"last_frame shape={last_frame.shape}, dtype={last_frame.dtype}")
-        _dbg(f"map_x shape={map_x.shape}, map_y shape={map_y.shape}")
-        _dbg(f"proj_h={self.proj_h}, proj_w={self.proj_w}")
-
-        if self._live_depth_provider is None:
-            try:
-                from .depth_provider import create_depth_provider
-                self._live_depth_provider = create_depth_provider(
-                    "auto", self.device, model_size="small",
-                )
-                _dbg(f"Depth provider loaded: {type(self._live_depth_provider).__name__}")
-            except Exception as exc:
-                import traceback
-                _dbg(f"DEPTH PROVIDER FAILED: {type(exc).__name__}: {exc}")
-                _dbg(traceback.format_exc())
-
-        if self._live_depth_provider is not None:
-            frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
-            if frame_f.max() > 1.5:
-                frame_f = frame_f / 255.0
-            _dbg(f"frame_f: shape={frame_f.shape}, device={frame_f.device}, "
-                 f"min={frame_f.min():.3f}, max={frame_f.max():.3f}")
-
-            # 4a. depth_then_warp
-            try:
-                _dbg("Generating depth_then_warp ...")
-                depth = self._live_depth_provider.estimate(frame_f)
-                _dbg(f"depth: shape={depth.shape}, range=[{depth.min():.3f}, {depth.max():.3f}]")
-                depth_rgb = build_warped_depth_image(
-                    depth, map_x, map_y,
-                    self._calib.proj_valid_mask if self._calib else None,
-                    self.proj_h, self.proj_w,
-                    device=self.device,
-                )
-                _dbg(f"depth_rgb: shape={depth_rgb.shape}")
-                depth_np = (depth_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                ok, buf = cv2.imencode(
-                    ".png", cv2.cvtColor(depth_np, cv2.COLOR_RGB2BGR)
-                )
-                if ok:
-                    files["depth_then_warp.png"] = buf.tobytes()
-                    _dbg(f"depth_then_warp.png OK ({len(buf.tobytes())} bytes)")
-            except Exception as exc:
-                import traceback
-                _dbg(f"depth_then_warp FAILED: {type(exc).__name__}: {exc}")
-                _dbg(traceback.format_exc())
-
-            # 4b. warp_then_depth
-            try:
-                _dbg("Generating warp_then_depth ...")
-                warped_f = cv2.remap(
-                    frame_f.cpu().numpy(), map_x, map_y,
-                    cv2.INTER_LINEAR, borderValue=0,
-                )
-                _dbg(f"warped_f: shape={warped_f.shape}")
-                warped_t = torch.from_numpy(warped_f).to(self.device)
-                depth_w = self._live_depth_provider.estimate(warped_t)
-
-                d_min, d_max = depth_w.min(), depth_w.max()
-                if d_max - d_min > 1e-6:
-                    depth_norm = (depth_w - d_min) / (d_max - d_min)
-                else:
-                    depth_norm = torch.zeros_like(depth_w)
-                depth_u8 = (depth_norm.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                depth_rgb2 = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2RGB)
-                ok, buf = cv2.imencode(
-                    ".png", cv2.cvtColor(depth_rgb2, cv2.COLOR_RGB2BGR)
-                )
-                if ok:
-                    files["warp_then_depth.png"] = buf.tobytes()
-                    _dbg(f"warp_then_depth.png OK ({len(buf.tobytes())} bytes)")
-            except Exception as exc:
-                import traceback
-                _dbg(f"warp_then_depth FAILED: {type(exc).__name__}: {exc}")
-                _dbg(traceback.format_exc())
-        else:
-            _dbg("Depth provider is None — skipping depth image generation")
+            logger.warning("Could not generate warped/depth images", exc_info=True)
 
         # Save result images to disk for static_calibration mode
         results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
@@ -589,8 +436,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
     def _upload_to_scope_gallery(self, files: dict[str, bytes]) -> None:
         """Upload calibration images to Scope's asset gallery for VACE use."""
-        import urllib.request
-
         scope_url = "http://localhost:8000"
         upload_url = f"{scope_url}/api/v1/assets"
 
@@ -650,81 +495,55 @@ class ProMapAnythingPipeline(Pipeline):
     _RESOLUTION_SCALES = {"quarter": 0.25, "half": 0.5, "native": 1.0}
 
     def __init__(self, device: torch.device | None = None, **kwargs):
-        # File-based debug log so we can always see what happened
-        _dbg_path = Path("/tmp/promap_init_debug.log")
-        def _dbg(msg: str) -> None:
-            import datetime
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            with open(_dbg_path, "a") as f:
-                f.write(f"[{ts}] PreProc __init__: {msg}\n")
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
-        try:
-            non_dev = {k: v for k, v in kwargs.items() if k != "device"}
-            _dbg(f"kwargs={non_dev}")
-            self.device = (
-                device
-                if device is not None
-                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            )
-            _dbg(f"device={self.device}")
+        self._gen_res: str = kwargs.get("generation_resolution", "half")
+        self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
 
-            self._gen_res: str = kwargs.get("generation_resolution", "half")
-            self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
-            _dbg(f"depth_mode={self._depth_mode}, gen_res={self._gen_res}")
+        # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
+        self._depth = None
 
-            # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
-            self._depth = None
+        # MJPEG streamer for input preview on dashboard
+        port = kwargs.get("stream_port", 8765)
+        self._streamer = get_or_create_streamer(port)
 
-            # Static calibration image cache
-            self._static_frame: torch.Tensor | None = None
+        # Calibration mapping
+        self._map_x: np.ndarray | None = None
+        self._map_y: np.ndarray | None = None
+        self._proj_valid_mask: np.ndarray | None = None
+        self.proj_w: int = 1920
+        self.proj_h: int = 1080
 
-            # MJPEG streamer for input preview on dashboard
-            port = kwargs.get("stream_port", 8765)
-            _dbg(f"Getting streamer on port {port}...")
-            self._streamer = get_or_create_streamer(port)
-            _dbg("Streamer OK")
+        # Temporal smoothing buffer
+        self._prev_depth: torch.Tensor | None = None
 
-            # Calibration mapping
-            self._map_x: np.ndarray | None = None
-            self._map_y: np.ndarray | None = None
-            self._proj_valid_mask: np.ndarray | None = None
-            self.proj_w: int = 1920
-            self.proj_h: int = 1080
+        # Log init kwargs for debugging
+        logger.info(
+            "Depth preprocessor __init__ kwargs: %s",
+            {k: v for k, v in kwargs.items() if k != "device"},
+        )
 
-            # Temporal smoothing buffer
-            self._prev_depth: torch.Tensor | None = None
-
-            # Log init kwargs for debugging
+        # Load calibration
+        cal_path = _DEFAULT_CALIBRATION_PATH
+        if cal_path.is_file():
+            mx, my, pw, ph, ts = load_calibration(cal_path)
+            self._map_x = mx
+            self._map_y = my
+            self.proj_w = pw
+            self.proj_h = ph
             logger.info(
-                "Depth preprocessor __init__ kwargs: %s",
-                {k: v for k, v in kwargs.items() if k != "device"},
+                "Calibration loaded from %s (%dx%d, captured %s)",
+                cal_path, pw, ph, ts,
             )
-
-            # Load calibration
-            cal_path = _DEFAULT_CALIBRATION_PATH
-            if cal_path.is_file():
-                mx, my, pw, ph, ts = load_calibration(cal_path)
-                self._map_x = mx
-                self._map_y = my
-                self.proj_w = pw
-                self.proj_h = ph
-                _dbg(f"Calibration loaded: {pw}x{ph}")
-                logger.info(
-                    "Calibration loaded from %s (%dx%d, captured %s)",
-                    cal_path, pw, ph, ts,
-                )
-            else:
-                _dbg(f"No calibration at {cal_path}")
-                logger.warning(
-                    "No calibration found at %s — output will be un-warped camera depth",
-                    cal_path,
-                )
-            _dbg("__init__ complete OK")
-        except Exception as exc:
-            import traceback
-            _dbg(f"__init__ CRASHED: {type(exc).__name__}: {exc}")
-            _dbg(traceback.format_exc())
-            raise
+        else:
+            logger.warning(
+                "No calibration found at %s — output will be un-warped camera depth",
+                cal_path,
+            )
 
     def _get_generation_resolution(self) -> tuple[int, int]:
         """Compute generation resolution from projector res + preset."""
@@ -735,8 +554,6 @@ class ProMapAnythingPipeline(Pipeline):
 
     def prepare(self, **kwargs) -> Requirements:
         return Requirements(input_size=1)
-
-    _call_count: int = 0
 
     def __call__(self, **kwargs) -> dict:
         try:
@@ -767,24 +584,10 @@ class ProMapAnythingPipeline(Pipeline):
         depth_mode = kwargs.get("depth_mode", self._depth_mode)
         temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
         depth_blur = kwargs.get("depth_blur", 0.0)
-
-        # Log kwargs on first call and every 300 frames for debugging
-        self._call_count += 1
-        if self._call_count == 1 or self._call_count % 300 == 0:
-            non_video = {k: v for k, v in kwargs.items() if k != "video"}
-            logger.info(
-                "Depth preprocessor __call__ #%d kwargs: %s",
-                self._call_count, non_video,
-            )
-            # Write to file so we can always check
-            try:
-                import datetime
-                ts = datetime.datetime.now().strftime("%H:%M:%S")
-                with open("/tmp/promap_preproc_debug.log", "a") as f:
-                    f.write(f"[{ts}] __call__ #{self._call_count} "
-                            f"depth_mode={depth_mode} kwargs={non_video}\n")
-            except Exception:
-                pass
+        edge_erosion = int(kwargs.get("edge_erosion", 0))
+        depth_contrast = float(kwargs.get("depth_contrast", 1.0))
+        near_clip = float(kwargs.get("depth_near_clip", 0.0))
+        far_clip = float(kwargs.get("depth_far_clip", 1.0))
 
         # Normalise input to [0, 1]
         frame_f = frame.squeeze(0).to(device=self.device, dtype=torch.float32)
@@ -793,9 +596,9 @@ class ProMapAnythingPipeline(Pipeline):
 
         has_calib = self._map_x is not None and self._map_y is not None
 
-        if depth_mode == "static_calibration":
-            # Use saved depth image from calibration (no live depth model)
-            rgb = self._get_static_frame()
+        if depth_mode.startswith("static_"):
+            # Use saved image from calibration (no live depth model)
+            rgb = self._get_static_frame(depth_mode)
         elif depth_mode == "warped_rgb" and has_calib:
             # Warp camera RGB to projector perspective (no depth estimation)
             rgb = self._warped_rgb(frame_f)
@@ -805,6 +608,11 @@ class ProMapAnythingPipeline(Pipeline):
         else:
             # Estimate depth from raw camera, then warp to projector
             rgb = self._depth_then_warp(frame_f, depth_blur, temporal_smoothing)
+
+        # Apply edge processing (erosion, contrast, clipping)
+        rgb = self._apply_edge_processing(
+            rgb, edge_erosion, depth_contrast, near_clip, far_clip,
+        )
 
         # Submit full-resolution preview to dashboard before resizing
         self._submit_input_preview(rgb)
@@ -819,11 +627,67 @@ class ProMapAnythingPipeline(Pipeline):
             out_w, out_h = int(out_w), int(out_h)
         h, w = rgb.shape[:2]
         if (w, h) != (out_w, out_h):
-            rgb_np = (rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            rgb_np = cv2.resize(rgb_np, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            rgb = torch.from_numpy(rgb_np.astype(np.float32) / 255.0).to(self.device)
+            # GPU resize via torch interpolate
+            # (H, W, 3) -> (1, 3, H, W) -> interpolate -> (H, W, 3)
+            rgb_nchw = rgb.permute(2, 0, 1).unsqueeze(0)
+            rgb_nchw = torch.nn.functional.interpolate(
+                rgb_nchw, size=(out_h, out_w), mode="area",
+            )
+            rgb = rgb_nchw.squeeze(0).permute(1, 2, 0)
 
         return {"video": rgb.unsqueeze(0).clamp(0, 1)}
+
+    def _apply_edge_processing(
+        self,
+        rgb: torch.Tensor,
+        erosion: int,
+        contrast: float,
+        near_clip: float,
+        far_clip: float,
+    ) -> torch.Tensor:
+        """Apply edge erosion, contrast, and depth clipping.
+
+        Operates on the grayscale depth RGB (H, W, 3) float [0, 1].
+        """
+        if erosion <= 0 and abs(contrast - 1.0) < 0.01 and near_clip <= 0.0 and far_clip >= 1.0:
+            return rgb  # Nothing to do
+
+        img = rgb.cpu().numpy()  # (H, W, 3) float [0, 1]
+        gray = img.mean(axis=-1)  # (H, W) for processing
+
+        # 1. Near/far clipping — black out pixels outside the range
+        if near_clip > 0.0 or far_clip < 1.0:
+            mask = (gray >= near_clip) & (gray <= far_clip)
+            # Re-normalise the remaining range to [0, 1]
+            if far_clip > near_clip:
+                gray = np.where(mask, (gray - near_clip) / (far_clip - near_clip), 0.0)
+            else:
+                gray = np.zeros_like(gray)
+            gray = gray.clip(0, 1)
+
+        # 2. Contrast enhancement — power curve centred at 0.5
+        if abs(contrast - 1.0) >= 0.01:
+            # Sigmoid-like contrast: push values away from 0.5
+            gray = np.where(
+                gray > 0,
+                np.power(gray.clip(1e-6, 1.0), 1.0 / contrast),
+                0.0,
+            )
+
+        # 3. Edge erosion — shrink the non-black region inward
+        if erosion > 0:
+            # Build a mask of "valid" (non-black) pixels
+            valid = (gray > 0.02).astype(np.uint8)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (erosion * 2 + 1, erosion * 2 + 1),
+            )
+            eroded = cv2.erode(valid, kernel, iterations=1)
+            # Zero out pixels that were removed by erosion
+            gray = gray * eroded.astype(np.float32)
+
+        # Convert back to RGB
+        out = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+        return torch.from_numpy(out).to(rgb.device)
 
     def _ensure_depth_model(self) -> None:
         """Lazy-load the depth model on first use."""
@@ -831,31 +695,58 @@ class ProMapAnythingPipeline(Pipeline):
             from .depth_provider import create_depth_provider
             self._depth = create_depth_provider("auto", self.device, model_size="small")
 
-    def _get_static_frame(self) -> torch.Tensor:
-        """Load and cache the static depth image from calibration results."""
-        if self._static_frame is not None:
-            return self._static_frame
+    # Map depth_mode values to calibration result filenames
+    _STATIC_FILE_MAP = {
+        "static_depth_warped": "depth_then_warp.png",
+        "static_depth_from_warped": "warp_then_depth.png",
+        "static_warped_camera": "warped_camera.png",
+    }
+
+    def _get_static_frame(self, mode: str) -> torch.Tensor:
+        """Load and cache a static image from calibration results."""
+        # Cache per mode so switching modes loads the right image
+        cache_key = f"_static_{mode}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
 
         results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
-        # Try depth_then_warp first, then warp_then_depth, then warped_camera
+
+        # Try the specific file for this mode first
+        primary = self._STATIC_FILE_MAP.get(mode)
+        candidates = [primary] if primary else []
+        # Fallback order if the specific file doesn't exist
         for name in ("depth_then_warp.png", "warp_then_depth.png", "warped_camera.png"):
+            if name not in candidates:
+                candidates.append(name)
+
+        for name in candidates:
             path = results_dir / name
             if path.is_file():
                 img = cv2.imread(str(path))
                 if img is not None:
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    self._static_frame = torch.from_numpy(
+                    frame = torch.from_numpy(
                         img.astype(np.float32) / 255.0
                     ).to(self.device)
-                    logger.info("Loaded static calibration frame: %s", name)
-                    return self._static_frame
+                    if name != primary:
+                        logger.warning(
+                            "Static frame for %s: wanted %s but fell back to %s "
+                            "(re-run calibration to regenerate depth images)",
+                            mode, primary, name,
+                        )
+                    else:
+                        logger.info("Loaded static frame for %s: %s", mode, name)
+                    setattr(self, cache_key, frame)
+                    return frame
 
-        # Fallback: generate a grey frame at projector resolution
+        # Fallback: grey frame at projector resolution
         logger.warning("No calibration result images found — using grey fallback")
-        self._static_frame = torch.full(
+        frame = torch.full(
             (self.proj_h, self.proj_w, 3), 0.5, dtype=torch.float32, device=self.device,
         )
-        return self._static_frame
+        setattr(self, cache_key, frame)
+        return frame
 
     def _depth_then_warp(
         self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
@@ -919,20 +810,28 @@ class ProMapAnythingPipeline(Pipeline):
         return torch.from_numpy(warped_np).to(self.device)
 
     def _depth_to_grayscale(self, depth: torch.Tensor, blur: float) -> torch.Tensor:
-        """Convert depth tensor to grayscale RGB (near=dark, far=bright)."""
-        depth_np = depth.cpu().numpy()
-        d_min, d_max = depth_np.min(), depth_np.max()
+        """Convert depth tensor to grayscale RGB (near=dark, far=bright).
+
+        Normalises on GPU, applies optional blur on CPU.
+        """
+        d_min = depth.min()
+        d_max = depth.max()
         if d_max - d_min > 1e-6:
-            depth_norm = (depth_np - d_min) / (d_max - d_min)
+            depth_norm = (depth - d_min) / (d_max - d_min)
         else:
-            depth_norm = np.zeros_like(depth_np)
+            depth_norm = torch.zeros_like(depth)
+
         if blur > 0.5:
+            # Gaussian blur requires CPU/numpy
+            depth_np = depth_norm.cpu().numpy()
             ksize = int(blur) * 2 + 1
-            depth_norm = cv2.GaussianBlur(depth_norm, (ksize, ksize), 0)
-        depth_uint8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-        return torch.from_numpy(
-            cv2.cvtColor(depth_uint8, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
-        ).to(self.device)
+            depth_np = cv2.GaussianBlur(depth_np, (ksize, ksize), 0)
+            return torch.from_numpy(
+                np.stack([depth_np, depth_np, depth_np], axis=-1).astype(np.float32)
+            ).to(self.device)
+
+        # No blur — stay on GPU
+        return depth_norm.unsqueeze(-1).expand(-1, -1, 3).to(self.device)
 
     def _submit_input_preview(self, rgb: torch.Tensor) -> None:
         """Send the preprocessor output to the streamer for dashboard preview."""
@@ -955,7 +854,6 @@ class ProMapAnythingProjectorPipeline(Pipeline):
 
     def __init__(self, device=None, **kwargs):
         self.device = device or torch.device("cpu")
-
         port = kwargs.get("stream_port", 8765)
         self._streamer = get_or_create_streamer(port)
         logger.info("Projector postprocessor: streaming on port %d", port)
@@ -985,6 +883,8 @@ class ProMapAnythingProjectorPipeline(Pipeline):
         if self._streamer is not None and self._streamer.is_running:
             rgb_np = (frame.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
 
+            # Determine target size for the encoder thread (resize off pipeline thread)
+            target_size = None
             upscale = kwargs.get("upscale_to_projector", True)
             if upscale:
                 proj_res = self._get_projector_resolution()
@@ -992,11 +892,8 @@ class ProMapAnythingProjectorPipeline(Pipeline):
                     proj_w, proj_h = proj_res
                     h, w = rgb_np.shape[:2]
                     if (w, h) != (proj_w, proj_h):
-                        rgb_np = cv2.resize(
-                            rgb_np, (proj_w, proj_h),
-                            interpolation=cv2.INTER_LANCZOS4,
-                        )
+                        target_size = (proj_w, proj_h)
 
-            self._streamer.submit_frame(rgb_np)
+            self._streamer.submit_frame(rgb_np, target_size=target_size)
 
         return {"video": output}
