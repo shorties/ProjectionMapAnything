@@ -36,6 +36,12 @@ if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
 
 logger = logging.getLogger(__name__)
+# Ensure our logger output reaches stdout (Scope doesn't forward plugin loggers)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[ProMap Pipe] %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
 
 _DEFAULT_CALIBRATION_PATH = Path.home() / ".promapanything_calibration.json"
 
@@ -155,6 +161,16 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         return Requirements(input_size=1)
 
     def __call__(self, **kwargs) -> dict:
+        try:
+            return self._call_inner(**kwargs)
+        except Exception as exc:
+            print(f"[ProMap Calibrate] __call__ CRASHED: {type(exc).__name__}: {exc}", flush=True)
+            import traceback
+            traceback.print_exc()
+            # Return test card as fallback so pipeline doesn't go silent
+            return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
+
+    def _call_inner(self, **kwargs) -> dict:
         video = kwargs.get("video")
         if video is None:
             raise ValueError("Calibration pipeline requires video input")
@@ -163,6 +179,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         start = kwargs.get("start_calibration", False)
         live_depth = kwargs.get("live_depth_preview", False)
         reset = kwargs.get("reset_calibration", False)
+
+        print(f"[ProMap Calibrate] __call__: start={start} live_depth={live_depth} reset={reset} calibrating={self._calibrating} done={self._done}", flush=True)
 
         # Reset calibration on rising edge (toggled ON)
         if reset and not self._reset_armed:

@@ -28,6 +28,12 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+# Ensure our logger output reaches stdout (Scope doesn't forward plugin loggers)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[ProMap Cal] %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
 
 
 # -- Gray code utilities ------------------------------------------------------
