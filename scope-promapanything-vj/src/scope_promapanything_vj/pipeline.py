@@ -478,8 +478,18 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         except Exception:
             logger.warning("Could not generate warped camera image", exc_info=True)
 
-        # 4. Warped depth map — only if depth provider is already loaded
-        #    (skip downloading a model here — it blocks the pipeline for minutes)
+        # 4. Warped depth map — load depth provider if not already loaded
+        #    (model is pre-cached in background at plugin load time)
+        if self._live_depth_provider is None:
+            try:
+                from .depth_provider import create_depth_provider
+                self._live_depth_provider = create_depth_provider(
+                    "auto", self.device, model_size="small",
+                )
+                logger.info("Depth provider loaded for calibration results")
+            except Exception:
+                logger.warning("Could not load depth provider", exc_info=True)
+
         if self._live_depth_provider is not None:
             try:
                 frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
@@ -504,8 +514,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                     logger.info("Generated warped_depth.png")
             except Exception:
                 logger.error("Could not generate warped depth image", exc_info=True)
-        else:
-            logger.info("Skipping warped_depth.png (depth provider not loaded)")
 
         # Push to streamer for dashboard
         if files and self._streamer is not None:
