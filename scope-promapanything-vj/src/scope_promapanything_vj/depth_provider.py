@@ -90,12 +90,12 @@ class TransformersDepthProvider(DepthProvider):
 
     @torch.no_grad()
     def estimate(self, frame: torch.Tensor) -> torch.Tensor:
-        from transformers.image_utils import to_pil_image  # type: ignore[import-not-found]
+        from PIL import Image
 
         h, w = frame.shape[:2]
 
         img_np = (frame.cpu().numpy() * 255).astype(np.uint8)
-        pil_img = to_pil_image(img_np)
+        pil_img = Image.fromarray(img_np)
 
         inputs = self._processor(images=pil_img, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
