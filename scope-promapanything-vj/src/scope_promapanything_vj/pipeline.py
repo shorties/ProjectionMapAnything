@@ -479,63 +479,73 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             logger.warning("Could not generate warped camera image", exc_info=True)
 
         # 4. Depth maps — two approaches for comparison
-        #    (model is pre-cached in background at plugin load time)
+        #    Write debug log to /tmp so we can always check what happened
+        _debug_log = Path("/tmp/promap_depth_debug.log")
+        def _dbg(msg: str) -> None:
+            import datetime
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            with open(_debug_log, "a") as f:
+                f.write(f"[{ts}] {msg}\n")
+
+        _dbg(f"Starting depth generation. device={self.device}")
+        _dbg(f"last_frame shape={last_frame.shape}, dtype={last_frame.dtype}")
+        _dbg(f"map_x shape={map_x.shape}, map_y shape={map_y.shape}")
+        _dbg(f"proj_h={self.proj_h}, proj_w={self.proj_w}")
+
         if self._live_depth_provider is None:
             try:
                 from .depth_provider import create_depth_provider
                 self._live_depth_provider = create_depth_provider(
                     "auto", self.device, model_size="small",
                 )
-                logger.info("Depth provider loaded for calibration results")
+                _dbg(f"Depth provider loaded: {type(self._live_depth_provider).__name__}")
             except Exception as exc:
-                logger.error(
-                    "Could not load depth provider for calibration results: %s: %s",
-                    type(exc).__name__, exc, exc_info=True,
-                )
-                print(f"[ProMap] DEPTH PROVIDER FAILED: {type(exc).__name__}: {exc}")
+                import traceback
+                _dbg(f"DEPTH PROVIDER FAILED: {type(exc).__name__}: {exc}")
+                _dbg(traceback.format_exc())
 
         if self._live_depth_provider is not None:
             frame_f = last_frame.squeeze(0).to(device=self.device, dtype=torch.float32)
             if frame_f.max() > 1.5:
                 frame_f = frame_f / 255.0
+            _dbg(f"frame_f: shape={frame_f.shape}, device={frame_f.device}, "
+                 f"min={frame_f.min():.3f}, max={frame_f.max():.3f}")
 
-            # 4a. depth_then_warp: estimate depth from raw camera, warp result
-            #     Depth model sees a natural camera image (best depth quality),
-            #     then the depth map is remapped to projector perspective.
+            # 4a. depth_then_warp
             try:
-                print("[ProMap] Generating depth_then_warp ...")
-                depth = self._live_depth_provider.estimate(frame_f)  # (H, W)
+                _dbg("Generating depth_then_warp ...")
+                depth = self._live_depth_provider.estimate(frame_f)
+                _dbg(f"depth: shape={depth.shape}, range=[{depth.min():.3f}, {depth.max():.3f}]")
                 depth_rgb = build_warped_depth_image(
                     depth, map_x, map_y,
                     self._calib.proj_valid_mask if self._calib else None,
                     self.proj_h, self.proj_w,
                     device=self.device,
-                )  # (H, W, 3) float32 [0,1]
+                )
+                _dbg(f"depth_rgb: shape={depth_rgb.shape}")
                 depth_np = (depth_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                 ok, buf = cv2.imencode(
                     ".png", cv2.cvtColor(depth_np, cv2.COLOR_RGB2BGR)
                 )
                 if ok:
                     files["depth_then_warp.png"] = buf.tobytes()
-                    logger.info("Generated depth_then_warp.png")
-                    print("[ProMap] depth_then_warp.png OK")
+                    _dbg(f"depth_then_warp.png OK ({len(buf.tobytes())} bytes)")
             except Exception as exc:
-                logger.error("Could not generate depth_then_warp", exc_info=True)
-                print(f"[ProMap] depth_then_warp FAILED: {type(exc).__name__}: {exc}")
+                import traceback
+                _dbg(f"depth_then_warp FAILED: {type(exc).__name__}: {exc}")
+                _dbg(traceback.format_exc())
 
-            # 4b. warp_then_depth: warp camera RGB to projector, then estimate depth
-            #     Depth model sees the scene from projector's perspective,
-            #     which may produce more spatially coherent depth for VACE.
+            # 4b. warp_then_depth
             try:
-                print("[ProMap] Generating warp_then_depth ...")
+                _dbg("Generating warp_then_depth ...")
                 warped_f = cv2.remap(
                     frame_f.cpu().numpy(), map_x, map_y,
                     cv2.INTER_LINEAR, borderValue=0,
                 )
+                _dbg(f"warped_f: shape={warped_f.shape}")
                 warped_t = torch.from_numpy(warped_f).to(self.device)
-                depth_w = self._live_depth_provider.estimate(warped_t)  # (H, W)
+                depth_w = self._live_depth_provider.estimate(warped_t)
 
-                # Normalise to [0, 1] grayscale RGB
                 d_min, d_max = depth_w.min(), depth_w.max()
                 if d_max - d_min > 1e-6:
                     depth_norm = (depth_w - d_min) / (d_max - d_min)
@@ -548,11 +558,13 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 )
                 if ok:
                     files["warp_then_depth.png"] = buf.tobytes()
-                    logger.info("Generated warp_then_depth.png")
-                    print("[ProMap] warp_then_depth.png OK")
+                    _dbg(f"warp_then_depth.png OK ({len(buf.tobytes())} bytes)")
             except Exception as exc:
-                logger.error("Could not generate warp_then_depth", exc_info=True)
-                print(f"[ProMap] warp_then_depth FAILED: {type(exc).__name__}: {exc}")
+                import traceback
+                _dbg(f"warp_then_depth FAILED: {type(exc).__name__}: {exc}")
+                _dbg(traceback.format_exc())
+        else:
+            _dbg("Depth provider is None — skipping depth image generation")
 
         # Save result images to disk for static_calibration mode
         results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
@@ -737,6 +749,15 @@ class ProMapAnythingPipeline(Pipeline):
                 "Depth preprocessor __call__ #%d kwargs: %s",
                 self._call_count, non_video,
             )
+            # Write to file so we can always check
+            try:
+                import datetime
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                with open("/tmp/promap_preproc_debug.log", "a") as f:
+                    f.write(f"[{ts}] __call__ #{self._call_count} "
+                            f"depth_mode={depth_mode} kwargs={non_video}\n")
+            except Exception:
+                pass
 
         # Normalise input to [0, 1]
         frame_f = frame.squeeze(0).to(device=self.device, dtype=torch.float32)
