@@ -544,6 +544,14 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             except Exception:
                 logger.error("Could not generate warp_then_depth", exc_info=True)
 
+        # Save result images to disk for static_calibration mode
+        results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
+        results_dir.mkdir(exist_ok=True)
+        for name, data in files.items():
+            if name.endswith(".png"):
+                (results_dir / name).write_bytes(data)
+                logger.info("Saved %s to %s", name, results_dir / name)
+
         # Push to streamer for dashboard
         if files and self._streamer is not None:
             self._streamer.set_calibration_results(files, timestamp)
@@ -628,10 +636,11 @@ class ProMapAnythingPipeline(Pipeline):
 
         self._gen_res: str = kwargs.get("generation_resolution", "half")
 
-        # Depth estimation (hardcoded auto/small)
-        from .depth_provider import create_depth_provider
+        # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
+        self._depth = None
 
-        self._depth = create_depth_provider("auto", self.device, model_size="small")
+        # Static calibration image cache
+        self._static_frame: torch.Tensor | None = None
 
         # MJPEG streamer for input preview on dashboard
         port = kwargs.get("stream_port", 8765)
@@ -693,7 +702,10 @@ class ProMapAnythingPipeline(Pipeline):
 
         has_calib = self._map_x is not None and self._map_y is not None
 
-        if depth_mode == "warped_rgb" and has_calib:
+        if depth_mode == "static_calibration":
+            # Use saved depth image from calibration (no live depth model)
+            rgb = self._get_static_frame()
+        elif depth_mode == "warped_rgb" and has_calib:
             # Warp camera RGB to projector perspective (no depth estimation)
             rgb = self._warped_rgb(frame_f)
         elif depth_mode == "warp_then_depth" and has_calib:
@@ -716,10 +728,43 @@ class ProMapAnythingPipeline(Pipeline):
 
         return {"video": rgb.unsqueeze(0).clamp(0, 1)}
 
+    def _ensure_depth_model(self) -> None:
+        """Lazy-load the depth model on first use."""
+        if self._depth is None:
+            from .depth_provider import create_depth_provider
+            self._depth = create_depth_provider("auto", self.device, model_size="small")
+
+    def _get_static_frame(self) -> torch.Tensor:
+        """Load and cache the static depth image from calibration results."""
+        if self._static_frame is not None:
+            return self._static_frame
+
+        results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
+        # Try depth_then_warp first, then warp_then_depth, then warped_camera
+        for name in ("depth_then_warp.png", "warp_then_depth.png", "warped_camera.png"):
+            path = results_dir / name
+            if path.is_file():
+                img = cv2.imread(str(path))
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    self._static_frame = torch.from_numpy(
+                        img.astype(np.float32) / 255.0
+                    ).to(self.device)
+                    logger.info("Loaded static calibration frame: %s", name)
+                    return self._static_frame
+
+        # Fallback: generate a grey frame at projector resolution
+        logger.warning("No calibration result images found — using grey fallback")
+        self._static_frame = torch.full(
+            (self.proj_h, self.proj_w, 3), 0.5, dtype=torch.float32, device=self.device,
+        )
+        return self._static_frame
+
     def _depth_then_warp(
         self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
     ) -> torch.Tensor:
         """Estimate depth from raw camera, then warp to projector perspective."""
+        self._ensure_depth_model()
         depth = self._depth.estimate(frame_f)
 
         # Temporal smoothing
@@ -748,6 +793,7 @@ class ProMapAnythingPipeline(Pipeline):
         self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
     ) -> torch.Tensor:
         """Warp camera RGB to projector perspective, then estimate depth."""
+        self._ensure_depth_model()
         # Warp camera to projector view
         warped_np = cv2.remap(
             frame_f.cpu().numpy(), self._map_x, self._map_y,

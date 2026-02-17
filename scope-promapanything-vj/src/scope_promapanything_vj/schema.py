@@ -203,13 +203,16 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     # -- Input-side controls (left panel) -------------------------------------
 
-    depth_mode: Literal["depth_then_warp", "warp_then_depth", "warped_rgb"] = Field(
+    depth_mode: Literal[
+        "depth_then_warp", "warp_then_depth", "warped_rgb", "static_calibration",
+    ] = Field(
         default="depth_then_warp",
         description=(
             "What to send to the AI model as conditioning input. "
             "'depth_then_warp' = depth from camera, warped to projector. "
             "'warp_then_depth' = camera warped to projector, then depth. "
-            "'warped_rgb' = camera RGB warped to projector (no depth)."
+            "'warped_rgb' = camera RGB warped to projector (no depth). "
+            "'static_calibration' = use saved depth from calibration (no live depth model)."
         ),
         json_schema_extra=ui_field_config(
             order=0,
