@@ -60,7 +60,7 @@ _PROJECTOR_HTML = """\
          display:flex; justify-content:center;
          align-items:center; }
   body.fs { cursor:none; }
-  img#stream { width:100vw; height:100vh;
+  img#view { width:100vw; height:100vh;
         object-fit:contain; display:block; }
   #hint { position:fixed; bottom:30px;
           left:50%; transform:translateX(-50%);
@@ -68,11 +68,46 @@ _PROJECTOR_HTML = """\
           pointer-events:none;
           transition:opacity 0.5s; }
   body.fs #hint { opacity:0; }
+  #status { position:fixed; top:10px; right:10px;
+            color:#333; font:11px monospace;
+            pointer-events:none; }
+  body.fs #status { opacity:0; }
 </style>
 </head><body>
-<img id="stream" src="/stream" />
+<img id="view" />
 <div id="hint">Click to go fullscreen &mdash; drag this window to your projector first</div>
+<div id="status"></div>
 <script>
+const img = document.getElementById('view');
+const statusEl = document.getElementById('status');
+let connected = false;
+let errorCount = 0;
+
+// Frame polling with auto-reconnect (survives server restarts)
+function refresh() {
+  const t = Date.now();
+  const probe = new Image();
+  probe.onload = () => {
+    img.src = probe.src;
+    if (!connected) {
+      connected = true;
+      errorCount = 0;
+      statusEl.textContent = '';
+    }
+    setTimeout(refresh, 33);  // ~30fps
+  };
+  probe.onerror = () => {
+    connected = false;
+    errorCount++;
+    // Back off: 500ms for first few failures, then 2s
+    const delay = errorCount < 5 ? 500 : 2000;
+    statusEl.textContent = 'Reconnecting...';
+    setTimeout(refresh, delay);
+  };
+  probe.src = '/frame?t=' + t;
+}
+refresh();
+
 document.body.addEventListener('click', () => {
   if (!document.fullscreenElement) {
     document.documentElement.requestFullscreen().catch(() => {});
