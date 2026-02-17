@@ -201,7 +201,9 @@ class ProMapAnythingConfig(BasePipelineConfig):
     modes = {"video": ModeDefaults(default=True)}
     usage = [UsageType.PREPROCESSOR]
 
-    # -- Input-side controls (left panel) -------------------------------------
+    # -- Configuration (settings panel) ---------------------------------------
+    # NOTE: Scope only renders "configuration" fields for preprocessors.
+    # "input" category fields are invisible for preprocessor pipelines.
 
     depth_mode: Literal[
         "depth_then_warp", "warp_then_depth", "warped_rgb", "static_calibration",
@@ -217,7 +219,8 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=0,
             label="Depth Mode",
-            category="input",
+            is_load_param=True,
+            category="configuration",
         ),
     )
 
@@ -229,7 +232,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=1,
             label="Temporal Smoothing",
-            category="input",
+            category="configuration",
         ),
     )
 
@@ -241,11 +244,9 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=2,
             label="Depth Blur",
-            category="input",
+            category="configuration",
         ),
     )
-
-    # -- Configuration (settings panel) ---------------------------------------
 
     stream_port: int = Field(
         default=8765,
@@ -253,7 +254,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         le=65535,
         description="MJPEG stream port for the dashboard input preview.",
         json_schema_extra=ui_field_config(
-            order=1,
+            order=3,
             label="Stream Port",
             is_load_param=True,
             category="configuration",
@@ -268,7 +269,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "'native' = full projector res (slow, highest quality)."
         ),
         json_schema_extra=ui_field_config(
-            order=2,
+            order=4,
             label="Generation Resolution",
             is_load_param=True,
             category="configuration",

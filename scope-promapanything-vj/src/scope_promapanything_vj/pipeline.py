@@ -657,6 +657,7 @@ class ProMapAnythingPipeline(Pipeline):
         )
 
         self._gen_res: str = kwargs.get("generation_resolution", "half")
+        self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
 
         # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
         self._depth = None
@@ -737,7 +738,7 @@ class ProMapAnythingPipeline(Pipeline):
 
         frame = video[0]  # (1, H, W, C) [0, 255]
 
-        depth_mode = kwargs.get("depth_mode", "depth_then_warp")
+        depth_mode = kwargs.get("depth_mode", self._depth_mode)
         temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
         depth_blur = kwargs.get("depth_blur", 0.0)
 
