@@ -96,10 +96,9 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         le=7680,
         description="Projector output resolution width in pixels.",
         json_schema_extra=ui_field_config(
-            order=0,
+            order=4,
             label="Projector Width",
-            is_load_param=True,
-            category="configuration",
+            category="input",
         ),
     )
 
@@ -109,10 +108,9 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         le=4320,
         description="Projector output resolution height in pixels.",
         json_schema_extra=ui_field_config(
-            order=1,
+            order=5,
             label="Projector Height",
-            is_load_param=True,
-            category="configuration",
+            category="input",
         ),
     )
 
