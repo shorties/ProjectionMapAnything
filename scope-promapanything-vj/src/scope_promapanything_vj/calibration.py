@@ -111,7 +111,7 @@ class CalibrationState:
         self,
         proj_w: int,
         proj_h: int,
-        settle_frames: int = 6,
+        settle_frames: int = 30,
         capture_frames: int = 3,
         decode_threshold: float = 20.0,
         bit_threshold: float = 3.0,
@@ -145,6 +145,12 @@ class CalibrationState:
         self._waiting_for_settle = False
         self._frame_count = 0  # frames captured for current pattern
 
+        # Adaptive settle: track camera brightness to detect pattern arrival
+        self._prev_camera_mean: float = -1.0  # last known camera brightness
+        self._stable_count: int = 0  # consecutive frames with stable brightness
+        self._brightness_changed: bool = False  # detected a brightness shift
+        self._min_settle: int = 6  # minimum frames before checking stability
+
         # Each slot holds a list of float32 frames (for multi-frame averaging)
         self._captures: list[list[np.ndarray]] = [[] for _ in range(self.total_patterns)]
 
@@ -156,13 +162,20 @@ class CalibrationState:
     def start(self) -> None:
         self.phase = CalibrationPhase.WHITE
         self._pattern_index = 0
-        self._settle_counter = 0
-        self._waiting_for_settle = True
         self._frame_count = 0
+        self._prev_camera_mean = -1.0
         self._captures = [[] for _ in range(self.total_patterns)]
         self.map_x = None
         self.map_y = None
         self.proj_valid_mask = None
+        self._begin_settle()
+
+    def _begin_settle(self) -> None:
+        """Reset adaptive settle state for the next pattern."""
+        self._waiting_for_settle = True
+        self._settle_counter = 0
+        self._stable_count = 0
+        self._brightness_changed = False
 
     def _camera_to_gray(self, frame_tensor: torch.Tensor) -> np.ndarray:
         """Convert a (1, H, W, C) tensor to a grayscale uint8 numpy array.
@@ -203,13 +216,57 @@ class CalibrationState:
         Returns the pattern to project as (1, H, W, 3) [0,1], or None if
         calibration just finished.
         """
-        # Handle settle delay
+        # Handle settle: wait for the camera to actually see the new pattern.
+        # Uses adaptive brightness detection: after a minimum wait, checks
+        # if camera brightness changed (pattern arrived) and then stabilised.
         if self._waiting_for_settle:
             self._settle_counter += 1
-            if self._settle_counter < self.settle_frames:
+
+            # Monitor camera brightness for adaptive settle
+            gray = self._camera_to_gray(camera_frame)
+            cam_mean = float(gray.mean())
+
+            if self._settle_counter <= self._min_settle:
+                # Minimum wait — just record baseline
+                self._prev_camera_mean = cam_mean
                 return self._current_pattern(device)
+
+            # Check for brightness change (pattern arrived in camera)
+            delta = abs(cam_mean - self._prev_camera_mean)
+            if delta > 2.0:
+                self._brightness_changed = True
+                self._stable_count = 0
+            else:
+                self._stable_count += 1
+
+            self._prev_camera_mean = cam_mean
+
+            # Settle is done when: brightness changed AND then stabilised
+            # (3 consecutive frames within tolerance), OR we hit max settle
+            settled = (
+                (self._brightness_changed and self._stable_count >= 3)
+                or self._settle_counter >= self.settle_frames
+            )
+
+            if not settled:
+                return self._current_pattern(device)
+
+            # Log settle timing
+            if self._brightness_changed:
+                logger.info(
+                    "Settle done: %d frames (brightness changed, stable)",
+                    self._settle_counter,
+                )
+            else:
+                logger.info(
+                    "Settle done: %d frames (max reached, no change detected)",
+                    self._settle_counter,
+                )
+
             self._waiting_for_settle = False
             self._settle_counter = 0
+            self._stable_count = 0
+            self._brightness_changed = False
             self._frame_count = 0
 
         # Capture frame (accumulate for multi-frame averaging)
@@ -234,13 +291,13 @@ class CalibrationState:
         # Done with this pattern, advance to next
         if self.phase == CalibrationPhase.WHITE:
             self.phase = CalibrationPhase.BLACK
-            self._waiting_for_settle = True
+            self._begin_settle()
             return self._current_pattern(device)
 
         if self.phase == CalibrationPhase.BLACK:
             self.phase = CalibrationPhase.PATTERNS
             self._pattern_index = 0
-            self._waiting_for_settle = True
+            self._begin_settle()
             return self._current_pattern(device)
 
         if self.phase == CalibrationPhase.PATTERNS:
@@ -250,7 +307,7 @@ class CalibrationState:
                 self._decode()
                 self.phase = CalibrationPhase.DONE
                 return None
-            self._waiting_for_settle = True
+            self._begin_settle()
             return self._current_pattern(device)
 
         return None
@@ -550,27 +607,58 @@ def save_calibration(
     proj_w: int,
     proj_h: int,
 ) -> None:
-    """Save calibration mapping to a JSON file."""
-    data = {
-        "version": 1,
+    """Save calibration mapping.
+
+    Uses ``.npz`` for fast I/O.  Also writes a small JSON sidecar for
+    metadata and backwards compatibility with tools that read the old format.
+    """
+    p = Path(path)
+
+    # Fast binary save — instant even for 1920×1080
+    npz_path = p.with_suffix(".npz")
+    np.savez_compressed(
+        npz_path,
+        map_x=map_x,
+        map_y=map_y,
+        meta=np.array([proj_w, proj_h]),
+    )
+
+    # Small JSON sidecar (metadata only, no huge arrays)
+    meta = {
+        "version": 2,
         "projector_width": proj_w,
         "projector_height": proj_h,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "map_x": map_x.tolist(),
-        "map_y": map_y.tolist(),
+        "npz_file": npz_path.name,
     }
-    Path(path).write_text(json.dumps(data))
+    p.write_text(json.dumps(meta))
+    logger.info("Saved calibration: %s + %s", p.name, npz_path.name)
 
 
 def load_calibration(
     path: str | Path,
 ) -> tuple[np.ndarray, np.ndarray, int, int, str]:
-    """Load calibration mapping from a JSON file.
+    """Load calibration mapping from JSON+NPZ or legacy JSON.
 
     Returns (map_x, map_y, proj_w, proj_h, timestamp_iso).
     """
-    data = json.loads(Path(path).read_text())
+    p = Path(path)
+    data = json.loads(p.read_text())
+    timestamp = data.get("timestamp", "unknown")
+
+    # New format (v2): metadata JSON + NPZ binary
+    if data.get("version", 1) >= 2:
+        npz_path = p.parent / data["npz_file"]
+        npz = np.load(npz_path)
+        return (
+            npz["map_x"].astype(np.float32),
+            npz["map_y"].astype(np.float32),
+            int(data["projector_width"]),
+            int(data["projector_height"]),
+            timestamp,
+        )
+
+    # Legacy format (v1): arrays embedded in JSON
     map_x = np.array(data["map_x"], dtype=np.float32)
     map_y = np.array(data["map_y"], dtype=np.float32)
-    timestamp = data.get("timestamp", "unknown")
     return map_x, map_y, data["projector_width"], data["projector_height"], timestamp
