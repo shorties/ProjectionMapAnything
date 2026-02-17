@@ -244,20 +244,6 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     # -- Configuration (settings panel) ---------------------------------------
 
-    calibration_file: str = Field(
-        default="",
-        description=(
-            "Path to a calibration JSON file.  Leave empty to use the "
-            "default (~/.promapanything_calibration.json)."
-        ),
-        json_schema_extra=ui_field_config(
-            order=0,
-            label="Calibration File",
-            is_load_param=True,
-            category="configuration",
-        ),
-    )
-
     stream_port: int = Field(
         default=8765,
         ge=1024,

@@ -627,7 +627,6 @@ class ProMapAnythingPipeline(Pipeline):
         )
 
         self._gen_res: str = kwargs.get("generation_resolution", "half")
-        calibration_file: str = kwargs.get("calibration_file", "")
 
         # Depth estimation (hardcoded auto/small)
         from .depth_provider import create_depth_provider
@@ -648,8 +647,8 @@ class ProMapAnythingPipeline(Pipeline):
         # Temporal smoothing buffer
         self._prev_depth: torch.Tensor | None = None
 
-        # Load calibration (explicit path or default)
-        cal_path = Path(calibration_file) if calibration_file else _DEFAULT_CALIBRATION_PATH
+        # Load calibration
+        cal_path = _DEFAULT_CALIBRATION_PATH
         if cal_path.is_file():
             mx, my, pw, ph, ts = load_calibration(cal_path)
             self._map_x = mx

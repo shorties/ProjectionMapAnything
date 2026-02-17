@@ -85,8 +85,15 @@ class TransformersDepthProvider(DepthProvider):
         logger.info("Loading Depth Anything V2 %s via transformers ...", model_size.title())
         self._processor = AutoImageProcessor.from_pretrained(model_id)
         self._model = AutoModelForDepthEstimation.from_pretrained(model_id)
-        self._model.to(device).eval()
-        logger.info("Depth model loaded (%s)", model_size)
+        try:
+            self._model.to(device).eval()
+            logger.info("Depth model loaded on %s (%s)", device, model_size)
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            # GPU full (main pipeline using VRAM) — fall back to CPU
+            logger.warning("CUDA OOM loading depth model — falling back to CPU")
+            self.device = torch.device("cpu")
+            self._model.to(self.device).eval()
+            logger.info("Depth model loaded on CPU (%s)", model_size)
 
     @torch.no_grad()
     def estimate(self, frame: torch.Tensor) -> torch.Tensor:
