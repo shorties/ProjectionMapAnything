@@ -746,10 +746,13 @@ class ProMapAnythingPipeline(Pipeline):
                 "Depth preprocessor CRASHED: %s: %s",
                 type(exc).__name__, exc, exc_info=True,
             )
-            # Return a grey frame at generation resolution as fallback
-            gen_w, gen_h = self._get_generation_resolution()
+            # Return a grey frame at expected resolution as fallback
+            out_w = kwargs.get("width", None)
+            out_h = kwargs.get("height", None)
+            if out_w is None or out_h is None:
+                out_w, out_h = self._get_generation_resolution()
             fallback = torch.full(
-                (gen_h, gen_w, 3), 0.5,
+                (int(out_h), int(out_w), 3), 0.5,
                 dtype=torch.float32, device=self.device,
             )
             return {"video": fallback.unsqueeze(0)}
@@ -806,12 +809,18 @@ class ProMapAnythingPipeline(Pipeline):
         # Submit full-resolution preview to dashboard before resizing
         self._submit_input_preview(rgb)
 
-        # Resize to generation resolution
-        gen_w, gen_h = self._get_generation_resolution()
+        # Resize to match what Scope / the main pipeline expects.
+        # Scope passes target width/height in kwargs; fall back to our own calc.
+        out_w = kwargs.get("width", None)
+        out_h = kwargs.get("height", None)
+        if out_w is None or out_h is None:
+            out_w, out_h = self._get_generation_resolution()
+        else:
+            out_w, out_h = int(out_w), int(out_h)
         h, w = rgb.shape[:2]
-        if (w, h) != (gen_w, gen_h):
+        if (w, h) != (out_w, out_h):
             rgb_np = (rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            rgb_np = cv2.resize(rgb_np, (gen_w, gen_h), interpolation=cv2.INTER_AREA)
+            rgb_np = cv2.resize(rgb_np, (out_w, out_h), interpolation=cv2.INTER_AREA)
             rgb = torch.from_numpy(rgb_np.astype(np.float32) / 255.0).to(self.device)
 
         return {"video": rgb.unsqueeze(0).clamp(0, 1)}
