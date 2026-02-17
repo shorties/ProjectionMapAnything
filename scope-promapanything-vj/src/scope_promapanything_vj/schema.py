@@ -143,7 +143,7 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
     )
 
     settle_frames: int = Field(
-        default=30,
+        default=60,
         ge=1,
         le=120,
         description=(

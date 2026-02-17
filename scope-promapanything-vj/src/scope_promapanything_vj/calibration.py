@@ -145,11 +145,14 @@ class CalibrationState:
         self._waiting_for_settle = False
         self._frame_count = 0  # frames captured for current pattern
 
-        # Adaptive settle: track camera brightness to detect pattern arrival
-        self._prev_camera_mean: float = -1.0  # last known camera brightness
-        self._stable_count: int = 0  # consecutive frames with stable brightness
-        self._brightness_changed: bool = False  # detected a brightness shift
-        self._min_settle: int = 6  # minimum frames before checking stability
+        # Adaptive settle: structural baseline comparison for pattern arrival
+        # Compares full-frame pixel differences (not just mean brightness)
+        # so we detect spatial pattern changes even when overall brightness is similar
+        self._settle_baseline: np.ndarray | None = None  # camera at settle start
+        self._prev_settle_frame: np.ndarray | None = None  # for stability check
+        self._stable_count: int = 0
+        self._brightness_changed: bool = False
+        self._min_settle: int = 8  # minimum frames before checking
 
         # Each slot holds a list of float32 frames (for multi-frame averaging)
         self._captures: list[list[np.ndarray]] = [[] for _ in range(self.total_patterns)]
@@ -163,7 +166,6 @@ class CalibrationState:
         self.phase = CalibrationPhase.WHITE
         self._pattern_index = 0
         self._frame_count = 0
-        self._prev_camera_mean = -1.0
         self._captures = [[] for _ in range(self.total_patterns)]
         self.map_x = None
         self.map_y = None
@@ -176,6 +178,8 @@ class CalibrationState:
         self._settle_counter = 0
         self._stable_count = 0
         self._brightness_changed = False
+        self._settle_baseline = None
+        self._prev_settle_frame = None
 
     def _camera_to_gray(self, frame_tensor: torch.Tensor) -> np.ndarray:
         """Convert a (1, H, W, C) tensor to a grayscale uint8 numpy array.
@@ -217,32 +221,48 @@ class CalibrationState:
         calibration just finished.
         """
         # Handle settle: wait for the camera to actually see the new pattern.
-        # Uses adaptive brightness detection: after a minimum wait, checks
-        # if camera brightness changed (pattern arrived) and then stabilised.
+        # Uses STRUCTURAL baseline comparison: captures the camera frame at the
+        # start of settle (still showing old pattern), then watches for pixel-level
+        # changes across the whole image.  This detects spatial pattern changes
+        # even when overall mean brightness barely shifts.
         if self._waiting_for_settle:
             self._settle_counter += 1
-
-            # Monitor camera brightness for adaptive settle
             gray = self._camera_to_gray(camera_frame)
-            cam_mean = float(gray.mean())
+            gray_f = gray.astype(np.float32)
 
+            # Capture baseline on first frame (camera still shows old pattern)
+            if self._settle_baseline is None:
+                self._settle_baseline = gray_f.copy()
+
+            # Minimum wait before checking for changes
             if self._settle_counter <= self._min_settle:
-                # Minimum wait — just record baseline
-                self._prev_camera_mean = cam_mean
+                self._prev_settle_frame = gray_f.copy()
                 return self._current_pattern(device)
 
-            # Check for brightness change (pattern arrived in camera)
-            delta = abs(cam_mean - self._prev_camera_mean)
-            if delta > 2.0:
+            # Structural change: mean absolute pixel diff from baseline
+            structural_diff = 0.0
+            if (self._settle_baseline is not None
+                    and gray_f.shape == self._settle_baseline.shape):
+                structural_diff = float(
+                    np.mean(np.abs(gray_f - self._settle_baseline))
+                )
+
+            if structural_diff > 3.0:
                 self._brightness_changed = True
-                self._stable_count = 0
-            else:
-                self._stable_count += 1
 
-            self._prev_camera_mean = cam_mean
+            # Frame-to-frame stability (camera fully settled on new pattern)
+            if (self._prev_settle_frame is not None
+                    and gray_f.shape == self._prev_settle_frame.shape):
+                frame_diff = float(
+                    np.mean(np.abs(gray_f - self._prev_settle_frame))
+                )
+                if frame_diff < 1.5:
+                    self._stable_count += 1
+                else:
+                    self._stable_count = 0
 
-            # Settle is done when: brightness changed AND then stabilised
-            # (3 consecutive frames within tolerance), OR we hit max settle
+            self._prev_settle_frame = gray_f.copy()
+
             settled = (
                 (self._brightness_changed and self._stable_count >= 3)
                 or self._settle_counter >= self.settle_frames
@@ -251,22 +271,24 @@ class CalibrationState:
             if not settled:
                 return self._current_pattern(device)
 
-            # Log settle timing
+            # Log settle result with diagnostics
+            bl_mean = float(self._settle_baseline.mean()) if self._settle_baseline is not None else 0
             if self._brightness_changed:
                 logger.info(
-                    "Settle done: %d frames (brightness changed, stable)",
-                    self._settle_counter,
+                    "Settle done: %d frames (structural diff=%.1f, "
+                    "baseline_mean=%.1f, current_mean=%.1f)",
+                    self._settle_counter, structural_diff,
+                    bl_mean, float(gray_f.mean()),
                 )
             else:
                 logger.info(
-                    "Settle done: %d frames (max reached, no change detected)",
-                    self._settle_counter,
+                    "Settle done: %d frames (MAX — diff=%.1f, "
+                    "baseline=%.1f, current=%.1f — pattern may not have arrived!)",
+                    self._settle_counter, structural_diff,
+                    bl_mean, float(gray_f.mean()),
                 )
 
             self._waiting_for_settle = False
-            self._settle_counter = 0
-            self._stable_count = 0
-            self._brightness_changed = False
             self._frame_count = 0
 
         # Capture frame (accumulate for multi-frame averaging)

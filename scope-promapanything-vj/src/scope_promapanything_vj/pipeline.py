@@ -180,7 +180,14 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         live_depth = kwargs.get("live_depth_preview", False)
         reset = kwargs.get("reset_calibration", False)
 
-        print(f"[ProMap Calibrate] __call__: start={start} live_depth={live_depth} reset={reset} calibrating={self._calibrating} done={self._done}", flush=True)
+        # Update projector resolution from input-side fields
+        new_pw = kwargs.get("projector_width", self.proj_w)
+        new_ph = kwargs.get("projector_height", self.proj_h)
+        if new_pw != self.proj_w or new_ph != self.proj_h:
+            self.proj_w = new_pw
+            self.proj_h = new_ph
+            self._test_card = self._build_test_card()
+            logger.info("Projector resolution updated to %dx%d", self.proj_w, self.proj_h)
 
         # Reset calibration on rising edge (toggled ON)
         if reset and not self._reset_armed:
