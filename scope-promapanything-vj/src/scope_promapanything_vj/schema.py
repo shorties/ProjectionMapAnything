@@ -144,6 +144,39 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
         ),
     )
 
+    settle_frames: int = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description=(
+            "Frames to wait after each pattern change before capturing. "
+            "Increase for high-latency setups (remote/RunPod). "
+            "Local: 6–10, Remote: 15–30."
+        ),
+        json_schema_extra=ui_field_config(
+            order=4,
+            label="Settle Frames",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
+    capture_frames: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "Frames to average per pattern for noise rejection. "
+            "More = cleaner but slower calibration."
+        ),
+        json_schema_extra=ui_field_config(
+            order=5,
+            label="Capture Frames",
+            is_load_param=True,
+            category="configuration",
+        ),
+    )
+
 
 # =============================================================================
 # Depth preprocessor

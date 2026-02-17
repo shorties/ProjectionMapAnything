@@ -73,6 +73,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
         self.proj_w: int = kwargs.get("projector_width", 1920)
         self.proj_h: int = kwargs.get("projector_height", 1080)
+        self._settle_frames: int = kwargs.get("settle_frames", 15)
+        self._capture_frames: int = kwargs.get("capture_frames", 3)
 
         # Start the MJPEG streamer for the projector pop-out window
         port = kwargs.get("stream_port", 8765)
@@ -229,7 +231,11 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
         # -- Start calibration on first toggle ON ----------------------------
         if start and not self._calibrating and not self._done:
-            self._calib = CalibrationState(self.proj_w, self.proj_h)
+            self._calib = CalibrationState(
+                self.proj_w, self.proj_h,
+                settle_frames=self._settle_frames,
+                capture_frames=self._capture_frames,
+            )
             self._calib.start()
             self._calibrating = True
             if self._streamer is not None:

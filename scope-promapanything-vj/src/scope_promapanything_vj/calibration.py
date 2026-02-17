@@ -305,7 +305,11 @@ class CalibrationState:
         h, w = white_f.shape[:2]
         diff = white_f - black_f
 
-        # Debug: report capture statistics
+        # Debug: report capture statistics (print for Scope visibility)
+        print(f"[ProMap Cal] Decode: cam {w}x{h}, proj {self.proj_w}x{self.proj_h}", flush=True)
+        print(f"[ProMap Cal]   WHITE: min={white_f.min():.1f} max={white_f.max():.1f} mean={white_f.mean():.1f}", flush=True)
+        print(f"[ProMap Cal]   BLACK: min={black_f.min():.1f} max={black_f.max():.1f} mean={black_f.mean():.1f}", flush=True)
+        print(f"[ProMap Cal]   DIFF: min={diff.min():.1f} max={diff.max():.1f} mean={diff.mean():.1f} thresh={self.decode_threshold}", flush=True)
         logger.info(
             "Decode: camera resolution %dx%d, projector %dx%d",
             w, h, self.proj_w, self.proj_h,
