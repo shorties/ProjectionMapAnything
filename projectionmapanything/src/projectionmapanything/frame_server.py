@@ -270,11 +270,11 @@ _CONTROL_PANEL_HTML = """\
     </div>
   </div>
 
-  <!-- VACE Input Preview -->
-  <div class="card">
+  <!-- VACE Input Preview (hidden until preprocessor feeds frames) -->
+  <div class="card hidden" id="input-preview-card">
     <h2>VACE Input (preprocessor output)</h2>
     <div class="preview">
-      <img id="input-preview" src="/input-frame" />
+      <img id="input-preview" />
     </div>
   </div>
 
@@ -462,8 +462,24 @@ function openProjector() {
 // -- Preview auto-refresh --
 setInterval(() => {
   document.getElementById('preview').src = '/frame?t=' + Date.now();
-  document.getElementById('input-preview').src = '/input-frame?t=' + Date.now();
 }, 2000);
+
+// Input preview: only poll if the endpoint has content (avoids 204 flicker)
+let inputPreviewActive = false;
+async function checkInputPreview() {
+  try {
+    const r = await fetch('/input-frame', { method: 'HEAD' });
+    if (r.status === 200) {
+      document.getElementById('input-preview-card').classList.remove('hidden');
+      document.getElementById('input-preview').src = '/input-frame?t=' + Date.now();
+      inputPreviewActive = true;
+    } else if (inputPreviewActive) {
+      inputPreviewActive = false;
+      document.getElementById('input-preview-card').classList.add('hidden');
+    }
+  } catch {}
+}
+setInterval(checkInputPreview, 3000);
 
 // -- Projector status polling --
 function updateProjectorStatus() {
