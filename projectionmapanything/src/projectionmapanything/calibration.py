@@ -121,6 +121,7 @@ class CalibrationState:
         consistency_max_diff: float = 3.0,
         fill_kernel_size: int = 11,
         max_brightness: int = 255,
+        min_settle: int = 8,
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
@@ -154,7 +155,7 @@ class CalibrationState:
         self._prev_settle_frame: np.ndarray | None = None  # for stability check
         self._stable_count: int = 0
         self._brightness_changed: bool = False
-        self._min_settle: int = 8  # minimum frames before checking
+        self._min_settle: int = max(1, min_settle)
 
         # Each slot holds a list of float32 frames (for multi-frame averaging)
         self._captures: list[list[np.ndarray]] = [[] for _ in range(self.total_patterns)]

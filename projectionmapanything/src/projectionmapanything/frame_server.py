@@ -815,8 +815,10 @@ async function scCaptureLoop() {
         document.getElementById('sc-stop-btn').style.display = 'none';
         break;
       } else {
-        statusEl.textContent = data.phase + ' — ' + (data.pattern_info || '') +
+        let msg = data.phase + ' — ' + (data.pattern_info || '') +
           ' (' + Math.round((data.progress || 0) * 100) + '%)';
+        if (data.settling) msg += ' [settling]';
+        statusEl.textContent = msg;
         statusEl.className = 'sc-status';
       }
     } catch (err) {
@@ -1090,7 +1092,7 @@ class FrameStreamer:
         self,
         proj_w: int = 1920,
         proj_h: int = 1080,
-        settle_frames: int = 15,
+        settle_frames: int = 10,
         capture_frames: int = 3,
         max_brightness: int = 128,
     ) -> dict:
@@ -1110,11 +1112,14 @@ class FrameStreamer:
         )
         self._standalone_ambient = None
 
+        # Lower settle for browser mode: each frame is a full HTTP round-trip
+        # (~160ms) so we don't need as many settle frames as the Scope pipeline.
         self._standalone_calib = CalibrationState(
             proj_w, proj_h,
             settle_frames=settle_frames,
             capture_frames=capture_frames,
             max_brightness=max_brightness,
+            min_settle=3,
         )
         self._standalone_calib.start()
 
@@ -1143,13 +1148,31 @@ class FrameStreamer:
 
         Returns
         -------
-        dict with phase, progress, pattern_info, done, and optionally coverage_pct.
+        dict with phase, progress, pattern_info, done, settling, and
+        optionally coverage_pct.
         """
         from .calibration import CalibrationPhase
 
         calib = self._standalone_calib
         if calib is None:
             return {"error": "No calibration in progress", "done": True}
+
+        # If we're in DECODING phase, run decode in this call.
+        # This will block for a few seconds — the browser shows
+        # "Decoding..." from the previous response while we work.
+        if calib.phase == CalibrationPhase.DECODING:
+            self.update_calibration_progress(
+                0.98, "DECODING", "Decoding patterns...",
+            )
+            # step() will run _decode() and set phase=DONE
+            dummy = torch.zeros(1, 1, 1, 3)
+            calib.step(dummy, self._standalone_device or torch.device("cpu"))
+            if calib.phase == CalibrationPhase.DONE:
+                return self._finish_standalone_calibration()
+            return {
+                "phase": "DECODING", "progress": 0.98,
+                "pattern_info": "Decoding...", "done": False,
+            }
 
         # Decode JPEG → RGB uint8
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -1166,12 +1189,16 @@ class FrameStreamer:
         tensor = torch.from_numpy(rgb.astype(np.float32)).unsqueeze(0)
         device = self._standalone_device or torch.device("cpu")
 
+        # Track settle state before stepping
+        was_settling = calib._waiting_for_settle
+
         # Step the calibration state machine
         pattern = calib.step(tensor, device)
 
         # Build progress info
         phase = calib.phase.name
         progress = calib.progress
+        settling = calib._waiting_for_settle
         pattern_info = ""
 
         if calib.phase == CalibrationPhase.PATTERNS:
@@ -1187,10 +1214,16 @@ class FrameStreamer:
             captured = sum(len(s) for s in calib._captures)
             total_cap = calib.total_patterns * calib.capture_frames
             pattern_info += f" ({captured}/{total_cap} captures)"
+            if settling:
+                pattern_info += f" settling {calib._settle_counter}/{calib.settle_frames}"
         elif calib.phase == CalibrationPhase.WHITE:
             pattern_info = "Capturing white reference"
+            if settling:
+                pattern_info += f" settling {calib._settle_counter}/{calib.settle_frames}"
         elif calib.phase == CalibrationPhase.BLACK:
             pattern_info = "Capturing black reference"
+            if settling:
+                pattern_info += f" settling {calib._settle_counter}/{calib.settle_frames}"
         elif calib.phase == CalibrationPhase.DECODING:
             pattern_info = "Decoding patterns..."
 
@@ -1213,6 +1246,7 @@ class FrameStreamer:
             "phase": phase,
             "progress": progress,
             "pattern_info": pattern_info,
+            "settling": settling,
             "done": False,
         }
 
