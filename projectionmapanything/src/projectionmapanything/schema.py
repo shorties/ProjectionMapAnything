@@ -442,6 +442,16 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ),
     )
 
+    invert_subject_mask: bool = Field(
+        default=False,
+        description="Invert the subject isolation mask (keep background, remove subject).",
+        json_schema_extra=ui_field_config(
+            order=15,
+            label="Invert Subject Mask",
+            category="configuration",
+        ),
+    )
+
     # -- Load-time config -----------------------------------------------------
 
     stream_port: int = Field(

@@ -683,6 +683,7 @@ class ProMapAnythingPipeline(Pipeline):
         isolation_mode = kwargs.get("subject_isolation", self._isolation_mode)
         subject_depth_range = float(kwargs.get("subject_depth_range", 0.3))
         subject_feather = float(kwargs.get("subject_feather", 5.0))
+        invert_mask = bool(kwargs.get("invert_subject_mask", False))
 
         # Normalise input to [0, 1]
         frame_f = frame.squeeze(0).to(device=self.device, dtype=torch.float32)
@@ -736,6 +737,7 @@ class ProMapAnythingPipeline(Pipeline):
         if isolation_mode != "none":
             rgb = self._apply_isolation(
                 rgb, reference_frame, isolation_mode, subject_depth_range, subject_feather,
+                invert=invert_mask,
             )
 
         # -- Resize to match what Scope / the main pipeline expects -----------
@@ -949,6 +951,7 @@ class ProMapAnythingPipeline(Pipeline):
         mode: str,
         depth_range: float,
         feather: float,
+        invert: bool = False,
     ) -> torch.Tensor:
         """Apply subject isolation to the depth RGB."""
         from .isolation import isolate_by_depth_band, isolate_by_mask, isolate_by_rembg
@@ -972,6 +975,9 @@ class ProMapAnythingPipeline(Pipeline):
 
         if mask_np is None:
             return rgb
+
+        if invert:
+            mask_np = 1.0 - mask_np
 
         mask_t = torch.from_numpy(mask_np).to(rgb.device).unsqueeze(-1)
         result = rgb * mask_t
