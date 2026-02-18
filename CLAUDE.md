@@ -1,4 +1,4 @@
-# ProMapAnything — Projection Mapping System
+# ProjectionMapAnything — Projection Mapping System
 
 A complete projection mapping solution: camera-projector calibration via structured light, real-time depth estimation, and AI-powered VJ effects projected onto physical surfaces. Inspired by Microsoft's RoomAlive Toolkit.
 
@@ -6,7 +6,19 @@ A complete projection mapping solution: camera-projector calibration via structu
 
 ```
 ProjectionMapAnything/
-├── promapanything-app/              # Standalone desktop app (Windows)
+├── projectionmapanything/              # Daydream Scope plugin (3 pipelines)
+│   └── src/projectionmapanything/
+│       ├── __init__.py              # Plugin entry (hookimpl, registers 3 pipelines)
+│       ├── schema.py                # Pydantic configs with UI annotations
+│       ├── pipeline.py              # 3 pipeline classes (calibrate, depth, projector)
+│       ├── calibration.py           # Gray code state machine (CalibrationState)
+│       ├── depth_provider.py        # Depth estimation (built-in or transformers)
+│       ├── remap.py                 # Depth warp camera→projector
+│       ├── effects.py               # GPU effects (pure torch, no loops)
+│       ├── isolation.py             # Subject isolation (depth_band, mask, rembg)
+│       └── frame_server.py          # MJPEG HTTP server (singleton FrameStreamer)
+│
+├── promapanything-app/              # Standalone desktop app (Windows, gitignored)
 │   └── src/promapanything/
 │       ├── app.py                   # Main app (dual-window GLFW, event loop)
 │       ├── state.py                 # Central state (AppState, AppMode, CalibrationPhase)
@@ -22,21 +34,10 @@ ProjectionMapAnything/
 │           ├── scene.py             # 3D scene (point cloud, mesh, frustum)
 │           └── shaders/             # GLSL shaders (effects, pointcloud, mesh, etc.)
 │
-├── scope-promapanything-vj/         # Daydream Scope plugin (3 pipelines)
-│   └── src/scope_promapanything_vj/
-│       ├── __init__.py              # Plugin entry (hookimpl, registers 3 pipelines)
-│       ├── schema.py                # Pydantic configs with UI annotations
-│       ├── pipeline.py              # 3 pipeline classes (calibrate, depth, projector)
-│       ├── calibration.py           # Gray code state machine (CalibrationState)
-│       ├── depth_provider.py        # Depth estimation (built-in or transformers)
-│       ├── remap.py                 # Depth warp camera→projector
-│       ├── effects.py               # GPU effects (pure torch, no loops)
-│       └── frame_server.py          # MJPEG HTTP server (singleton FrameStreamer)
-│
-├── projector-client/                # Companion app for local projector display
+├── projector-client/                # Companion app for local projector display (gitignored)
 │   └── projector_client.py          # MJPEG receiver + fullscreen GLFW window
 │
-├── ProCamCalibration/               # Microsoft RoomAlive Toolkit reference (C#)
+├── ProCamCalibration/               # Microsoft RoomAlive Toolkit reference (gitignored)
 │
 └── .claude/skills/
     ├── structured-light/SKILL.md    # 61KB calibration theory reference
@@ -52,22 +53,28 @@ ProjectionMapAnything/
 
 | Pipeline | Role | Config Class | Pipeline Class |
 |----------|------|--------------|----------------|
-| ProMapAnything Calibrate | **Main pipeline** | `ProMapAnythingCalibrateConfig` | `ProMapAnythingCalibratePipeline` |
-| ProMapAnything Depth | **Preprocessor** | `ProMapAnythingConfig` | `ProMapAnythingPipeline` |
-| ProMapAnything Projector | **Postprocessor** | `ProMapAnythingProjectorConfig` | `ProMapAnythingProjectorPipeline` |
+| ProjectionMapAnything Calibrate | **Main pipeline** | `ProjectionMapAnythingCalibrateConfig` | `ProjectionMapAnythingCalibratePipeline` |
+| ProjectionMapAnything Depth | **Preprocessor** | `ProjectionMapAnythingConfig` | `ProjectionMapAnythingPipeline` |
+| ProjectionMapAnything Projector | **Postprocessor** | `ProjectionMapAnythingProjectorConfig` | `ProjectionMapAnythingProjectorPipeline` |
+
+### Pipeline IDs
+
+- `projectionmapanything-calibrate`
+- `projectionmapanything-depth`
+- `projectionmapanything-projector`
 
 ### Workflow
 
 ```
 CALIBRATION (standalone — no pre/post needed):
-  Select "ProMapAnything Calibrate" as main pipeline → hit play
+  Select "ProjectionMapAnything Calibrate" as main pipeline → hit play
   Grey test card on projector → user toggles "Start Calibration"
   Gray code patterns → camera captures → decode → save calibration
   Uploads result images to Scope gallery for VACE conditioning
 
 NORMAL VJ MODE:
-  Main: Krea/VACE    Pre: ProMapAnything Depth    Post: ProMapAnything Projector
-  Camera → depth estimation → warp to projector perspective → AI generation → MJPEG stream
+  Main: Krea/VACE    Pre: ProjectionMapAnything Depth    Post: ProjectionMapAnything Projector
+  Camera → depth estimation → warp to projector perspective → effects → isolation → AI generation → MJPEG stream
 ```
 
 ### Calibration Pipeline Details
@@ -79,21 +86,30 @@ NORMAL VJ MODE:
 - `capture_frames=3` per pattern (averaged for noise rejection)
 - Per-bit reliability thresholding + spatial consistency filtering
 - Gaussian splat fill + inpainting for dense correspondence
-- Saves to `~/.promapanything_calibration.json` with UTC timestamp
+- Saves to `~/.projectionmapanything_calibration.json` with UTC timestamp
 - Publishes downloadable results via frame_server + uploads to Scope asset gallery
 
 ### Depth Preprocessor Details
 
-- Loads calibration automatically from `~/.promapanything_calibration.json`
+- Loads calibration automatically from `~/.projectionmapanything_calibration.json`
 - Uses Depth Anything V2 (tries Scope built-in first, falls back to transformers)
 - Warps depth from camera→projector perspective using calibration maps
 - Output: grayscale RGB (near=dark, far=bright) matching VACE training data
 - Temporal smoothing + Gaussian blur for flicker/noise reduction
+- Edge blend: Sobel/Canny edge detection blended into depth
+- Depth effects: Surface-masked animated effects (noise, flow, pulse, wave, kaleido, etc.)
+- Subject isolation: depth_band, custom mask, or rembg AI background removal
+- Custom depth: User-uploaded depth map via dashboard
 - Resizes to generation resolution (quarter/half/native of projector res)
+
+**Preprocessor chain**: `depth → edge_processing → edge_blend → surface-masked effect → isolation → preview → resize`
 
 ### Projector Postprocessor Details
 
 - Streams final AI output to projector via MJPEG
+- Edge feathering: fade to black at projection edges
+- Subject masking: apply preprocessor isolation mask
+- Color correction: brightness, gamma, contrast adjustments
 - Optionally upscales to projector resolution (from companion app config)
 - Shares singleton FrameStreamer with calibration pipeline
 
@@ -103,13 +119,15 @@ Module-level singleton `FrameStreamer` in `frame_server.py`. Both calibration an
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /` | Control panel (Scope URL, projector button, preview, status) |
+| `GET /` | Control panel (Scope URL, projector button, preview, status, custom upload) |
 | `GET /projector` | Fullscreen MJPEG viewer (drag to projector, click fullscreen) |
 | `GET /stream` | MJPEG multipart stream |
 | `GET /frame` | Single JPEG snapshot |
 | `GET/POST /config` | Projector resolution from browser |
 | `GET /calibration/status` | Calibration completion status + file list |
 | `GET /calibration/download/<name>` | Download calibration result files |
+| `POST /upload` | Custom depth map or mask upload (query: stage, type) |
+| `GET /upload/status` | Custom upload status (has_custom_depth, has_custom_mask) |
 
 **Calibration priority**: When `calibration_active=True`, normal `submit_frame()` is suppressed — only `submit_calibration_frame()` goes through.
 
@@ -123,8 +141,8 @@ Fields use `category` in `ui_field_config()` to control panel placement:
 - `category="configuration"` → **Right panel** (settings) — load-time config set once
 
 Current layout:
-- **Input side**: Start Calibration toggle, Temporal Smoothing, Depth Blur, Upscale to Projector
-- **Settings side**: Projector Width/Height, Stream Port, Projector URL, Calibration File, Gen Resolution
+- **Input side**: Start Calibration toggle, Temporal Smoothing, Depth Blur, Edge Erosion, Depth Contrast, Near/Far Clip, Edge Blend, Edge Method, Active Effect, Effect Intensity, Effect Speed, Subject Depth Range, Subject Feather, Upscale to Projector, Edge Feather, Apply Subject Mask, Brightness, Gamma, Contrast
+- **Settings side**: Projector Width/Height, Stream Port, Projector URL, Calibration File, Gen Resolution, Depth Mode, Subject Isolation
 
 ## Critical Implementation Notes
 
@@ -161,7 +179,7 @@ Never show camera feed on the projector before calibration — the camera sees t
 
 ## Data Files
 
-### Calibration (`~/.promapanything_calibration.json`)
+### Calibration (`~/.projectionmapanything_calibration.json`)
 ```json
 {
   "version": 1,
@@ -173,6 +191,11 @@ Never show camera feed on the projector before calibration — the camera sees t
 }
 ```
 Note: Standalone app version also includes `K_cam`, `dist_cam`, `K_proj`, `dist_proj`, `R`, `T`.
+
+### Results (`~/.projectionmapanything_results/`)
+- `custom_depth.png` — User-uploaded custom depth map
+- `custom_mask.png` — User-uploaded custom isolation mask
+- Calibration result images (coverage map, warped camera, etc.)
 
 ### Live Export (`~/.promapanything_live/`)
 - `depth_bw.npy` — (H, W) float32 grayscale depth
@@ -191,7 +214,7 @@ Note: Standalone app version also includes `K_cam`, `dist_cam`, `K_proj`, `dist_
 - **Port 8765**: Must be explicitly exposed in RunPod settings for MJPEG streamer
 - **URL pattern**: `https://{pod-id}-{port}.proxy.runpod.net/`
 - **Auto-detect**: Uses `RUNPOD_POD_ID` env var for URL construction
-- **Plugin install**: `git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=scope-promapanything-vj`
+- **Plugin install**: `git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectionmapanything`
 - **Caution**: Killing Scope process (PID) restarts the entire container
 
 ## Technology Stack
@@ -199,7 +222,7 @@ Note: Standalone app version also includes `K_cam`, `dist_cam`, `K_proj`, `dist_
 | Component | Stack |
 |-----------|-------|
 | Standalone App | Python 3.12+, GLFW, ModernGL, imgui-bundle, PyTorch, SpoutGL, OpenCV, PyGLM |
-| Scope Plugin | Python 3.12+, PyTorch, OpenCV, Pydantic, transformers (fallback depth) |
+| Scope Plugin | Python 3.12+, PyTorch, OpenCV, Pydantic, transformers (fallback depth), rembg |
 | Projector Client | Python 3.10+, GLFW, PyOpenGL, OpenCV |
 | Reference (C#) | .NET, DirectX, SharpDX, Kinect v2 SDK |
 

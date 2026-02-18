@@ -1,4 +1,4 @@
-"""ProMapAnything VJ Tools — pipelines.
+"""ProjectionMapAnything — pipelines.
 
 Registered pipelines:
 1. ProMapAnythingCalibratePipeline  — main pipeline (Gray code calibration)
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time as _time
 import urllib.request
 import webbrowser
 from datetime import datetime, timezone
@@ -43,11 +44,144 @@ logger = logging.getLogger(__name__)
 # Ensure our logger output reaches stdout (Scope doesn't forward plugin loggers)
 if not logger.handlers:
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("[ProMap Pipe] %(message)s"))
+    _handler.setFormatter(logging.Formatter("[PMA Pipe] %(message)s"))
     logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
 
-_DEFAULT_CALIBRATION_PATH = Path.home() / ".promapanything_calibration.json"
+_DEFAULT_CALIBRATION_PATH = Path.home() / ".projectionmapanything_calibration.json"
+_RESULTS_DIR = Path.home() / ".projectionmapanything_results"
+
+
+def publish_calibration_results(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    rgb_frame_np: np.ndarray,
+    proj_w: int,
+    proj_h: int,
+    proj_valid_mask: np.ndarray | None,
+    coverage_pct: float,
+    streamer: FrameStreamer | None,
+) -> dict[str, bytes]:
+    """Generate calibration artifacts, push to streamer, and upload to Scope gallery.
+
+    Parameters
+    ----------
+    rgb_frame_np : np.ndarray
+        uint8 (H, W, 3) RGB camera image (ambient frame).
+    proj_valid_mask : np.ndarray | None
+        Boolean mask of valid projector pixels (before inpainting).
+    streamer : FrameStreamer | None
+        Shared MJPEG streamer to push results to.
+
+    Returns
+    -------
+    dict[str, bytes]
+        Mapping of filename → file bytes for all generated artifacts.
+    """
+    logger.info("Publishing calibration results (coverage=%.1f%%) ...", coverage_pct)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    files: dict[str, bytes] = {}
+
+    # 1. Calibration JSON
+    try:
+        files["calibration.json"] = _DEFAULT_CALIBRATION_PATH.read_bytes()
+    except Exception:
+        logger.warning("Could not read calibration JSON for download")
+
+    # 2. Coverage map — green where valid, black where inpainted
+    if proj_valid_mask is not None:
+        coverage = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
+        coverage[proj_valid_mask] = [0, 200, 100]
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(coverage, cv2.COLOR_RGB2BGR))
+        if ok:
+            files["coverage_map.png"] = buf.tobytes()
+
+    # 3. Warped camera image + grayscale depth-like images.
+    try:
+        warped = cv2.remap(
+            rgb_frame_np, map_x, map_y,
+            cv2.INTER_LINEAR, borderValue=0,
+        )
+        ok, buf = cv2.imencode(
+            ".png", cv2.cvtColor(warped, cv2.COLOR_RGB2BGR)
+        )
+        if ok:
+            files["warped_camera.png"] = buf.tobytes()
+
+        # Grayscale luminance as depth-like conditioning signal
+        gray = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        ok, buf = cv2.imencode(".png", gray_bgr)
+        if ok:
+            files["depth_then_warp.png"] = buf.tobytes()
+            files["warp_then_depth.png"] = buf.tobytes()
+            logger.info("Generated grayscale depth images from warped camera")
+    except Exception:
+        logger.warning("Could not generate warped/depth images", exc_info=True)
+
+    # Save result images to disk for static_calibration mode
+    _RESULTS_DIR.mkdir(exist_ok=True)
+    for name, data in files.items():
+        if name.endswith(".png"):
+            (_RESULTS_DIR / name).write_bytes(data)
+            logger.info("Saved %s to %s", name, _RESULTS_DIR / name)
+
+    # Push to streamer for dashboard
+    if files and streamer is not None:
+        streamer.set_calibration_results(files, timestamp)
+        if coverage_pct > 0:
+            streamer._calibration_coverage_pct = coverage_pct
+        logger.info(
+            "Calibration results published for download: %s",
+            list(files.keys()),
+        )
+
+    # Upload warped image + coverage to Scope's asset gallery for VACE
+    _upload_to_scope_gallery(files)
+
+    return files
+
+
+def _upload_to_scope_gallery(files: dict[str, bytes]) -> None:
+    """Upload calibration images to Scope's asset gallery for VACE use."""
+    scope_url = "http://localhost:8000"
+    upload_url = f"{scope_url}/api/v1/assets"
+
+    for name, data in files.items():
+        if not name.endswith(".png"):
+            continue
+        try:
+            # Build multipart form data
+            boundary = b"----PMABoundary"
+            body = b"--" + boundary + b"\r\n"
+            body += (
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{name}"\r\n'
+            ).encode()
+            body += b"Content-Type: image/png\r\n\r\n"
+            body += data + b"\r\n"
+            body += b"--" + boundary + b"--\r\n"
+
+            req = urllib.request.Request(
+                upload_url,
+                data=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary.decode()}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.info(
+                    "Uploaded %s to Scope gallery (status %d)",
+                    name, resp.status,
+                )
+        except Exception:
+            logger.debug(
+                "Could not upload %s to Scope gallery (API may not be available)",
+                name,
+                exc_info=True,
+            )
 
 
 # =============================================================================
@@ -61,7 +195,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
     Select as the main pipeline, hit play. The Scope viewer shows the
     camera feed — position it on the projector. Then toggle
     **Start Calibration** to begin projecting patterns. When done, the
-    calibration saves to ``~/.promapanything_calibration.json``.
+    calibration saves to ``~/.projectionmapanything_calibration.json``.
     """
 
     @classmethod
@@ -90,8 +224,13 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self._done = False
         self._reset_armed = False
 
+        # Calibration brightness (controls test card + WHITE pattern)
+        self._cal_brightness: int = 128
+        # Last camera frame captured while showing test card (used for warped RGB)
+        self._ambient_frame: torch.Tensor | None = None
+
         # Build the grey test card (shown on projector before calibration)
-        self._test_card = self._build_test_card()
+        self._test_card = self._build_test_card(self._cal_brightness)
 
         # Compute the projector URL (RunPod auto-detect)
         pod_id = os.environ.get("RUNPOD_POD_ID", "")
@@ -115,13 +254,13 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         # Track whether we already opened the browser via the toggle
         self._browser_opened = not pod_id
 
-    def _build_test_card(self) -> torch.Tensor:
+    def _build_test_card(self, brightness: int = 128) -> torch.Tensor:
         """Build a grey test card image at projector resolution.
 
         Shown on the projector before calibration starts to avoid
         camera-projector feedback loops.  Returns (H, W, 3) float32 [0,1].
         """
-        card = np.full((self.proj_h, self.proj_w, 3), 128, dtype=np.uint8)
+        card = np.full((self.proj_h, self.proj_w, 3), brightness, dtype=np.uint8)
 
         # Thin white border
         cv2.rectangle(card, (2, 2), (self.proj_w - 3, self.proj_h - 3),
@@ -177,11 +316,19 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         # Update projector resolution from input-side fields
         new_pw = kwargs.get("projector_width", self.proj_w)
         new_ph = kwargs.get("projector_height", self.proj_h)
+        new_brightness = int(kwargs.get("calibration_brightness", self._cal_brightness))
+        rebuild_card = False
         if new_pw != self.proj_w or new_ph != self.proj_h:
             self.proj_w = new_pw
             self.proj_h = new_ph
-            self._test_card = self._build_test_card()
+            rebuild_card = True
             logger.info("Projector resolution updated to %dx%d", self.proj_w, self.proj_h)
+        if new_brightness != self._cal_brightness:
+            self._cal_brightness = new_brightness
+            rebuild_card = True
+            logger.info("Calibration brightness updated to %d", self._cal_brightness)
+        if rebuild_card:
+            self._test_card = self._build_test_card(self._cal_brightness)
 
         # Reset calibration on rising edge (toggled ON)
         if reset and not self._reset_armed:
@@ -189,6 +336,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._calib = None
             self._calibrating = False
             self._done = False
+            self._ambient_frame = None
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
                 self._streamer.calibration_active = False
@@ -213,6 +361,11 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             if self._streamer is not None:
                 self._streamer.calibration_active = False
 
+            # Store the camera frame while showing test card — this is what the
+            # room looks like under the test card brightness. Used later for the
+            # warped camera RGB image (instead of the white reference).
+            self._ambient_frame = frame.clone()
+
             # Send test card to streamer (projector shows neutral grey)
             self._submit_to_streamer(self._test_card)
             return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
@@ -223,6 +376,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                 self.proj_w, self.proj_h,
                 settle_frames=self._settle_frames,
                 capture_frames=self._capture_frames,
+                max_brightness=self._cal_brightness,
             )
             self._calib.start()
             self._calibrating = True
@@ -265,8 +419,25 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                             coverage_pct=coverage_pct,
                         )
 
+                    # Use the stored ambient frame (captured while the test
+                    # card was displayed) for the warped camera RGB image.
+                    # This shows the room at the user's chosen brightness —
+                    # much more natural than the white reference.  Fall back
+                    # to the WHITE reference capture if no ambient was stored.
+                    if self._ambient_frame is not None:
+                        rgb_tensor = self._ambient_frame.clone()
+                    else:
+                        white_np = self._calib._get_averaged(0)  # float32 grayscale
+                        white_rgb = np.stack([white_np] * 3, axis=-1)
+                        white_rgb = (
+                            white_rgb / max(white_rgb.max(), 1.0) * 255.0
+                        ).clip(0, 255)
+                        rgb_tensor = torch.from_numpy(
+                            white_rgb.astype(np.float32) / 255.0
+                        ).unsqueeze(0).to(self.device)
+
                     self._publish_calibration_results(
-                        map_x, map_y, frame, coverage_pct,
+                        map_x, map_y, rgb_tensor, coverage_pct,
                     )
 
                     # Final progress update
@@ -361,118 +532,27 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         coverage_pct: float = 0.0,
     ) -> None:
         """Generate calibration artifacts, push to streamer, and upload to Scope gallery."""
-        logger.info("Publishing calibration results (coverage=%.1f%%) ...", coverage_pct)
-        timestamp = datetime.now(timezone.utc).isoformat()
-        files: dict[str, bytes] = {}
+        # Convert tensor to uint8 numpy
+        cam_np = last_frame.squeeze(0).cpu().numpy()
+        if cam_np.max() > 1.5:
+            cam_np = cam_np.astype(np.uint8)
+        else:
+            cam_np = (cam_np * 255).clip(0, 255).astype(np.uint8)
 
-        # 1. Calibration JSON
-        try:
-            files["calibration.json"] = _DEFAULT_CALIBRATION_PATH.read_bytes()
-        except Exception:
-            logger.warning("Could not read calibration JSON for download")
+        proj_valid_mask = (
+            self._calib.proj_valid_mask if self._calib is not None else None
+        )
 
-        # 2. Coverage map — green where valid, black where inpainted
-        if self._calib is not None and self._calib.proj_valid_mask is not None:
-            coverage = np.zeros(
-                (self.proj_h, self.proj_w, 3), dtype=np.uint8
-            )
-            coverage[self._calib.proj_valid_mask] = [0, 200, 100]
-            ok, buf = cv2.imencode(".png", cv2.cvtColor(coverage, cv2.COLOR_RGB2BGR))
-            if ok:
-                files["coverage_map.png"] = buf.tobytes()
-
-        # 3. Warped camera image + grayscale depth-like images.
-        # Neural depth is NOT loaded here — it would block calibration for
-        # 30+ seconds downloading/loading the model.  Use a live depth mode
-        # in the preprocessor if you need true neural depth.
-        try:
-            cam_np = last_frame.squeeze(0).cpu().numpy()
-            if cam_np.max() > 1.5:
-                cam_np = cam_np.astype(np.uint8)
-            else:
-                cam_np = (cam_np * 255).clip(0, 255).astype(np.uint8)
-            warped = cv2.remap(
-                cam_np, map_x, map_y,
-                cv2.INTER_LINEAR, borderValue=0,
-            )
-            ok, buf = cv2.imencode(
-                ".png", cv2.cvtColor(warped, cv2.COLOR_RGB2BGR)
-            )
-            if ok:
-                files["warped_camera.png"] = buf.tobytes()
-
-            # Grayscale luminance as depth-like conditioning signal
-            gray = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-            gray = cv2.bilateralFilter(gray, 9, 75, 75)
-            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            ok, buf = cv2.imencode(".png", gray_bgr)
-            if ok:
-                files["depth_then_warp.png"] = buf.tobytes()
-                files["warp_then_depth.png"] = buf.tobytes()
-                logger.info("Generated grayscale depth images from warped camera")
-        except Exception:
-            logger.warning("Could not generate warped/depth images", exc_info=True)
-
-        # Save result images to disk for static_calibration mode
-        results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
-        results_dir.mkdir(exist_ok=True)
-        for name, data in files.items():
-            if name.endswith(".png"):
-                (results_dir / name).write_bytes(data)
-                logger.info("Saved %s to %s", name, results_dir / name)
-
-        # Push to streamer for dashboard
-        if files and self._streamer is not None:
-            self._streamer.set_calibration_results(files, timestamp)
-            if coverage_pct > 0:
-                self._streamer._calibration_coverage_pct = coverage_pct
-            logger.info(
-                "Calibration results published for download: %s",
-                list(files.keys()),
-            )
-
-        # Upload warped image + coverage to Scope's asset gallery for VACE
-        self._upload_to_scope_gallery(files)
-
-    def _upload_to_scope_gallery(self, files: dict[str, bytes]) -> None:
-        """Upload calibration images to Scope's asset gallery for VACE use."""
-        scope_url = "http://localhost:8000"
-        upload_url = f"{scope_url}/api/v1/assets"
-
-        for name, data in files.items():
-            if not name.endswith(".png"):
-                continue
-            try:
-                # Build multipart form data
-                boundary = b"----ProMapBoundary"
-                body = b"--" + boundary + b"\r\n"
-                body += (
-                    f'Content-Disposition: form-data; name="file"; '
-                    f'filename="{name}"\r\n'
-                ).encode()
-                body += b"Content-Type: image/png\r\n\r\n"
-                body += data + b"\r\n"
-                body += b"--" + boundary + b"--\r\n"
-
-                req = urllib.request.Request(
-                    upload_url,
-                    data=body,
-                    headers={
-                        "Content-Type": f"multipart/form-data; boundary={boundary.decode()}",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    logger.info(
-                        "Uploaded %s to Scope gallery (status %d)",
-                        name, resp.status,
-                    )
-            except Exception:
-                logger.debug(
-                    "Could not upload %s to Scope gallery (API may not be available)",
-                    name,
-                    exc_info=True,
-                )
+        publish_calibration_results(
+            map_x=map_x,
+            map_y=map_y,
+            rgb_frame_np=cam_np,
+            proj_w=self.proj_w,
+            proj_h=self.proj_h,
+            proj_valid_mask=proj_valid_mask,
+            coverage_pct=coverage_pct,
+            streamer=self._streamer,
+        )
 
 
 # =============================================================================
@@ -503,6 +583,7 @@ class ProMapAnythingPipeline(Pipeline):
 
         self._gen_res: str = kwargs.get("generation_resolution", "half")
         self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
+        self._isolation_mode: str = kwargs.get("subject_isolation", "none")
 
         # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
         self._depth = None
@@ -520,6 +601,12 @@ class ProMapAnythingPipeline(Pipeline):
 
         # Temporal smoothing buffer
         self._prev_depth: torch.Tensor | None = None
+
+        # Effect animation timer
+        self._effect_start_time: float = _time.time()
+
+        # Last warped camera frame (for edge blend)
+        self._last_warped_camera: np.ndarray | None = None
 
         # Log init kwargs for debugging
         logger.info(
@@ -588,6 +675,14 @@ class ProMapAnythingPipeline(Pipeline):
         depth_contrast = float(kwargs.get("depth_contrast", 1.0))
         near_clip = float(kwargs.get("depth_near_clip", 0.0))
         far_clip = float(kwargs.get("depth_far_clip", 1.0))
+        edge_blend = float(kwargs.get("edge_blend", 0.0))
+        edge_method = kwargs.get("edge_method", "sobel")
+        active_effect = kwargs.get("active_effect", "none")
+        effect_intensity = float(kwargs.get("effect_intensity", 0.5))
+        effect_speed = float(kwargs.get("effect_speed", 1.0))
+        isolation_mode = kwargs.get("subject_isolation", self._isolation_mode)
+        subject_depth_range = float(kwargs.get("subject_depth_range", 0.3))
+        subject_feather = float(kwargs.get("subject_feather", 5.0))
 
         # Normalise input to [0, 1]
         frame_f = frame.squeeze(0).to(device=self.device, dtype=torch.float32)
@@ -595,30 +690,53 @@ class ProMapAnythingPipeline(Pipeline):
             frame_f = frame_f / 255.0
 
         has_calib = self._map_x is not None and self._map_y is not None
+        is_static = depth_mode.startswith("static_") or depth_mode == "custom"
 
-        if depth_mode.startswith("static_"):
-            # Use saved image from calibration (no live depth model)
+        # -- Depth / source selection -----------------------------------------
+        if depth_mode == "custom":
+            rgb = self._get_custom_depth(frame_f)
+        elif depth_mode.startswith("static_"):
             rgb = self._get_static_frame(depth_mode)
         elif depth_mode == "warped_rgb" and has_calib:
-            # Warp camera RGB to projector perspective (no depth estimation)
             rgb = self._warped_rgb(frame_f)
         elif depth_mode == "warp_then_depth" and has_calib:
-            # Warp camera RGB to projector perspective, then estimate depth
             rgb = self._warp_then_depth(frame_f, depth_blur, temporal_smoothing)
         else:
-            # Estimate depth from raw camera, then warp to projector
             rgb = self._depth_then_warp(frame_f, depth_blur, temporal_smoothing)
 
-        # Apply edge processing (erosion, contrast, clipping)
+        # For static/custom modes, use the static warped camera image (from
+        # calibration results) for edge blend and isolation instead of the
+        # live camera feed. The live camera sees the projector output,
+        # creating a feedback loop.
+        if is_static:
+            reference_frame = self._get_static_warped_camera()
+        else:
+            reference_frame = frame_f
+
+        # -- Edge processing (erosion, contrast, clipping) --------------------
         rgb = self._apply_edge_processing(
             rgb, edge_erosion, depth_contrast, near_clip, far_clip,
         )
 
-        # Submit full-resolution preview to dashboard before resizing
-        self._submit_input_preview(rgb)
+        # -- Edge blend (overlay surface edges from warped camera) ------------
+        if edge_blend > 0 and has_calib:
+            rgb = self._apply_edge_blend(
+                rgb, reference_frame, edge_blend, edge_method, is_static=is_static,
+            )
 
-        # Resize to match what Scope / the main pipeline expects.
-        # Scope passes target width/height in kwargs; fall back to our own calc.
+        # -- Depth effects (surface-masked) -----------------------------------
+        if active_effect != "none" and effect_intensity > 0:
+            rgb = self._apply_effect(
+                rgb, active_effect, effect_intensity, effect_speed,
+            )
+
+        # -- Subject isolation ------------------------------------------------
+        if isolation_mode != "none":
+            rgb = self._apply_isolation(
+                rgb, reference_frame, isolation_mode, subject_depth_range, subject_feather,
+            )
+
+        # -- Resize to match what Scope / the main pipeline expects -----------
         out_w = kwargs.get("width", None)
         out_h = kwargs.get("height", None)
         if out_w is None or out_h is None:
@@ -627,8 +745,6 @@ class ProMapAnythingPipeline(Pipeline):
             out_w, out_h = int(out_w), int(out_h)
         h, w = rgb.shape[:2]
         if (w, h) != (out_w, out_h):
-            # GPU resize via torch interpolate
-            # (H, W, 3) -> (1, 3, H, W) -> interpolate -> (H, W, 3)
             rgb_nchw = rgb.permute(2, 0, 1).unsqueeze(0)
             rgb_nchw = torch.nn.functional.interpolate(
                 rgb_nchw, size=(out_h, out_w), mode="area",
@@ -636,6 +752,8 @@ class ProMapAnythingPipeline(Pipeline):
             rgb = rgb_nchw.squeeze(0).permute(1, 2, 0)
 
         return {"video": rgb.unsqueeze(0).clamp(0, 1)}
+
+    # -- Edge processing ------------------------------------------------------
 
     def _apply_edge_processing(
         self,
@@ -645,49 +763,277 @@ class ProMapAnythingPipeline(Pipeline):
         near_clip: float,
         far_clip: float,
     ) -> torch.Tensor:
-        """Apply edge erosion, contrast, and depth clipping.
-
-        Operates on the grayscale depth RGB (H, W, 3) float [0, 1].
-        """
+        """Apply edge erosion, contrast, and depth clipping."""
         if erosion <= 0 and abs(contrast - 1.0) < 0.01 and near_clip <= 0.0 and far_clip >= 1.0:
-            return rgb  # Nothing to do
+            return rgb
 
-        img = rgb.cpu().numpy()  # (H, W, 3) float [0, 1]
-        gray = img.mean(axis=-1)  # (H, W) for processing
+        img = rgb.cpu().numpy()
+        gray = img.mean(axis=-1)
 
-        # 1. Near/far clipping — black out pixels outside the range
         if near_clip > 0.0 or far_clip < 1.0:
             mask = (gray >= near_clip) & (gray <= far_clip)
-            # Re-normalise the remaining range to [0, 1]
             if far_clip > near_clip:
                 gray = np.where(mask, (gray - near_clip) / (far_clip - near_clip), 0.0)
             else:
                 gray = np.zeros_like(gray)
             gray = gray.clip(0, 1)
 
-        # 2. Contrast enhancement — power curve centred at 0.5
         if abs(contrast - 1.0) >= 0.01:
-            # Sigmoid-like contrast: push values away from 0.5
             gray = np.where(
                 gray > 0,
                 np.power(gray.clip(1e-6, 1.0), 1.0 / contrast),
                 0.0,
             )
 
-        # 3. Edge erosion — shrink the non-black region inward
         if erosion > 0:
-            # Build a mask of "valid" (non-black) pixels
             valid = (gray > 0.02).astype(np.uint8)
             kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (erosion * 2 + 1, erosion * 2 + 1),
             )
             eroded = cv2.erode(valid, kernel, iterations=1)
-            # Zero out pixels that were removed by erosion
             gray = gray * eroded.astype(np.float32)
 
-        # Convert back to RGB
         out = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
         return torch.from_numpy(out).to(rgb.device)
+
+    # -- Edge blend -----------------------------------------------------------
+
+    def _apply_edge_blend(
+        self,
+        depth_rgb: torch.Tensor,
+        reference_frame: torch.Tensor,
+        blend: float,
+        method: str,
+        is_static: bool = False,
+    ) -> torch.Tensor:
+        """Blend surface edges from the warped camera into the depth map."""
+        # For static modes the reference IS already the warped camera image.
+        # For live modes we need to warp the raw camera through the calibration.
+        if is_static:
+            ref_np = reference_frame.cpu().numpy()
+        else:
+            ref_np = self._get_warped_camera_np(reference_frame)
+            if ref_np is None:
+                return depth_rgb
+
+        # Convert to grayscale for edge detection
+        if ref_np.ndim == 3 and ref_np.shape[2] == 3:
+            gray = cv2.cvtColor(
+                (ref_np * 255).clip(0, 255).astype(np.uint8),
+                cv2.COLOR_RGB2GRAY,
+            )
+        else:
+            gray = (ref_np * 255).clip(0, 255).astype(np.uint8)
+
+        # Edge detection
+        if method == "canny":
+            edges = cv2.Canny(gray, 50, 150).astype(np.float32) / 255.0
+        else:
+            # Sobel
+            sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            edges = np.sqrt(sx * sx + sy * sy)
+            e_max = edges.max()
+            if e_max > 1e-6:
+                edges = edges / e_max
+
+        # Resize edges to match depth_rgb if needed
+        dh, dw = depth_rgb.shape[:2]
+        if edges.shape[:2] != (dh, dw):
+            edges = cv2.resize(edges, (dw, dh), interpolation=cv2.INTER_LINEAR)
+
+        # Blend: depth + edges * blend
+        edges_t = torch.from_numpy(edges).to(depth_rgb.device)
+        edges_rgb = edges_t.unsqueeze(-1).expand(-1, -1, 3)
+        return (depth_rgb + edges_rgb * blend).clamp(0, 1)
+
+    def _get_warped_camera_np(self, frame_f: torch.Tensor) -> np.ndarray | None:
+        """Get warped camera image for edge detection, with caching."""
+        if self._map_x is None or self._map_y is None:
+            return None
+        warped = cv2.remap(
+            frame_f.cpu().numpy(), self._map_x, self._map_y,
+            cv2.INTER_LINEAR, borderValue=0,
+        )
+        self._last_warped_camera = warped
+        return warped
+
+    # -- Depth effects --------------------------------------------------------
+
+    def _apply_effect(
+        self,
+        rgb: torch.Tensor,
+        effect_name: str,
+        intensity: float,
+        speed: float,
+    ) -> torch.Tensor:
+        """Apply an animated effect to the depth map with surface masking.
+
+        Effects only apply to non-black regions of the depth map (the actual
+        projection surfaces). Black void regions stay black.
+        """
+        from . import effects
+
+        # Extract grayscale depth for effect processing
+        gray = rgb.mean(dim=-1)  # (H, W)
+        t = _time.time() - self._effect_start_time
+
+        # Build surface mask: non-black regions
+        surface_mask = (gray > 0.02).float()
+
+        # Apply effect to the grayscale depth
+        effected = gray.clone()
+
+        if effect_name == "noise_blend":
+            effected = effects.apply_noise_blend(
+                gray, intensity=intensity, scale=4.0, octaves=4,
+                speed=speed, time=t,
+            )
+        elif effect_name == "flow_warp":
+            effected = effects.apply_flow_warp(
+                gray, intensity=intensity * 0.3, scale=4.0,
+                speed=speed, time=t,
+            )
+        elif effect_name == "pulse":
+            effected = effects.apply_pulse(
+                gray, speed=speed, amount=intensity, time=t,
+            )
+        elif effect_name == "wave_warp":
+            effected = effects.apply_wave_warp(
+                gray, frequency=3.0, amplitude=intensity * 0.1,
+                speed=speed, direction=0.0, time=t,
+            )
+        elif effect_name == "kaleido":
+            effected = effects.apply_kaleido(
+                gray, segments=max(2, int(intensity * 4 + 2)),
+                rotation=0.0, time=t * speed,
+            )
+        elif effect_name == "shockwave":
+            effected = effects.apply_shockwave(
+                gray, origin_x=0.5, origin_y=0.5, speed=speed,
+                thickness=0.15, strength=intensity, decay=1.5,
+                time=t, auto_trigger_interval=max(2.0, 5.0 / max(speed, 0.1)),
+            )
+        elif effect_name == "wobble":
+            effected = effects.apply_wobble(
+                gray, intensity=intensity * 0.15, speed=speed, time=t,
+            )
+        elif effect_name == "geometry_edges":
+            effected = effects.apply_geometry_edges(
+                gray, edge_strength=intensity, glow_width=3.0,
+                pulse_speed=speed, time=t,
+            )
+        elif effect_name == "depth_fog":
+            effected = effects.apply_depth_fog(
+                gray, density=intensity, near=0.0, far=0.7,
+                animated=True, speed=speed, time=t,
+            )
+        elif effect_name == "radial_zoom":
+            effected = effects.apply_radial_zoom(
+                gray, origin_x=0.5, origin_y=0.5, strength=intensity * 0.2,
+                speed=speed, time=t,
+            )
+
+        # Surface masking: effect only on surfaces, void stays black
+        result = effected * surface_mask + gray * (1.0 - surface_mask)
+        return result.clamp(0, 1).unsqueeze(-1).expand(-1, -1, 3)
+
+    # -- Subject isolation ----------------------------------------------------
+
+    def _apply_isolation(
+        self,
+        rgb: torch.Tensor,
+        frame_f: torch.Tensor,
+        mode: str,
+        depth_range: float,
+        feather: float,
+    ) -> torch.Tensor:
+        """Apply subject isolation to the depth RGB."""
+        from .isolation import isolate_by_depth_band, isolate_by_mask, isolate_by_rembg
+
+        h, w = rgb.shape[:2]
+        gray_np = rgb.mean(dim=-1).cpu().numpy()
+        mask_np: np.ndarray | None = None
+
+        if mode == "depth_band":
+            mask_np = isolate_by_depth_band(gray_np, band_width=depth_range, feather=feather)
+        elif mode == "mask":
+            mask_path = _RESULTS_DIR / "custom_mask.png"
+            mask_np = isolate_by_mask(mask_path, h, w, feather=feather)
+        elif mode == "rembg":
+            # rembg needs the camera frame as uint8 RGB
+            cam_np = (frame_f.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            mask_np = isolate_by_rembg(cam_np, feather=feather)
+            # Resize mask to match depth if needed
+            if mask_np is not None and mask_np.shape[:2] != (h, w):
+                mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        if mask_np is None:
+            return rgb
+
+        mask_t = torch.from_numpy(mask_np).to(rgb.device).unsqueeze(-1)
+        result = rgb * mask_t
+
+        # Store mask on streamer for postprocessor subject mask
+        if self._streamer is not None:
+            self._streamer.set_isolation_mask(mask_np)
+
+        return result
+
+    # -- Static warped camera -------------------------------------------------
+
+    def _get_static_warped_camera(self) -> torch.Tensor:
+        """Load the static warped camera from calibration results (cached).
+
+        Used instead of the live camera feed for edge blend / isolation
+        in static and custom depth modes to avoid feedback loops.
+        """
+        cached = getattr(self, "_static_warped_camera", None)
+        if cached is not None:
+            return cached
+
+        path = _RESULTS_DIR / "warped_camera.png"
+        if path.is_file():
+            img = cv2.imread(str(path))
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                frame = torch.from_numpy(
+                    img.astype(np.float32) / 255.0
+                ).to(self.device)
+                self._static_warped_camera = frame
+                logger.info("Loaded static warped camera for edge blend / isolation")
+                return frame
+
+        logger.warning("No warped_camera.png found — edge blend will use live camera")
+        # Return a grey placeholder so we don't crash
+        frame = torch.full(
+            (self.proj_h, self.proj_w, 3), 0.5,
+            dtype=torch.float32, device=self.device,
+        )
+        self._static_warped_camera = frame
+        return frame
+
+    # -- Custom depth ---------------------------------------------------------
+
+    def _get_custom_depth(self, frame_f: torch.Tensor) -> torch.Tensor:
+        """Load custom depth map from disk (uploaded via dashboard)."""
+        custom_path = _RESULTS_DIR / "custom_depth.png"
+        if custom_path.is_file():
+            img = cv2.imread(str(custom_path))
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                return torch.from_numpy(
+                    img.astype(np.float32) / 255.0
+                ).to(self.device)
+
+        # Fallback: grey frame
+        logger.warning("No custom depth map found at %s", custom_path)
+        return torch.full(
+            (self.proj_h, self.proj_w, 3), 0.5,
+            dtype=torch.float32, device=self.device,
+        )
+
+    # -- Depth source methods -------------------------------------------------
 
     def _ensure_depth_model(self) -> None:
         """Lazy-load the depth model on first use."""
@@ -695,7 +1041,6 @@ class ProMapAnythingPipeline(Pipeline):
             from .depth_provider import create_depth_provider
             self._depth = create_depth_provider("auto", self.device, model_size="small")
 
-    # Map depth_mode values to calibration result filenames
     _STATIC_FILE_MAP = {
         "static_depth_warped": "depth_then_warp.png",
         "static_depth_from_warped": "warp_then_depth.png",
@@ -704,24 +1049,19 @@ class ProMapAnythingPipeline(Pipeline):
 
     def _get_static_frame(self, mode: str) -> torch.Tensor:
         """Load and cache a static image from calibration results."""
-        # Cache per mode so switching modes loads the right image
         cache_key = f"_static_{mode}"
         cached = getattr(self, cache_key, None)
         if cached is not None:
             return cached
 
-        results_dir = _DEFAULT_CALIBRATION_PATH.parent / ".promapanything_results"
-
-        # Try the specific file for this mode first
         primary = self._STATIC_FILE_MAP.get(mode)
         candidates = [primary] if primary else []
-        # Fallback order if the specific file doesn't exist
         for name in ("depth_then_warp.png", "warp_then_depth.png", "warped_camera.png"):
             if name not in candidates:
                 candidates.append(name)
 
         for name in candidates:
-            path = results_dir / name
+            path = _RESULTS_DIR / name
             if path.is_file():
                 img = cv2.imread(str(path))
                 if img is not None:
@@ -740,7 +1080,6 @@ class ProMapAnythingPipeline(Pipeline):
                     setattr(self, cache_key, frame)
                     return frame
 
-        # Fallback: grey frame at projector resolution
         logger.warning("No calibration result images found — using grey fallback")
         frame = torch.full(
             (self.proj_h, self.proj_w, 3), 0.5, dtype=torch.float32, device=self.device,
@@ -755,7 +1094,6 @@ class ProMapAnythingPipeline(Pipeline):
         self._ensure_depth_model()
         depth = self._depth.estimate(frame_f)
 
-        # Temporal smoothing
         if temporal_smoothing > 0 and self._prev_depth is not None:
             if self._prev_depth.shape == depth.shape:
                 depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
@@ -774,7 +1112,6 @@ class ProMapAnythingPipeline(Pipeline):
                 device=self.device,
             )
 
-        # No calibration — output camera-space depth as grayscale
         return self._depth_to_grayscale(depth, depth_blur)
 
     def _warp_then_depth(
@@ -782,23 +1119,19 @@ class ProMapAnythingPipeline(Pipeline):
     ) -> torch.Tensor:
         """Warp camera RGB to projector perspective, then estimate depth."""
         self._ensure_depth_model()
-        # Warp camera to projector view
         warped_np = cv2.remap(
             frame_f.cpu().numpy(), self._map_x, self._map_y,
             cv2.INTER_LINEAR, borderValue=0,
         )
         warped_t = torch.from_numpy(warped_np).to(self.device)
 
-        # Estimate depth from the warped (projector-perspective) image
         depth = self._depth.estimate(warped_t)
 
-        # Temporal smoothing
         if temporal_smoothing > 0 and self._prev_depth is not None:
             if self._prev_depth.shape == depth.shape:
                 depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
         self._prev_depth = depth.clone()
 
-        # Already in projector space — just convert to grayscale RGB
         return self._depth_to_grayscale(depth, depth_blur)
 
     def _warped_rgb(self, frame_f: torch.Tensor) -> torch.Tensor:
@@ -810,10 +1143,7 @@ class ProMapAnythingPipeline(Pipeline):
         return torch.from_numpy(warped_np).to(self.device)
 
     def _depth_to_grayscale(self, depth: torch.Tensor, blur: float) -> torch.Tensor:
-        """Convert depth tensor to grayscale RGB (near=dark, far=bright).
-
-        Normalises on GPU, applies optional blur on CPU.
-        """
+        """Convert depth tensor to grayscale RGB (near=dark, far=bright)."""
         d_min = depth.min()
         d_max = depth.max()
         if d_max - d_min > 1e-6:
@@ -822,7 +1152,6 @@ class ProMapAnythingPipeline(Pipeline):
             depth_norm = torch.zeros_like(depth)
 
         if blur > 0.5:
-            # Gaussian blur requires CPU/numpy
             depth_np = depth_norm.cpu().numpy()
             ksize = int(blur) * 2 + 1
             depth_np = cv2.GaussianBlur(depth_np, (ksize, ksize), 0)
@@ -830,14 +1159,10 @@ class ProMapAnythingPipeline(Pipeline):
                 np.stack([depth_np, depth_np, depth_np], axis=-1).astype(np.float32)
             ).to(self.device)
 
-        # No blur — stay on GPU
         return depth_norm.unsqueeze(-1).expand(-1, -1, 3).to(self.device)
 
-    def _submit_input_preview(self, rgb: torch.Tensor) -> None:
-        """Send the preprocessor output to the streamer for dashboard preview."""
-        if self._streamer is not None and self._streamer.is_running:
-            rgb_np = (rgb.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
-            self._streamer.submit_input_preview(rgb_np)
+    # _submit_input_preview removed — dashboard overhead reduction.
+    # Only the postprocessor streams to the projector now.
 
 
 # =============================================================================
@@ -878,12 +1203,34 @@ class ProMapAnythingProjectorPipeline(Pipeline):
         if frame.max() > 1.5:
             frame = frame / 255.0
 
+        # -- Edge feather -----------------------------------------------------
+        edge_feather = float(kwargs.get("edge_feather", 0.0))
+        if edge_feather > 0:
+            frame = self._apply_edge_feather(frame, edge_feather)
+
+        # -- Subject mask -----------------------------------------------------
+        apply_mask = kwargs.get("apply_subject_mask", False)
+        if apply_mask and self._streamer is not None:
+            mask_np = self._streamer.get_isolation_mask()
+            if mask_np is not None:
+                h, w = frame.shape[:2]
+                if mask_np.shape[:2] != (h, w):
+                    mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
+                mask_t = torch.from_numpy(mask_np).to(frame.device).unsqueeze(-1)
+                frame = frame * mask_t
+
+        # -- Color correction -------------------------------------------------
+        brightness = float(kwargs.get("brightness", 0.0))
+        gamma = float(kwargs.get("gamma", 1.0))
+        contrast = float(kwargs.get("contrast", 1.0))
+        if abs(gamma - 1.0) > 0.01 or abs(brightness) > 0.001 or abs(contrast - 1.0) > 0.01:
+            frame = self._apply_color_correction(frame, brightness, gamma, contrast)
+
         output = frame.unsqueeze(0).clamp(0, 1)
 
         if self._streamer is not None and self._streamer.is_running:
             rgb_np = (frame.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
 
-            # Determine target size for the encoder thread (resize off pipeline thread)
             target_size = None
             upscale = kwargs.get("upscale_to_projector", True)
             if upscale:
@@ -897,3 +1244,41 @@ class ProMapAnythingProjectorPipeline(Pipeline):
             self._streamer.submit_frame(rgb_np, target_size=target_size)
 
         return {"video": output}
+
+    @staticmethod
+    def _apply_edge_feather(frame: torch.Tensor, radius: float) -> torch.Tensor:
+        """Fade to black at projection edges. Pure torch, vectorized."""
+        h, w = frame.shape[:2]
+        r = radius
+
+        # Distance from each edge → ramp [0, 1] over radius pixels
+        rows = torch.arange(h, device=frame.device, dtype=torch.float32)
+        cols = torch.arange(w, device=frame.device, dtype=torch.float32)
+
+        top = (rows / r).clamp(0, 1)
+        bottom = ((h - 1 - rows) / r).clamp(0, 1)
+        left = (cols / r).clamp(0, 1)
+        right = ((w - 1 - cols) / r).clamp(0, 1)
+
+        # Combine: minimum distance to any edge
+        vert = torch.min(top, bottom).unsqueeze(1)  # (H, 1)
+        horiz = torch.min(left, right).unsqueeze(0)  # (1, W)
+        mask = (vert * horiz).unsqueeze(-1)  # (H, W, 1)
+
+        return frame * mask
+
+    @staticmethod
+    def _apply_color_correction(
+        frame: torch.Tensor,
+        brightness: float,
+        gamma: float,
+        contrast: float,
+    ) -> torch.Tensor:
+        """Apply brightness, gamma, and contrast correction."""
+        if abs(gamma - 1.0) > 0.01:
+            frame = frame.clamp(1e-6, 1.0).pow(gamma)
+        if abs(contrast - 1.0) > 0.01:
+            frame = (frame - 0.5) * contrast + 0.5
+        if abs(brightness) > 0.001:
+            frame = frame + brightness
+        return frame.clamp(0, 1)

@@ -8,3 +8,19 @@ build/
 imgui.ini
 nul
 .claude/settings.local.json
+
+# Standalone app (not published)
+promapanything-app/
+
+# Reference code (not published)
+ProCamCalibration/
+
+# Companion projector client (not published)
+projector-client/
+
+# Model weights
+*.pth
+
+# Development
+.venv/
+*.egg

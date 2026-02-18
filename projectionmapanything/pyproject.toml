@@ -1,0 +1,19 @@
+[project]
+name = "projectionmapanything"
+version = "0.5.5"
+description = "ProjectionMapAnything (VJ.Tools) Scope Plugin — AI-powered projection mapping with structured light calibration, depth estimation, and real-time VJ effects"
+requires-python = ">=3.12"
+dependencies = ["opencv-python-headless", "transformers"]
+
+[project.optional-dependencies]
+rembg = ["rembg"]
+
+[project.entry-points."scope"]
+projectionmapanything = "projectionmapanything"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/projectionmapanything"]

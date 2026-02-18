@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Ensure our logger output reaches stdout (Scope doesn't forward plugin loggers)
 if not logger.handlers:
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("[ProMap Cal] %(message)s"))
+    _handler.setFormatter(logging.Formatter("[PMA Cal] %(message)s"))
     logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
 
@@ -120,11 +120,13 @@ class CalibrationState:
         spatial_consistency: bool = True,
         consistency_max_diff: float = 3.0,
         fill_kernel_size: int = 11,
+        max_brightness: int = 255,
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
         self.settle_frames = settle_frames
         self.capture_frames = max(1, capture_frames)
+        self.max_brightness = max(10, min(255, max_brightness))
         self.decode_threshold = decode_threshold
         self.bit_threshold = bit_threshold
         self.morph_cleanup = morph_cleanup
@@ -354,7 +356,9 @@ class CalibrationState:
 
     def _current_pattern(self, device: torch.device) -> torch.Tensor:
         if self.phase == CalibrationPhase.WHITE:
-            pattern = np.full((self.proj_h, self.proj_w), 255, dtype=np.uint8)
+            pattern = np.full(
+                (self.proj_h, self.proj_w), self.max_brightness, dtype=np.uint8,
+            )
         elif self.phase == CalibrationPhase.BLACK:
             pattern = np.zeros((self.proj_h, self.proj_w), dtype=np.uint8)
         elif self.phase == CalibrationPhase.PATTERNS:
@@ -376,11 +380,27 @@ class CalibrationState:
 
         return self._pattern_to_tensor(pattern, device)
 
-    def _get_averaged(self, index: int) -> np.ndarray:
-        """Return the mean of accumulated frames for a capture index (float32)."""
+    def _get_averaged(
+        self, index: int, target_shape: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        """Return the mean of accumulated frames for a capture index (float32).
+
+        If *target_shape* ``(h, w)`` is given, any frames that don't match
+        are resized first.  This guards against Scope changing the camera
+        resolution mid-calibration.
+        """
         frames = self._captures[index]
         if not frames:
             raise ValueError(f"No captures for index {index}")
+
+        if target_shape is not None:
+            th, tw = target_shape
+            frames = [
+                cv2.resize(f, (tw, th), interpolation=cv2.INTER_LINEAR)
+                if f.shape[:2] != (th, tw) else f
+                for f in frames
+            ]
+
         if len(frames) == 1:
             return frames[0]
         return np.mean(frames, axis=0).astype(np.float32)
@@ -397,9 +417,10 @@ class CalibrationState:
         6. Inpainting remaining holes
         """
         white_f = self._get_averaged(0)
-        black_f = self._get_averaged(1)
+        ref_shape = white_f.shape[:2]  # canonical resolution
+        black_f = self._get_averaged(1, target_shape=ref_shape)
 
-        h, w = white_f.shape[:2]
+        h, w = ref_shape
         diff = white_f - black_f
 
         logger.info(
@@ -434,8 +455,8 @@ class CalibrationState:
             pos_idx = base + bit_idx * 2
             neg_idx = base + bit_idx * 2 + 1
             if self._captures[pos_idx] and self._captures[neg_idx]:
-                pos_f = self._get_averaged(pos_idx)
-                neg_f = self._get_averaged(neg_idx)
+                pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
+                neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
                 decoded_x |= bit_val << bit_idx
                 if self.bit_threshold > 0:
@@ -461,8 +482,8 @@ class CalibrationState:
             pos_idx = base_y + bit_idx * 2
             neg_idx = base_y + bit_idx * 2 + 1
             if self._captures[pos_idx] and self._captures[neg_idx]:
-                pos_f = self._get_averaged(pos_idx)
-                neg_f = self._get_averaged(neg_idx)
+                pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
+                neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
                 decoded_y |= bit_val << bit_idx
                 if self.bit_threshold > 0:
@@ -564,44 +585,128 @@ class CalibrationState:
         np.add.at(sum_cy, (proj_ys, proj_xs), cam_ys.astype(np.float32))
         np.add.at(count, (proj_ys, proj_xs), 1.0)
 
-        # Gaussian splat: spread correspondences to fill gaps
-        fk = self.fill_kernel_size
-        if fk > 1:
-            fk = fk if fk % 2 == 1 else fk + 1
-            sum_cx = cv2.GaussianBlur(sum_cx, (fk, fk), 0)
-            sum_cy = cv2.GaussianBlur(sum_cy, (fk, fk), 0)
-            count = cv2.GaussianBlur(count, (fk, fk), 0)
+        # Gaussian splat: spread correspondences to fill gaps.
+        # Use a large kernel — coverage can be sparse (15-40%) and we need
+        # to bridge gaps between valid regions.
+        fk = max(self.fill_kernel_size, 31)
+        fk = fk if fk % 2 == 1 else fk + 1
+        sum_cx_s = cv2.GaussianBlur(sum_cx, (fk, fk), 0)
+        sum_cy_s = cv2.GaussianBlur(sum_cy, (fk, fk), 0)
+        count_s = cv2.GaussianBlur(count, (fk, fk), 0)
 
-        valid_proj = count > 0.01
+        valid_proj = count_s > 0.01
         map_x = np.full((self.proj_h, self.proj_w), -1.0, dtype=np.float32)
         map_y = np.full((self.proj_h, self.proj_w), -1.0, dtype=np.float32)
-        map_x[valid_proj] = sum_cx[valid_proj] / count[valid_proj]
-        map_y[valid_proj] = sum_cy[valid_proj] / count[valid_proj]
+        map_x[valid_proj] = sum_cx_s[valid_proj] / count_s[valid_proj]
+        map_y[valid_proj] = sum_cy_s[valid_proj] / count_s[valid_proj]
+
+        n_raw = int(np.count_nonzero(valid_proj))
+        logger.info(
+            "  Raw projector pixels after splat fill: %d/%d (%.1f%%)",
+            n_raw, self.proj_h * self.proj_w,
+            100.0 * n_raw / max(self.proj_h * self.proj_w, 1),
+        )
+
+        # -- Outlier rejection: median-based smoothness filter --
+        # A valid mapping should be locally smooth (neighboring projector
+        # pixels map to nearby camera pixels).  Reject pixels where the
+        # map value deviates from the local median by more than a threshold.
+        # NOTE: cv2.medianBlur only supports float32 for ksize <= 5.
+        med_k = 5
+        for pass_i in range(2):
+            med_x = cv2.medianBlur(
+                np.where(valid_proj, map_x, 0).astype(np.float32), med_k,
+            )
+            med_y = cv2.medianBlur(
+                np.where(valid_proj, map_y, 0).astype(np.float32), med_k,
+            )
+            # Expected gradient: camera_res / projector_res ≈ pixels per step
+            expected_grad = max(w, h) / max(self.proj_w, self.proj_h)
+            outlier_thresh = max(expected_grad * med_k, 8.0)
+            diff_x = np.abs(map_x - med_x)
+            diff_y = np.abs(map_y - med_y)
+            outliers = valid_proj & (
+                (diff_x > outlier_thresh) | (diff_y > outlier_thresh)
+            )
+            n_outliers = int(outliers.sum())
+            if n_outliers > 0:
+                valid_proj[outliers] = False
+                map_x[outliers] = -1.0
+                map_y[outliers] = -1.0
+                logger.info(
+                    "  Outlier pass %d: removed %d pixels (thresh=%.1f)",
+                    pass_i + 1, n_outliers, outlier_thresh,
+                )
+            else:
+                break
+
+        # -- Re-fill after outlier removal with Gaussian splat --
+        # Rebuild from cleaned valid pixels only
+        clean_valid = valid_proj & (map_x >= 0) & (map_y >= 0)
+        sum_cx2 = np.zeros_like(sum_cx)
+        sum_cy2 = np.zeros_like(sum_cy)
+        count2 = np.zeros_like(count)
+        sum_cx2[clean_valid] = map_x[clean_valid]
+        sum_cy2[clean_valid] = map_y[clean_valid]
+        count2[clean_valid] = 1.0
+        sum_cx2 = cv2.GaussianBlur(sum_cx2, (fk, fk), 0)
+        sum_cy2 = cv2.GaussianBlur(sum_cy2, (fk, fk), 0)
+        count2 = cv2.GaussianBlur(count2, (fk, fk), 0)
+        valid_proj2 = count2 > 0.01
+        map_x = np.full_like(map_x, -1.0)
+        map_y = np.full_like(map_y, -1.0)
+        map_x[valid_proj2] = sum_cx2[valid_proj2] / count2[valid_proj2]
+        map_y[valid_proj2] = sum_cy2[valid_proj2] / count2[valid_proj2]
+        valid_proj = valid_proj2
+
+        # -- Final smoothing: median + bilateral filter --
+        # Median removes remaining salt-and-pepper noise
+        map_x_f = np.where(valid_proj, map_x, 0).astype(np.float32)
+        map_y_f = np.where(valid_proj, map_y, 0).astype(np.float32)
+        map_x_f = cv2.medianBlur(map_x_f, 5)
+        map_y_f = cv2.medianBlur(map_y_f, 5)
+        # Bilateral preserves edges while smoothing — sigma tuned for pixel coords
+        map_x_f = cv2.bilateralFilter(map_x_f, 9, 20.0, 20.0)
+        map_y_f = cv2.bilateralFilter(map_y_f, 9, 20.0, 20.0)
+        map_x[valid_proj] = map_x_f[valid_proj]
+        map_y[valid_proj] = map_y_f[valid_proj]
 
         # Store validity mask BEFORE inpainting
         self.proj_valid_mask = valid_proj.copy()
         n_valid_proj = int(np.count_nonzero(valid_proj))
         total_proj = self.proj_h * self.proj_w
         logger.info(
-            "  Projector pixels with correspondence: %d/%d (%.1f%%)",
+            "  Final projector pixels with correspondence: %d/%d (%.1f%%)",
             n_valid_proj, total_proj, 100.0 * n_valid_proj / max(total_proj, 1),
         )
 
-        # Inpaint only small internal holes — NOT large uncovered boundary regions
-        # (blanket inpainting of large regions causes fold-overs / distortion)
+        # -- Gradient quality check (diagnostic) --
+        gx = np.abs(np.diff(map_x, axis=1))
+        gy = np.abs(np.diff(map_y, axis=0))
+        gx_v = gx[valid_proj[:, :-1]]
+        gy_v = gy[valid_proj[:-1, :]]
+        if gx_v.size > 0:
+            logger.info(
+                "  Map smoothness: grad_x mean=%.2f std=%.2f p99=%.1f, "
+                "grad_y mean=%.2f std=%.2f p99=%.1f",
+                gx_v.mean(), gx_v.std(), np.percentile(gx_v, 99),
+                gy_v.mean(), gy_v.std(), np.percentile(gy_v, 99),
+            )
+
+        # Inpaint small internal holes (not large uncovered boundary regions)
         hole_mask = (~valid_proj).astype(np.uint8) * 255
         if np.any(~valid_proj):
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
                 hole_mask, connectivity=8,
             )
-            max_small_area = max(int(self.proj_w * self.proj_h * 0.005), 100)
+            max_small_area = max(int(self.proj_w * self.proj_h * 0.01), 200)
             small_hole_mask = np.zeros_like(hole_mask)
             for label_id in range(1, num_labels):
                 area = stats[label_id, cv2.CC_STAT_AREA]
                 if area < max_small_area:
                     small_hole_mask[labels == label_id] = 255
             if np.any(small_hole_mask):
-                inpaint_r = max(fk, 5)
+                inpaint_r = max(fk // 2, 7)
                 map_x = cv2.inpaint(map_x, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
                 map_y = cv2.inpaint(map_y, small_hole_mask, inpaint_r, cv2.INPAINT_NS)
 
