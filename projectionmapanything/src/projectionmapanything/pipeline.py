@@ -690,13 +690,15 @@ class ProMapAnythingPipeline(Pipeline):
             frame_f = frame_f / 255.0
 
         has_calib = self._map_x is not None and self._map_y is not None
-        is_static = depth_mode.startswith("static_") or depth_mode == "custom"
+        is_static = depth_mode.startswith("static_") or depth_mode in ("custom", "canny")
 
         # -- Depth / source selection -----------------------------------------
         if depth_mode == "custom":
             rgb = self._get_custom_depth(frame_f)
         elif depth_mode.startswith("static_"):
             rgb = self._get_static_frame(depth_mode)
+        elif depth_mode == "canny":
+            rgb = self._canny_edges(frame_f, is_static=not has_calib)
         elif depth_mode == "warped_rgb" and has_calib:
             rgb = self._warped_rgb(frame_f)
         elif depth_mode == "warp_then_depth" and has_calib:
@@ -1142,8 +1144,46 @@ class ProMapAnythingPipeline(Pipeline):
         )
         return torch.from_numpy(warped_np).to(self.device)
 
+    def _canny_edges(
+        self, frame_f: torch.Tensor, is_static: bool = False,
+    ) -> torch.Tensor:
+        """Canny edge detection on warped camera image for VACE conditioning.
+
+        Produces white edges on black background — excellent for VACE
+        structural guidance without depth information.
+        """
+        # Get the warped camera image (static or live)
+        if self._map_x is not None and self._map_y is not None:
+            # Use static warped camera to avoid feedback loops
+            ref = self._get_static_warped_camera()
+            ref_np = (ref.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        else:
+            # No calibration — use raw camera frame
+            ref_np = (frame_f.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+        # Convert to grayscale
+        if ref_np.ndim == 3 and ref_np.shape[2] == 3:
+            gray = cv2.cvtColor(ref_np, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = ref_np
+
+        # Apply bilateral filter to reduce noise while preserving edges
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+        # Canny edge detection
+        edges = cv2.Canny(gray, 50, 150)
+
+        # Dilate edges slightly for better visibility
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        edges = cv2.dilate(edges, kernel, iterations=1)
+
+        # Convert to float [0, 1] RGB
+        edges_f = edges.astype(np.float32) / 255.0
+        edges_rgb = np.stack([edges_f, edges_f, edges_f], axis=-1)
+        return torch.from_numpy(edges_rgb).to(self.device)
+
     def _depth_to_grayscale(self, depth: torch.Tensor, blur: float) -> torch.Tensor:
-        """Convert depth tensor to grayscale RGB (near=dark, far=bright)."""
+        """Convert depth tensor to grayscale RGB (near=bright, far=dark)."""
         d_min = depth.min()
         d_max = depth.max()
         if d_max - d_min > 1e-6:

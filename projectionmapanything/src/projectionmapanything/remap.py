@@ -3,8 +3,9 @@
 Uses the calibration mapping (map_x, map_y) produced by Gray code calibration
 to warp a camera-space depth map into projector-space coordinates.
 
-Output convention: near = dark (0), far = bright (1), grayscale (R=G=B).
-This matches VACE's training data from Depth Anything V2.
+Output convention: near = bright (1), far = dark (0), grayscale (R=G=B).
+This is inverse depth (disparity), matching VACE's expected input from
+Depth Anything V2 / MiDaS.
 """
 
 from __future__ import annotations

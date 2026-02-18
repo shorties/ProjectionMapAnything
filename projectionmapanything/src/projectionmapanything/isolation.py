@@ -26,13 +26,14 @@ def isolate_by_depth_band(
 ) -> np.ndarray:
     """Isolate the nearest surfaces using histogram peak detection.
 
-    Finds the dominant depth peak in the nearest 50% of depth values,
+    Finds the dominant depth peak in the brightest depth values
+    (near=bright convention from Depth Anything V2 / VACE),
     then builds a band mask around it.
 
     Parameters
     ----------
     depth : np.ndarray
-        (H, W) float32 depth in [0, 1]. 0 = near, 1 = far.
+        (H, W) float32 depth in [0, 1]. 1 = near (bright), 0 = far (dark).
     band_width : float
         Width of the depth band to keep, as a fraction of [0, 1].
     feather : float
@@ -50,8 +51,10 @@ def isolate_by_depth_band(
 
     valid_depths = depth[valid]
 
-    # Histogram of the nearest 50% of depth values
-    hist, bin_edges = np.histogram(valid_depths, bins=50, range=(0.0, 0.5))
+    # Histogram of the nearest (brightest) depth values.
+    # Convention: near=bright (1.0), far=dark (0.0).
+    # Search the upper half (0.5–1.0) for the nearest surfaces.
+    hist, bin_edges = np.histogram(valid_depths, bins=50, range=(0.5, 1.0))
 
     # Find the dominant peak
     peak_bin = int(np.argmax(hist))

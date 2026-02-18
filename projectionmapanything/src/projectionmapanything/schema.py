@@ -190,7 +190,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     Appears in the **Preprocessor** dropdown.  Estimates depth from the
     camera, warps it to the projector's perspective using saved calibration,
-    and outputs a VACE-optimized grayscale depth map (near=dark, far=bright).
+    and outputs a VACE-optimized grayscale depth map (near=bright, far=dark).
     """
 
     pipeline_id = "projectionmapanything-depth"
@@ -198,7 +198,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
     pipeline_description = (
         "Depth preprocessor — estimates depth and warps to projector "
         "perspective using saved calibration.  Outputs VACE-optimized "
-        "grayscale depth (near=dark, far=bright)."
+        "grayscale depth (near=bright, far=dark)."
     )
 
     supports_prompts = False
@@ -213,6 +213,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         "depth_then_warp",
         "warp_then_depth",
         "warped_rgb",
+        "canny",
         "static_depth_warped",
         "static_depth_from_warped",
         "static_warped_camera",
@@ -222,6 +223,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
         description=(
             "Conditioning input for the AI model. "
             "LIVE: depth_then_warp, warp_then_depth, warped_rgb (need GPU depth model). "
+            "CANNY: canny (edge detection on warped camera — great for VACE). "
             "STATIC: static_depth_warped, static_depth_from_warped, "
             "static_warped_camera (from calibration, no GPU needed). "
             "CUSTOM: custom (upload your own depth map via the dashboard)."
@@ -409,7 +411,6 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=12,
             label="Subject Isolation",
-            is_load_param=True,
             category="configuration",
         ),
     )
