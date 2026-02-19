@@ -1,7 +1,8 @@
-"""Depth map re-projection from camera perspective to projector perspective.
+"""Depth map derivation and re-projection for projection mapping.
 
-Uses the calibration mapping (map_x, map_y) produced by Gray code calibration
-to warp a camera-space depth map into projector-space coordinates.
+Derives real depth from structured light calibration correspondence maps
+(map_x, map_y) using the Jacobian of the projector→camera mapping.
+Also supports warping camera-space depth maps to projector-space.
 
 Output convention: near = bright (1), far = dark (0), grayscale (R=G=B).
 This is inverse depth (disparity), matching VACE's expected input from
@@ -10,9 +11,89 @@ Depth Anything V2 / MiDaS.
 
 from __future__ import annotations
 
+import logging
+
 import cv2
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def derive_depth_from_calibration(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    proj_valid_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Derive a relative depth map from structured light correspondence maps.
+
+    The projector→camera mapping encodes depth: the Jacobian determinant
+    measures the local area scaling of the mapping, which is proportional
+    to 1/Z² (closer surfaces stretch across more camera pixels).
+
+    Parameters
+    ----------
+    map_x, map_y : np.ndarray
+        (proj_h, proj_w) float32 — camera pixel coordinates for each
+        projector pixel, from Gray code calibration.
+    proj_valid_mask : np.ndarray | None
+        Boolean mask of valid (decoded) projector pixels.
+
+    Returns
+    -------
+    np.ndarray
+        (proj_h, proj_w) float32 in [0, 1].
+        Convention: near = bright (1), far = dark (0).
+    """
+    # Partial derivatives of the correspondence map
+    # d(cam_x)/d(proj_x), d(cam_x)/d(proj_y), etc.
+    dx_dpx = np.gradient(map_x, axis=1)
+    dx_dpy = np.gradient(map_x, axis=0)
+    dy_dpx = np.gradient(map_y, axis=1)
+    dy_dpy = np.gradient(map_y, axis=0)
+
+    # Jacobian determinant = local area scaling factor
+    # |det(J)| ∝ 1/Z² → sqrt(|det(J)|) ∝ 1/Z (disparity)
+    det_j = np.abs(dx_dpx * dy_dpy - dx_dpy * dy_dpx)
+    disparity = np.sqrt(np.clip(det_j, 0.0, None))
+
+    # Mask invalid regions
+    if proj_valid_mask is not None:
+        disparity[~proj_valid_mask] = 0.0
+
+    # Smooth to reduce gradient noise
+    disparity = cv2.GaussianBlur(disparity.astype(np.float32), (11, 11), 0)
+
+    # Percentile normalization to [0, 1]
+    valid = disparity > 1e-6
+    if not np.any(valid):
+        logger.warning("No valid depth data from calibration")
+        return np.full_like(map_x, 0.5, dtype=np.float32)
+
+    p2 = float(np.percentile(disparity[valid], 2))
+    p98 = float(np.percentile(disparity[valid], 98))
+    if p98 - p2 < 1e-6:
+        return np.full_like(map_x, 0.5, dtype=np.float32)
+
+    depth = (disparity - p2) / (p98 - p2)
+    depth = np.clip(depth, 0.0, 1.0).astype(np.float32)
+
+    # Inpaint holes for a clean result
+    holes = (depth < 0.01).astype(np.uint8) * 255
+    if proj_valid_mask is not None:
+        holes[proj_valid_mask & (depth >= 0.01)] = 0
+    depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
+    if np.any(holes):
+        depth_u8 = cv2.inpaint(depth_u8, holes, 15, cv2.INPAINT_NS)
+        depth = depth_u8.astype(np.float32) / 255.0
+
+    logger.info(
+        "Derived depth from structured light: range [%.3f, %.3f], "
+        "valid %.1f%%",
+        depth[valid].min(), depth[valid].max(),
+        100.0 * np.count_nonzero(valid) / valid.size,
+    )
+    return depth
 
 
 def apply_depth_output_settings(

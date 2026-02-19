@@ -30,7 +30,7 @@ from .calibration import (
     save_calibration,
 )
 from .frame_server import FrameStreamer, get_or_create_streamer
-from .remap import build_warped_depth_image
+from .remap import build_warped_depth_image, derive_depth_from_calibration
 from .schema import (
     ProMapAnythingCalibrateConfig,
     ProMapAnythingConfig,
@@ -96,7 +96,7 @@ def publish_calibration_results(
         if ok:
             files["coverage_map.png"] = buf.tobytes()
 
-    # 3. Warped camera image + grayscale depth-like images.
+    # 3. Warped camera image
     try:
         warped = cv2.remap(
             rgb_frame_np, map_x, map_y,
@@ -107,18 +107,21 @@ def publish_calibration_results(
         )
         if ok:
             files["warped_camera.png"] = buf.tobytes()
+    except Exception:
+        logger.warning("Could not generate warped camera image", exc_info=True)
 
-        # Grayscale luminance as depth-like conditioning signal
-        gray = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
-        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        ok, buf = cv2.imencode(".png", gray_bgr)
+    # 4. Real depth map derived from structured light correspondence
+    try:
+        depth = derive_depth_from_calibration(map_x, map_y, proj_valid_mask)
+        depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
+        depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
+        ok, buf = cv2.imencode(".png", depth_bgr)
         if ok:
             files["depth_then_warp.png"] = buf.tobytes()
             files["warp_then_depth.png"] = buf.tobytes()
-            logger.info("Generated grayscale depth images from warped camera")
+            logger.info("Generated real depth maps from structured light calibration")
     except Exception:
-        logger.warning("Could not generate warped/depth images", exc_info=True)
+        logger.warning("Could not generate depth images", exc_info=True)
 
     # Save result images to disk for static_calibration mode
     _RESULTS_DIR.mkdir(exist_ok=True)
@@ -691,10 +694,14 @@ class ProMapAnythingPipeline(Pipeline):
             frame_f = frame_f / 255.0
 
         has_calib = self._map_x is not None and self._map_y is not None
-        is_static = depth_mode.startswith("static_") or depth_mode in ("custom", "canny")
+        is_static = depth_mode.startswith("static_") or depth_mode in (
+            "custom", "canny", "structured_light",
+        )
 
         # -- Depth / source selection -----------------------------------------
-        if depth_mode == "custom":
+        if depth_mode == "structured_light" and has_calib:
+            rgb = self._structured_light_depth()
+        elif depth_mode == "custom":
             rgb = self._get_custom_depth(frame_f)
         elif depth_mode.startswith("static_"):
             rgb = self._get_static_frame(depth_mode)
@@ -1149,6 +1156,22 @@ class ProMapAnythingPipeline(Pipeline):
             cv2.INTER_LINEAR, borderValue=0,
         )
         return torch.from_numpy(warped_np).to(self.device)
+
+    def _structured_light_depth(self) -> torch.Tensor:
+        """Derive depth from structured light calibration (cached)."""
+        cached = getattr(self, "_sl_depth_cache", None)
+        if cached is not None:
+            return cached
+
+        depth = derive_depth_from_calibration(
+            self._map_x, self._map_y, self._proj_valid_mask,
+        )
+        # Convert to RGB tensor
+        depth_rgb = np.stack([depth, depth, depth], axis=-1)
+        result = torch.from_numpy(depth_rgb).to(self.device)
+        self._sl_depth_cache = result
+        logger.info("Structured light depth computed and cached")
+        return result
 
     def _canny_edges(
         self, frame_f: torch.Tensor, is_static: bool = False,

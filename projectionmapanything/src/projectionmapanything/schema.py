@@ -210,22 +210,25 @@ class ProMapAnythingConfig(BasePipelineConfig):
     # "input" category fields are invisible for preprocessor pipelines.
 
     depth_mode: Literal[
+        "structured_light",
+        "canny",
         "depth_then_warp",
         "warp_then_depth",
         "warped_rgb",
-        "canny",
         "static_depth_warped",
         "static_depth_from_warped",
         "static_warped_camera",
         "custom",
     ] = Field(
-        default="static_depth_warped",
+        default="structured_light",
         description=(
             "Conditioning input for the AI model. "
-            "LIVE: depth_then_warp, warp_then_depth, warped_rgb (need GPU depth model). "
+            "STRUCTURED LIGHT: structured_light (real depth derived from "
+            "calibration scan — no GPU depth model needed). "
             "CANNY: canny (edge detection on warped camera — great for VACE). "
+            "LIVE: depth_then_warp, warp_then_depth, warped_rgb (need GPU depth model). "
             "STATIC: static_depth_warped, static_depth_from_warped, "
-            "static_warped_camera (from calibration, no GPU needed). "
+            "static_warped_camera (from calibration images). "
             "CUSTOM: custom (upload your own depth map via the dashboard)."
         ),
         json_schema_extra=ui_field_config(
