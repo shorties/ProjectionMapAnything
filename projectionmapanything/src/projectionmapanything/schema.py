@@ -455,6 +455,58 @@ class ProMapAnythingConfig(BasePipelineConfig):
         ),
     )
 
+    # -- Inline calibration ---------------------------------------------------
+
+    start_calibration: bool = Field(
+        default=False,
+        description=(
+            "Run Gray code calibration while the AI model stays loaded. "
+            "Overrides projector output with calibration patterns. "
+            "Toggle OFF when done or to cancel."
+        ),
+        json_schema_extra=ui_field_config(
+            order=16,
+            label="Start Calibration",
+            category="configuration",
+        ),
+    )
+
+    calibration_brightness: int = Field(
+        default=128,
+        ge=10,
+        le=255,
+        description="Brightness for calibration patterns and test card.",
+        json_schema_extra=ui_field_config(
+            order=17,
+            label="Calibration Brightness",
+            category="configuration",
+        ),
+    )
+
+    projector_width: int = Field(
+        default=1920,
+        ge=1,
+        le=7680,
+        description="Projector resolution width (for calibration pattern generation).",
+        json_schema_extra=ui_field_config(
+            order=18,
+            label="Projector Width",
+            category="configuration",
+        ),
+    )
+
+    projector_height: int = Field(
+        default=1080,
+        ge=1,
+        le=4320,
+        description="Projector resolution height (for calibration pattern generation).",
+        json_schema_extra=ui_field_config(
+            order=19,
+            label="Projector Height",
+            category="configuration",
+        ),
+    )
+
     # -- Load-time config -----------------------------------------------------
 
     stream_port: int = Field(

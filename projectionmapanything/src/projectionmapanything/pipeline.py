@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time as _time
 import urllib.request
 import webbrowser
@@ -611,6 +612,12 @@ class ProMapAnythingPipeline(Pipeline):
         # Last warped camera frame (for edge blend)
         self._last_warped_camera: np.ndarray | None = None
 
+        # -- Inline calibration state --
+        self._calib: CalibrationState | None = None
+        self._calibrating = False
+        self._calib_done = False
+        self._ambient_frame: torch.Tensor | None = None
+
         # Log init kwargs for debugging
         logger.info(
             "Depth preprocessor __init__ kwargs: %s",
@@ -670,6 +677,12 @@ class ProMapAnythingPipeline(Pipeline):
             raise ValueError("Depth preprocessor requires video input")
 
         frame = video[0]  # (1, H, W, C) [0, 255]
+
+        # -- Inline calibration -----------------------------------------------
+        start_cal = kwargs.get("start_calibration", False)
+        result = self._handle_inline_calibration(frame, start_cal, kwargs)
+        if result is not None:
+            return result
 
         depth_mode = kwargs.get("depth_mode", self._depth_mode)
         temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
@@ -994,6 +1007,155 @@ class ProMapAnythingPipeline(Pipeline):
             self._streamer.set_isolation_mask(mask_np)
 
         return result
+
+    # -- Inline calibration ---------------------------------------------------
+
+    def _handle_inline_calibration(
+        self,
+        frame: torch.Tensor,
+        start: bool,
+        kwargs: dict,
+    ) -> dict | None:
+        """Run Gray code calibration inline, overriding projector output.
+
+        Returns a preprocessor output dict while calibrating, or None
+        to fall through to normal depth processing.
+        """
+        cal_brightness = int(kwargs.get("calibration_brightness", 128))
+        cal_proj_w = int(kwargs.get("projector_width", self.proj_w))
+        cal_proj_h = int(kwargs.get("projector_height", self.proj_h))
+
+        # -- Toggled OFF or never started: cleanup and fall through ----------
+        if not start:
+            if self._calibrating:
+                # User toggled off mid-calibration — cancel
+                self._calibrating = False
+                self._calib = None
+                self._ambient_frame = None
+                if self._streamer is not None:
+                    self._streamer.calibration_active = False
+                logger.info("Inline calibration cancelled")
+            # Reset done flag so re-toggling starts fresh
+            self._calib_done = False
+            return None
+
+        # -- First toggle ON: create CalibrationState -----------------------
+        if start and not self._calibrating and not self._calib_done:
+            self._calib = CalibrationState(
+                cal_proj_w, cal_proj_h,
+                settle_frames=15,
+                capture_frames=3,
+                max_brightness=cal_brightness,
+            )
+            self._calib.start()
+            self._calibrating = True
+            self._ambient_frame = frame.clone()
+            if self._streamer is not None:
+                self._streamer.clear_calibration_results()
+            logger.info(
+                "Inline calibration started (%d patterns, %dx%d)",
+                self._calib.total_patterns, cal_proj_w, cal_proj_h,
+            )
+
+        # -- Step calibration -----------------------------------------------
+        if self._calibrating and self._calib is not None:
+            pattern = self._calib.step(frame, self.device)
+
+            # Update progress on streamer
+            if self._streamer is not None:
+                phase = self._calib.phase.name
+                progress = self._calib.progress
+                self._streamer.update_calibration_progress(progress, phase)
+
+            if self._calib.phase == CalibrationPhase.DONE:
+                mapping = self._calib.get_mapping()
+                if mapping is not None:
+                    map_x, map_y = mapping
+                    save_calibration(
+                        map_x, map_y, _DEFAULT_CALIBRATION_PATH,
+                        cal_proj_w, cal_proj_h,
+                    )
+                    logger.info("Inline calibration saved to %s", _DEFAULT_CALIBRATION_PATH)
+
+                    # Update live state
+                    self._map_x = map_x
+                    self._map_y = map_y
+                    self.proj_w = cal_proj_w
+                    self.proj_h = cal_proj_h
+                    self._proj_valid_mask = self._calib.proj_valid_mask
+
+                    # Clear cached depth so structured_light recomputes
+                    self._sl_depth_cache = None
+                    self._static_warped_camera = None
+
+                    # Coverage
+                    coverage_pct = 0.0
+                    if self._calib.proj_valid_mask is not None:
+                        total = self._calib.proj_valid_mask.size
+                        valid = np.count_nonzero(self._calib.proj_valid_mask)
+                        coverage_pct = (valid / total) * 100.0 if total > 0 else 0.0
+
+                    # Publish results in background (heavy: depth derivation,
+                    # PNG encoding, disk I/O, gallery upload)
+                    ambient_np = self._ambient_frame.squeeze(0).cpu().numpy()
+                    if ambient_np.max() > 1.5:
+                        ambient_np = ambient_np.astype(np.uint8)
+                    else:
+                        ambient_np = (ambient_np * 255).clip(0, 255).astype(np.uint8)
+
+                    _pvm = self._calib.proj_valid_mask
+                    _str = self._streamer
+
+                    def _publish_bg():
+                        publish_calibration_results(
+                            map_x=map_x, map_y=map_y,
+                            rgb_frame_np=ambient_np,
+                            proj_w=cal_proj_w, proj_h=cal_proj_h,
+                            proj_valid_mask=_pvm,
+                            coverage_pct=coverage_pct,
+                            streamer=_str,
+                        )
+                        if _str is not None:
+                            _str.update_calibration_progress(
+                                1.0, "DONE", coverage_pct=coverage_pct,
+                            )
+
+                    threading.Thread(
+                        target=_publish_bg, daemon=True, name="calib-publish",
+                    ).start()
+
+                self._calibrating = False
+                self._calib_done = True
+                self._calib = None
+                if self._streamer is not None:
+                    self._streamer.calibration_active = False
+                logger.info("Inline calibration complete — resuming normal mode")
+                return None  # Fall through to normal depth processing
+
+            elif pattern is not None:
+                # Send pattern to projector via streamer
+                t = pattern.squeeze(0) if pattern.ndim == 4 else pattern
+                if t.max() > 1.5:
+                    t = t / 255.0
+                if self._streamer is not None:
+                    self._streamer.calibration_active = True
+                    rgb_np = (t.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+                    self._streamer.submit_calibration_frame(rgb_np)
+
+        # While calibrating, output current depth (or grey) to the AI model.
+        # The AI keeps generating — its output just won't reach the projector
+        # because calibration_active=True suppresses normal streamer frames.
+        out_w = kwargs.get("width", None)
+        out_h = kwargs.get("height", None)
+        if out_w is None or out_h is None:
+            out_w, out_h = self._get_generation_resolution()
+        else:
+            out_w, out_h = int(out_w), int(out_h)
+        grey = torch.full(
+            (int(out_h), int(out_w), 3), 0.5,
+            dtype=torch.float32, device=self.device,
+        )
+        return {"video": grey.unsqueeze(0)}
 
     # -- Static warped camera -------------------------------------------------
 
