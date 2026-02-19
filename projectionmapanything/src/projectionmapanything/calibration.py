@@ -12,6 +12,7 @@ Ported from the standalone app with improvements:
 - Vectorized Gray-to-binary decode
 - Gaussian splat fill (blur sum/count) for dense correspondence
 - Morphological cleanup + spatial consistency filtering
+- Change-detection settle (captures as soon as camera shows new pattern)
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time as _time
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
@@ -122,10 +124,13 @@ class CalibrationState:
         fill_kernel_size: int = 11,
         max_brightness: int = 255,
         min_settle: int = 8,
+        min_settle_time: float = 2.0,
+        change_threshold: float = 5.0,
+        stability_threshold: float = 3.0,
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
-        self.settle_frames = settle_frames
+        self.settle_frames = settle_frames  # timeout fallback only
         self.capture_frames = max(1, capture_frames)
         self.max_brightness = max(10, min(255, max_brightness))
         self.decode_threshold = decode_threshold
@@ -135,6 +140,13 @@ class CalibrationState:
         self.spatial_consistency = spatial_consistency
         self.consistency_max_diff = consistency_max_diff
         self.fill_kernel_size = fill_kernel_size | 1  # ensure odd
+        # Change-detection settle thresholds (mean abs pixel diff, uint8 scale)
+        # change_threshold: baseline→current diff to detect new pattern arrival
+        #   Gray codes cause 20-100+ diff, noise is typically < 3
+        self.change_threshold = change_threshold
+        # stability_threshold: frame-to-frame diff to confirm pattern is stable
+        #   Sensor noise is typically 0.5-2.0, so 3.0 is robust
+        self.stability_threshold = stability_threshold
 
         self.bits_x = _num_bits(proj_w)
         self.bits_y = _num_bits(proj_h)
@@ -148,14 +160,15 @@ class CalibrationState:
         self._waiting_for_settle = False
         self._frame_count = 0  # frames captured for current pattern
 
-        # Adaptive settle: structural baseline comparison for pattern arrival
-        # Compares full-frame pixel differences (not just mean brightness)
-        # so we detect spatial pattern changes even when overall brightness is similar
+        # Change-detection settle state
         self._settle_baseline: np.ndarray | None = None  # camera at settle start
         self._prev_settle_frame: np.ndarray | None = None  # for stability check
         self._stable_count: int = 0
-        self._brightness_changed: bool = False
-        self._min_settle: int = max(1, min_settle)
+        self._change_detected: bool = False
+
+        # Cached pattern tensor (avoids regenerating 1920x1080x3 every frame)
+        self._cached_pattern: torch.Tensor | None = None
+        self._cached_pattern_key: tuple | None = None  # (phase, pattern_index)
 
         # Each slot holds a list of float32 frames (for multi-frame averaging)
         self._captures: list[list[np.ndarray]] = [[] for _ in range(self.total_patterns)]
@@ -176,13 +189,20 @@ class CalibrationState:
         self._begin_settle()
 
     def _begin_settle(self) -> None:
-        """Reset adaptive settle state for the next pattern."""
+        """Reset change-detection settle state for the next pattern.
+
+        The settle mechanism watches for the camera to actually display the
+        new pattern (structural diff from baseline), then waits for 1 frame
+        of stability before capturing.  Stale repeated frames (pipeline
+        faster than camera) naturally have zero diff and are ignored.
+        """
         self._waiting_for_settle = True
         self._settle_counter = 0
         self._stable_count = 0
-        self._brightness_changed = False
+        self._change_detected = False
         self._settle_baseline = None
         self._prev_settle_frame = None
+        self._settle_start_time = _time.monotonic()
 
     def _camera_to_gray(self, frame_tensor: torch.Tensor) -> np.ndarray:
         """Convert a (1, H, W, C) tensor to a grayscale uint8 numpy array.
@@ -234,76 +254,86 @@ class CalibrationState:
         if self.phase in (CalibrationPhase.IDLE, CalibrationPhase.DONE):
             return None
 
-        # Handle settle: wait for the camera to actually see the new pattern.
-        # Uses STRUCTURAL baseline comparison: captures the camera frame at the
-        # start of settle (still showing old pattern), then watches for pixel-level
-        # changes across the whole image.  This detects spatial pattern changes
-        # even when overall mean brightness barely shifts.
+        # Change-detection settle: wait for the camera to actually show the
+        # new pattern, then capture as soon as it stabilises.
+        #
+        # Phase 1 — WAITING FOR CHANGE:
+        #   Compare each frame to baseline (captured at settle start, still
+        #   showing the old pattern).  Stale repeated frames have zero diff
+        #   and are naturally ignored, so this works regardless of how fast
+        #   the pipeline runs relative to the camera.
+        #
+        # Phase 2 — WAITING FOR STABILITY:
+        #   Once the structural diff exceeds the change threshold (pattern
+        #   arrived), wait for 1 frame where the frame-to-frame diff is low
+        #   (projector has fully displayed the new pattern).
+        #
+        # Timeout: if no change after settle_frames, capture anyway (safety).
         if self._waiting_for_settle:
             self._settle_counter += 1
             gray = self._camera_to_gray(camera_frame)
             gray_f = gray.astype(np.float32)
+            elapsed = _time.monotonic() - self._settle_start_time
 
             # Capture baseline on first frame (camera still shows old pattern)
             if self._settle_baseline is None:
                 self._settle_baseline = gray_f.copy()
-
-            # Minimum wait before checking for changes
-            if self._settle_counter <= self._min_settle:
                 self._prev_settle_frame = gray_f.copy()
                 return self._current_pattern(device)
 
-            # Structural change: mean absolute pixel diff from baseline
-            structural_diff = 0.0
-            if (self._settle_baseline is not None
-                    and gray_f.shape == self._settle_baseline.shape):
+            if not self._change_detected:
+                # Phase 1: watch for the new pattern to arrive
                 structural_diff = float(
                     np.mean(np.abs(gray_f - self._settle_baseline))
                 )
+                if structural_diff > self.change_threshold:
+                    # Pattern arrived — move to stability check
+                    self._change_detected = True
+                    self._prev_settle_frame = gray_f.copy()
+                    self._stable_count = 0
+                    logger.debug(
+                        "Pattern change detected: %d frames / %.2fs (diff=%.1f)",
+                        self._settle_counter, elapsed, structural_diff,
+                    )
+                    return self._current_pattern(device)
 
-            if structural_diff > 3.0:
-                self._brightness_changed = True
+                # Timeout: no change detected after max settle frames
+                if self._settle_counter >= self.settle_frames:
+                    bl_mean = float(self._settle_baseline.mean())
+                    logger.warning(
+                        "Settle timeout: %d frames / %.1fs — no change "
+                        "detected (diff=%.1f, baseline=%.1f, current=%.1f)",
+                        self._settle_counter, elapsed, structural_diff,
+                        bl_mean, float(gray_f.mean()),
+                    )
+                    self._waiting_for_settle = False
+                    self._frame_count = 0
+                else:
+                    self._prev_settle_frame = gray_f.copy()
+                    return self._current_pattern(device)
 
-            # Frame-to-frame stability (camera fully settled on new pattern)
-            if (self._prev_settle_frame is not None
-                    and gray_f.shape == self._prev_settle_frame.shape):
+            else:
+                # Phase 2: change detected, wait for stability
                 frame_diff = float(
                     np.mean(np.abs(gray_f - self._prev_settle_frame))
                 )
-                if frame_diff < 1.5:
+                self._prev_settle_frame = gray_f.copy()
+
+                if frame_diff < self.stability_threshold:
                     self._stable_count += 1
                 else:
                     self._stable_count = 0
 
-            self._prev_settle_frame = gray_f.copy()
-
-            settled = (
-                (self._brightness_changed and self._stable_count >= 3)
-                or self._settle_counter >= self.settle_frames
-            )
-
-            if not settled:
-                return self._current_pattern(device)
-
-            # Log settle result with diagnostics
-            bl_mean = float(self._settle_baseline.mean()) if self._settle_baseline is not None else 0
-            if self._brightness_changed:
-                logger.info(
-                    "Settle done: %d frames (structural diff=%.1f, "
-                    "baseline_mean=%.1f, current_mean=%.1f)",
-                    self._settle_counter, structural_diff,
-                    bl_mean, float(gray_f.mean()),
-                )
-            else:
-                logger.info(
-                    "Settle done: %d frames (MAX — diff=%.1f, "
-                    "baseline=%.1f, current=%.1f — pattern may not have arrived!)",
-                    self._settle_counter, structural_diff,
-                    bl_mean, float(gray_f.mean()),
-                )
-
-            self._waiting_for_settle = False
-            self._frame_count = 0
+                if self._stable_count >= 2:
+                    # 2 consecutive stable frames — pattern fully displayed
+                    logger.info(
+                        "Settle done: %d frames / %.2fs (change + %d stable)",
+                        self._settle_counter, elapsed, self._stable_count,
+                    )
+                    self._waiting_for_settle = False
+                    self._frame_count = 0
+                else:
+                    return self._current_pattern(device)
 
         # Capture frame (accumulate for multi-frame averaging)
         gray = self._camera_to_gray(camera_frame)
@@ -356,6 +386,10 @@ class CalibrationState:
         return None
 
     def _current_pattern(self, device: torch.device) -> torch.Tensor:
+        key = (self.phase, self._pattern_index)
+        if self._cached_pattern is not None and self._cached_pattern_key == key:
+            return self._cached_pattern
+
         if self.phase == CalibrationPhase.WHITE:
             pattern = np.full(
                 (self.proj_h, self.proj_w), self.max_brightness, dtype=np.uint8,
@@ -379,7 +413,10 @@ class CalibrationState:
         else:
             pattern = np.zeros((self.proj_h, self.proj_w), dtype=np.uint8)
 
-        return self._pattern_to_tensor(pattern, device)
+        tensor = self._pattern_to_tensor(pattern, device)
+        self._cached_pattern = tensor
+        self._cached_pattern_key = key
+        return tensor
 
     def _get_averaged(
         self, index: int, target_shape: tuple[int, int] | None = None,
@@ -448,6 +485,10 @@ class CalibrationState:
             n_valid_diff, h * w, 100.0 * n_valid_diff / max(h * w, 1),
         )
 
+        # Track per-bit contrast for fallback valid mask
+        # (handles case where WHITE/BLACK refs are bad but patterns are good)
+        any_bit_contrast = np.zeros((h, w), dtype=bool)
+
         # Decode X (column) Gray codes with per-bit reliability
         base = 2  # skip white + black
         decoded_x = np.zeros((h, w), dtype=np.int32)
@@ -460,17 +501,17 @@ class CalibrationState:
                 neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
                 decoded_x |= bit_val << bit_idx
+                bit_diff = np.abs(pos_f - neg_f)
+                any_bit_contrast |= (bit_diff >= self.decode_threshold)
                 if self.bit_threshold > 0:
-                    bit_diff = np.abs(pos_f - neg_f)
                     x_reliable &= (bit_diff >= self.bit_threshold)
                 # Log first 3 bits for debugging
                 if bit_idx < 3:
-                    bd = np.abs(pos_f - neg_f)
                     logger.info(
                         "  X bit %d: pos_mean=%.1f neg_mean=%.1f "
                         "abs_diff: min=%.1f max=%.1f mean=%.1f",
                         bit_idx, pos_f.mean(), neg_f.mean(),
-                        bd.min(), bd.max(), bd.mean(),
+                        bit_diff.min(), bit_diff.max(), bit_diff.mean(),
                     )
             else:
                 logger.warning("  X bit %d: missing captures!", bit_idx)
@@ -487,19 +528,32 @@ class CalibrationState:
                 neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
                 decoded_y |= bit_val << bit_idx
+                bit_diff = np.abs(pos_f - neg_f)
+                any_bit_contrast |= (bit_diff >= self.decode_threshold)
                 if self.bit_threshold > 0:
-                    bit_diff = np.abs(pos_f - neg_f)
                     y_reliable &= (bit_diff >= self.bit_threshold)
                 if bit_idx < 3:
-                    bd = np.abs(pos_f - neg_f)
                     logger.info(
                         "  Y bit %d: pos_mean=%.1f neg_mean=%.1f "
                         "abs_diff: min=%.1f max=%.1f mean=%.1f",
                         bit_idx, pos_f.mean(), neg_f.mean(),
-                        bd.min(), bd.max(), bd.mean(),
+                        bit_diff.min(), bit_diff.max(), bit_diff.mean(),
                     )
             else:
                 logger.warning("  Y bit %d: missing captures!", bit_idx)
+
+        # Fallback: if WHITE/BLACK refs failed but per-bit contrast is strong,
+        # use per-bit contrast as the valid mask.  This handles cases where
+        # WHITE and BLACK captured the same stale frame (e.g. pipeline ran
+        # faster than camera during reference captures).
+        if n_valid_diff == 0 and np.count_nonzero(any_bit_contrast) > 0:
+            n_bit_valid = int(np.count_nonzero(any_bit_contrast))
+            logger.warning(
+                "  WHITE/BLACK refs identical — using per-bit contrast "
+                "as fallback valid mask: %d pixels (%.1f%%)",
+                n_bit_valid, 100.0 * n_bit_valid / max(h * w, 1),
+            )
+            valid_mask = any_bit_contrast
 
         # Apply bit reliability mask
         if self.bit_threshold > 0:

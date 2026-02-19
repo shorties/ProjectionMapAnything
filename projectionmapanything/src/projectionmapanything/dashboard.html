@@ -323,7 +323,7 @@
     </div>
   </details>
 
-  <!-- Legacy Postprocessor Output -->
+  <!-- Postprocessor Output -->
   <details>
     <summary>Output (Postprocessor)</summary>
     <div class="sec">
@@ -482,10 +482,16 @@ function openScope() {
   const url = scopeInput.value.trim();
   if (url) { localStorage.setItem('pma_scope_url', url); window.open(url, '_blank'); }
 }
+let _projectorWin = null;
 function openProjector() {
-  const w = window.open('/projector', 'promap-projector',
+  // Reuse existing window if still open — avoids kicking fullscreen
+  if (_projectorWin && !_projectorWin.closed) {
+    _projectorWin.focus();
+    return;
+  }
+  _projectorWin = window.open('/projector', 'promap-projector',
     'width=960,height=540,menubar=no,toolbar=no,location=no,status=no');
-  if (w) w.focus();
+  if (_projectorWin) _projectorWin.focus();
 }
 
 // -- Preview --
@@ -684,7 +690,8 @@ async function scStartCalibration() {
     });
     const d = await r.json();
     if (!d.ok) { st.textContent = 'Failed: ' + (d.error || ''); return; }
-    openProjector();
+    // Only open projector if not already open — don't kick fullscreen
+    if (!_projectorWin || _projectorWin.closed) openProjector();
     scRunning = true;
     document.getElementById('sc-start-btn').disabled = true;
     document.getElementById('sc-stop-btn').classList.remove('hidden');
@@ -725,7 +732,7 @@ async function scCaptureLoop() {
         st.textContent = msg;
       }
     } catch (e) { st.textContent = 'Frame error: ' + e.message; }
-    await new Promise(r => setTimeout(r, 80));
+    await new Promise(r => setTimeout(r, 16));
   }
 }
 

@@ -237,7 +237,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
     )
 
     calibration_speed: float = Field(
-        default=0.5,
+        default=0.85,
         ge=0.0,
         le=1.0,
         description=(
@@ -248,6 +248,33 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=2,
             label="Calibration Speed",
+            category="configuration",
+        ),
+    )
+
+    # -- Depth mode selector ---------------------------------------------------
+
+    depth_mode: Literal[
+        "structured_light",
+        "structured_light_jacobian",
+        "canny",
+        "warped_rgb",
+        "custom",
+    ] = Field(
+        default="structured_light",
+        description=(
+            "Conditioning input for the AI model. All modes use static "
+            "calibration data — never live camera processing (avoids "
+            "camera-projector feedback loops). "
+            "structured_light: displacement-based depth from calibration. "
+            "structured_light_jacobian: Jacobian-based depth. "
+            "canny: edge detection on warped camera from calibration. "
+            "warped_rgb: warped camera image from calibration. "
+            "custom: upload your own via the dashboard."
+        ),
+        json_schema_extra=ui_field_config(
+            order=4,
+            label="Depth Mode",
             category="configuration",
         ),
     )
@@ -290,25 +317,20 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
 
 class ProMapAnythingProjectorConfig(BasePipelineConfig):
-    """Projector output postprocessor (DEPRECATED).
+    """Projector output postprocessor — MJPEG stream to projector.
 
-    .. deprecated::
-        Edge feathering and subject masking have moved to the preprocessor.
-        The preprocessor now handles calibration, depth conditioning, and
-        all spatial masking. This postprocessor is only needed if you want
-        MJPEG delivery of the AI output to the projector with color correction.
-        Consider using a WebRTC client instead.
-
-    Appears in the **Postprocessor** dropdown.  Streams the final output
-    to the companion app via MJPEG.  Auto-starts the stream when selected.
+    Appears in the **Postprocessor** dropdown.  Select this to stream the
+    AI-generated output to the projector page (dashboard port 8765 →
+    Projector button).  Includes optional edge feathering, subject masking,
+    and color correction before streaming.
     """
 
     pipeline_id = "projectionmapanything-projector"
-    pipeline_name = "ProjectionMapAnything Projector (Legacy)"
+    pipeline_name = "ProjectionMapAnything Projector"
     pipeline_description = (
-        "LEGACY: Streams AI output to projector via MJPEG with color correction. "
-        "Edge feathering has moved to the preprocessor — use this only if you "
-        "need MJPEG delivery of the final AI output."
+        "Streams AI output to the projector via MJPEG. Select this as the "
+        "postprocessor to see the AI canvas on the projector page. "
+        "Includes edge feathering, subject masking, and color correction."
     )
 
     supports_prompts = False

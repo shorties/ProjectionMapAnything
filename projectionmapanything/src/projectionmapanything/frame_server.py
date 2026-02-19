@@ -70,11 +70,8 @@ _PROJECTOR_HTML = """\
          display:flex; justify-content:center;
          align-items:center; }
   body.fs { cursor:none; }
-  video#rtc { width:100vw; height:100vh;
-              object-fit:contain; display:block; }
   img#mjpeg { width:100vw; height:100vh;
-              object-fit:contain; display:none;
-              position:absolute; top:0; left:0; }
+              object-fit:contain; display:block; }
   #hint { position:fixed; bottom:30px;
           left:50%%; transform:translateX(-50%%);
           color:#444; font:14px sans-serif;
@@ -87,154 +84,20 @@ _PROJECTOR_HTML = """\
   body.fs #status { opacity:0; }
 </style>
 </head><body>
-<video id="rtc" autoplay playsinline muted></video>
 <img id="mjpeg" />
 <div id="hint">Click to go fullscreen &mdash; drag this window to your projector first</div>
 <div id="status"></div>
 <script>
-const rtcVideo = document.getElementById('rtc');
 const mjpegImg = document.getElementById('mjpeg');
 const statusEl = document.getElementById('status');
-let pc = null;
-let sessionId = null;
-let calibrating = false;
-let rtcConnected = false;
 
-// ---- Mode switching: WebRTC (AI output) vs MJPEG (calibration) ----
-function showWebRTC() {
-  rtcVideo.style.display = 'block';
-  mjpegImg.style.display = 'none';
-  mjpegImg.src = '';
-}
-function showMJPEG() {
-  mjpegImg.style.display = 'block';
-  rtcVideo.style.display = 'none';
+// ---- MJPEG stream (handles both calibration patterns and AI output) ----
+function startStream() {
   mjpegImg.src = '/stream?t=' + Date.now();
+  statusEl.textContent = 'Streaming';
 }
-mjpegImg.onerror = () => { setTimeout(() => { if (calibrating) showMJPEG(); }, 1000); };
-
-// ---- Poll calibration status to switch modes ----
-async function pollCalibration() {
-  try {
-    const r = await fetch('/calibration/status');
-    const d = await r.json();
-    const wasCalibrating = calibrating;
-    calibrating = d.active;
-    if (calibrating && !wasCalibrating) {
-      statusEl.textContent = 'CALIBRATING';
-      showMJPEG();
-    } else if (!calibrating && wasCalibrating) {
-      statusEl.textContent = 'AI Output';
-      showWebRTC();
-    }
-  } catch(e) {}
-}
-setInterval(pollCalibration, 1000);
-
-// ---- WebRTC connection to Scope ----
-async function connectWebRTC() {
-  statusEl.textContent = 'Connecting WebRTC...';
-  try {
-    // 1. Get ICE servers via our proxy
-    const iceResp = await fetch('/scope/ice-servers');
-    if (!iceResp.ok) throw new Error('ICE servers: ' + iceResp.status);
-    const iceData = await iceResp.json();
-    const iceServers = iceData.iceServers || [{ urls: ['stun:stun.l.google.com:19302'] }];
-
-    // 2. Create peer connection
-    pc = new RTCPeerConnection({ iceServers });
-
-    // 3. Create data channel (Scope expects this)
-    const dc = pc.createDataChannel('parameters', { ordered: true });
-
-    // 4. Send a black video track (Scope expects sendrecv)
-    const canvas = document.createElement('canvas');
-    canvas.width = 512; canvas.height = 512;
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, 512, 512);
-    const blackStream = canvas.captureStream(1);
-    const blackTrack = blackStream.getVideoTracks()[0];
-    const sender = pc.addTrack(blackTrack, blackStream);
-
-    // 5. Force VP8 codec (Scope's aiortc requires VP8)
-    const transceiver = pc.getTransceivers().find(t => t.sender === sender);
-    if (transceiver) {
-      const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || [];
-      const vp8 = codecs.filter(c => c.mimeType.toLowerCase() === 'video/vp8');
-      if (vp8.length > 0) transceiver.setCodecPreferences(vp8);
-    }
-
-    // 6. Handle incoming AI output video
-    pc.ontrack = (e) => {
-      if (e.track.kind === 'video') {
-        rtcVideo.srcObject = e.streams[0] || new MediaStream([e.track]);
-        rtcVideo.play().catch(() => {});
-        rtcConnected = true;
-        if (!calibrating) {
-          statusEl.textContent = 'AI Output';
-          showWebRTC();
-        }
-      }
-    };
-
-    // 7. Trickle ICE
-    pc.onicecandidate = async (e) => {
-      if (e.candidate && sessionId) {
-        await fetch('/scope/ice/' + sessionId, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            candidates: [{
-              candidate: e.candidate.candidate,
-              sdpMid: e.candidate.sdpMid,
-              sdpMLineIndex: e.candidate.sdpMLineIndex
-            }]
-          })
-        }).catch(() => {});
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        statusEl.textContent = 'WebRTC lost, reconnecting...';
-        rtcConnected = false;
-        setTimeout(connectWebRTC, 3000);
-      }
-    };
-
-    // 8. Create offer
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // 9. Send offer via our proxy
-    const answerResp = await fetch('/scope/offer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sdp: pc.localDescription.sdp,
-        type: 'offer',
-        initialParameters: { input_mode: 'video' }
-      })
-    });
-    if (!answerResp.ok) throw new Error('Offer: ' + answerResp.status);
-    const answer = await answerResp.json();
-    sessionId = answer.sessionId;
-    await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
-
-    statusEl.textContent = 'WebRTC connected';
-  } catch(err) {
-    console.warn('WebRTC failed, falling back to MJPEG:', err);
-    statusEl.textContent = 'MJPEG mode (WebRTC unavailable)';
-    rtcConnected = false;
-    showMJPEG();
-    // Retry WebRTC after delay
-    setTimeout(connectWebRTC, 10000);
-  }
-}
-
-// ---- Start ----
-connectWebRTC();
+mjpegImg.onerror = () => { setTimeout(startStream, 1000); };
+startStream();
 
 // ---- Fullscreen ----
 document.body.addEventListener('click', () => {
@@ -481,14 +344,18 @@ class FrameStreamer:
         )
         self._standalone_ambient = None
 
-        # Lower settle for browser mode: each frame is a full HTTP round-trip
-        # (~160ms) so we don't need as many settle frames as the Scope pipeline.
+        # Browser mode: each frame is an HTTP round-trip (~150-500ms).
+        # Change-detection settle captures as soon as the camera shows the
+        # new pattern.  settle_frames is just a timeout safety net — set it
+        # high so we don't capture stale frames if the MJPEG round-trip
+        # through RunPod proxy is slow.
         self._standalone_calib = CalibrationState(
             proj_w, proj_h,
-            settle_frames=settle_frames,
-            capture_frames=capture_frames,
+            settle_frames=max(30, settle_frames),  # timeout only
+            capture_frames=max(2, capture_frames),  # at least 2 for averaging
             max_brightness=max_brightness,
-            min_settle=3,
+            change_threshold=5.0,
+            stability_threshold=3.0,
         )
         self._standalone_calib.start()
 
@@ -558,7 +425,9 @@ class FrameStreamer:
         tensor = torch.from_numpy(rgb.astype(np.float32)).unsqueeze(0)
         device = self._standalone_device or torch.device("cpu")
 
-        # Track settle state before stepping
+        # Track state before stepping to detect pattern changes
+        prev_idx = calib._pattern_index
+        prev_phase = calib.phase
         was_settling = calib._waiting_for_settle
 
         # Step the calibration state machine
@@ -599,8 +468,15 @@ class FrameStreamer:
         # Update dashboard progress
         self.update_calibration_progress(progress, phase, pattern_info)
 
-        # Send pattern to projector stream
-        if pattern is not None:
+        # Only submit pattern to projector when it actually changed
+        # (new phase or new pattern index).  During settling the projector
+        # is already showing the correct pattern — no need to regenerate
+        # and re-encode 1920x1080 JPEG every frame.
+        pattern_changed = (
+            calib.phase != prev_phase
+            or calib._pattern_index != prev_idx
+        )
+        if pattern is not None and pattern_changed:
             pat = pattern.squeeze(0) if pattern.ndim == 4 else pattern
             if pat.max() > 1.5:
                 pat = pat / 255.0
@@ -1290,8 +1166,8 @@ class FrameStreamer:
                     result = streamer.start_standalone_calibration(
                         proj_w=int(cfg.get("proj_w", 1920)),
                         proj_h=int(cfg.get("proj_h", 1080)),
-                        settle_frames=int(cfg.get("settle_frames", 15)),
-                        capture_frames=int(cfg.get("capture_frames", 3)),
+                        settle_frames=int(cfg.get("settle_frames", 30)),
+                        capture_frames=int(cfg.get("capture_frames", 2)),
                         max_brightness=int(cfg.get("max_brightness", 128)),
                     )
                     resp = json.dumps(result).encode()
@@ -1476,6 +1352,11 @@ class FrameStreamer:
 
 _shared_streamer: FrameStreamer | None = None
 _shared_lock = threading.Lock()
+
+
+def get_streamer() -> FrameStreamer | None:
+    """Return the existing shared FrameStreamer, or None if not yet created."""
+    return _shared_streamer
 
 
 def get_or_create_streamer(port: int = 8765) -> FrameStreamer:

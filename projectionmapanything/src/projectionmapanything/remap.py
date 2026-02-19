@@ -24,12 +24,9 @@ def derive_depth_from_calibration(
     map_x: np.ndarray,
     map_y: np.ndarray,
     proj_valid_mask: np.ndarray | None = None,
+    method: str = "displacement",
 ) -> np.ndarray:
     """Derive a relative depth map from structured light correspondence maps.
-
-    The projector→camera mapping encodes depth: the Jacobian determinant
-    measures the local area scaling of the mapping, which is proportional
-    to 1/Z² (closer surfaces stretch across more camera pixels).
 
     Parameters
     ----------
@@ -38,6 +35,11 @@ def derive_depth_from_calibration(
         projector pixel, from Gray code calibration.
     proj_valid_mask : np.ndarray | None
         Boolean mask of valid (decoded) projector pixels.
+    method : str
+        ``"displacement"`` — fits affine model to correspondence, uses
+        residual magnitude as disparity. Better dynamic range.
+        ``"jacobian"`` — uses Jacobian determinant of the mapping.
+        Smoother but lower contrast.
 
     Returns
     -------
@@ -45,55 +47,97 @@ def derive_depth_from_calibration(
         (proj_h, proj_w) float32 in [0, 1].
         Convention: near = bright (1), far = dark (0).
     """
-    # Partial derivatives of the correspondence map
-    # d(cam_x)/d(proj_x), d(cam_x)/d(proj_y), etc.
-    dx_dpx = np.gradient(map_x, axis=1)
-    dx_dpy = np.gradient(map_x, axis=0)
-    dy_dpx = np.gradient(map_y, axis=1)
-    dy_dpy = np.gradient(map_y, axis=0)
+    proj_h, proj_w = map_x.shape
 
-    # Jacobian determinant = local area scaling factor
-    # |det(J)| ∝ 1/Z² → sqrt(|det(J)|) ∝ 1/Z (disparity)
-    det_j = np.abs(dx_dpx * dy_dpy - dx_dpy * dy_dpx)
-    disparity = np.sqrt(np.clip(det_j, 0.0, None))
-
-    # Mask invalid regions
+    # Valid pixel mask
     if proj_valid_mask is not None:
-        disparity[~proj_valid_mask] = 0.0
+        valid = proj_valid_mask.copy()
+    else:
+        valid = (map_x >= 0) & (map_y >= 0)
 
-    # Smooth to reduce gradient noise
-    disparity = cv2.GaussianBlur(disparity.astype(np.float32), (11, 11), 0)
-
-    # Percentile normalization to [0, 1]
-    valid = disparity > 1e-6
     if not np.any(valid):
         logger.warning("No valid depth data from calibration")
         return np.full_like(map_x, 0.5, dtype=np.float32)
 
-    p2 = float(np.percentile(disparity[valid], 2))
-    p98 = float(np.percentile(disparity[valid], 98))
+    if method == "jacobian":
+        disparity = _disparity_jacobian(map_x, map_y, valid)
+        blur_k = 11
+        label = "jacobian"
+    else:
+        disparity = _disparity_displacement(map_x, map_y, valid, proj_h, proj_w)
+        blur_k = 7
+        label = "displacement"
+
+    # Smooth
+    disparity = cv2.GaussianBlur(disparity.astype(np.float32), (blur_k, blur_k), 0)
+
+    # Percentile normalization
+    valid_vals = disparity[valid]
+    p2 = float(np.percentile(valid_vals, 2))
+    p98 = float(np.percentile(valid_vals, 98))
     if p98 - p2 < 1e-6:
         return np.full_like(map_x, 0.5, dtype=np.float32)
 
     depth = (disparity - p2) / (p98 - p2)
     depth = np.clip(depth, 0.0, 1.0).astype(np.float32)
 
-    # Inpaint holes for a clean result
-    holes = (depth < 0.01).astype(np.uint8) * 255
-    if proj_valid_mask is not None:
-        holes[proj_valid_mask & (depth >= 0.01)] = 0
+    # CLAHE for local contrast enhancement
     depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    depth_u8 = clahe.apply(depth_u8)
+
+    # Inpaint holes
+    holes = np.zeros((proj_h, proj_w), dtype=np.uint8)
+    holes[~valid] = 255
     if np.any(holes):
         depth_u8 = cv2.inpaint(depth_u8, holes, 15, cv2.INPAINT_NS)
-        depth = depth_u8.astype(np.float32) / 255.0
+
+    depth = depth_u8.astype(np.float32) / 255.0
 
     logger.info(
-        "Derived depth from structured light: range [%.3f, %.3f], "
-        "valid %.1f%%",
-        depth[valid].min(), depth[valid].max(),
+        "Derived depth (%s): range [%.3f, %.3f], valid %.1f%%",
+        label, depth[valid].min(), depth[valid].max(),
         100.0 * np.count_nonzero(valid) / valid.size,
     )
     return depth
+
+
+def _disparity_jacobian(
+    map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarray,
+) -> np.ndarray:
+    """Jacobian determinant of the correspondence → sqrt(|det J|) ∝ 1/Z."""
+    dx_dpx = np.gradient(map_x, axis=1)
+    dx_dpy = np.gradient(map_x, axis=0)
+    dy_dpx = np.gradient(map_y, axis=1)
+    dy_dpy = np.gradient(map_y, axis=0)
+    det_j = np.abs(dx_dpx * dy_dpy - dx_dpy * dy_dpx)
+    disp = np.sqrt(np.clip(det_j, 0.0, None))
+    disp[~valid] = 0.0
+    return disp
+
+
+def _disparity_displacement(
+    map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarray,
+    proj_h: int, proj_w: int,
+) -> np.ndarray:
+    """Affine-residual displacement magnitude → depth-dependent parallax."""
+    px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
+    py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
+
+    # Fit affine model to remove bulk camera-projector geometry
+    vx, vy = px[valid], py[valid]
+    A_mat = np.column_stack([vx, vy, np.ones_like(vx)])
+    cx, _, _, _ = np.linalg.lstsq(A_mat, map_x[valid], rcond=None)
+    cy, _, _, _ = np.linalg.lstsq(A_mat, map_y[valid], rcond=None)
+
+    pred_x = cx[0] * px + cx[1] * py + cx[2]
+    pred_y = cy[0] * px + cy[1] * py + cy[2]
+
+    res_x = map_x - pred_x
+    res_y = map_y - pred_y
+    disp = np.sqrt(res_x ** 2 + res_y ** 2)
+    disp[~valid] = 0.0
+    return disp
 
 
 def apply_depth_output_settings(

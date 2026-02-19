@@ -3,7 +3,7 @@
 Registered pipelines:
 1. ProMapAnythingCalibratePipeline  — main pipeline (calibration visualization, future)
 2. ProMapAnythingPipeline           — preprocessor (calibration + depth conditioning)
-3. ProMapAnythingProjectorPipeline  — postprocessor (LEGACY: MJPEG delivery)
+3. ProMapAnythingProjectorPipeline  — postprocessor (MJPEG relay to projector)
 
 The preprocessor is the primary pipeline. It handles:
 - Gray code calibration (inline, via start_calibration toggle)
@@ -11,8 +11,8 @@ The preprocessor is the primary pipeline. It handles:
 - Edge processing, effects, subject isolation, edge feathering
 - All spatial masking is applied to the depth conditioning BEFORE the AI
 
-The postprocessor is deprecated — it only provides MJPEG delivery of AI output
-to the projector with optional color correction.
+The postprocessor relays AI output to the projector via MJPEG streaming.
+Select it as the Postprocessor in Scope to see AI output on the projector page.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from .calibration import (
     save_calibration,
 )
 from .frame_server import FrameStreamer, get_or_create_streamer
-from .remap import build_warped_depth_image, derive_depth_from_calibration
+from .remap import derive_depth_from_calibration
 from .schema import (
     ProMapAnythingCalibrateConfig,
     ProMapAnythingConfig,
@@ -120,18 +120,23 @@ def publish_calibration_results(
     except Exception:
         logger.warning("Could not generate warped camera image", exc_info=True)
 
-    # 4. Real depth map derived from structured light correspondence
-    try:
-        depth = derive_depth_from_calibration(map_x, map_y, proj_valid_mask)
-        depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
-        depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
-        ok, buf = cv2.imencode(".png", depth_bgr)
-        if ok:
-            files["depth_then_warp.png"] = buf.tobytes()
-            files["warp_then_depth.png"] = buf.tobytes()
-            logger.info("Generated real depth maps from structured light calibration")
-    except Exception:
-        logger.warning("Could not generate depth images", exc_info=True)
+    # 4. Structured light depth maps — both methods
+    for method, filename in [
+        ("displacement", "depth_displacement.png"),
+        ("jacobian", "depth_jacobian.png"),
+    ]:
+        try:
+            depth = derive_depth_from_calibration(
+                map_x, map_y, proj_valid_mask, method=method,
+            )
+            depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
+            depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
+            ok, buf = cv2.imencode(".png", depth_bgr)
+            if ok:
+                files[filename] = buf.tobytes()
+                logger.info("Generated %s depth map", method)
+        except Exception:
+            logger.warning("Could not generate %s depth image", method, exc_info=True)
 
     # Save result images to disk for static_calibration mode
     _RESULTS_DIR.mkdir(exist_ok=True)
@@ -704,7 +709,8 @@ class ProMapAnythingPipeline(Pipeline):
             self._map_y = None
             self._proj_valid_mask = None
             self._prev_depth = None
-            self._sl_depth_cache = None
+            self._sl_depth_cache_displacement = None
+            self._sl_depth_cache_jacobian = None
             self._static_warped_camera = None
             self._calib = None
             self._calibrating = False
@@ -730,7 +736,8 @@ class ProMapAnythingPipeline(Pipeline):
                     self.proj_w = new_pw
                     self.proj_h = new_ph
                     # Invalidate caches that depend on projector resolution
-                    self._sl_depth_cache = None
+                    self._sl_depth_cache_displacement = None
+                    self._sl_depth_cache_jacobian = None
                     self._static_warped_camera = None
                     logger.info("Projector resolution auto-detected: %dx%d", self.proj_w, self.proj_h)
 
@@ -766,25 +773,31 @@ class ProMapAnythingPipeline(Pipeline):
             frame_f = frame_f / 255.0
 
         has_calib = self._map_x is not None and self._map_y is not None
-        is_static = depth_mode.startswith("static_") or depth_mode in (
-            "custom", "canny", "structured_light",
-        )
+        # All modes are static to prevent camera-projector feedback loops.
+        is_static = True
 
         # -- Depth / source selection -----------------------------------------
+        # IMPORTANT: Never run live depth estimation on the camera feed in
+        # projection mapping — the camera sees the projector output, creating
+        # a visual feedback loop. Only use static/cached depth sources.
         if depth_mode == "structured_light" and has_calib:
-            rgb = self._structured_light_depth()
+            rgb = self._structured_light_depth(method="displacement")
+        elif depth_mode == "structured_light_jacobian" and has_calib:
+            rgb = self._structured_light_depth(method="jacobian")
         elif depth_mode == "custom":
             rgb = self._get_custom_depth(frame_f)
         elif depth_mode.startswith("static_"):
             rgb = self._get_static_frame(depth_mode)
-        elif depth_mode == "canny":
-            rgb = self._canny_edges(frame_f, is_static=not has_calib)
+        elif depth_mode == "canny" and has_calib:
+            rgb = self._canny_edges(frame_f, is_static=True)
         elif depth_mode == "warped_rgb" and has_calib:
-            rgb = self._warped_rgb(frame_f)
-        elif depth_mode == "warp_then_depth" and has_calib:
-            rgb = self._warp_then_depth(frame_f, depth_blur, temporal_smoothing)
+            rgb = self._warped_rgb_static()
+        elif has_calib:
+            # Any other mode with calibration: use displacement depth
+            rgb = self._structured_light_depth(method="displacement")
         else:
-            rgb = self._depth_then_warp(frame_f, depth_blur, temporal_smoothing)
+            # No calibration: neutral grey (no live depth — would cause feedback)
+            rgb = self._grey_fallback(frame_f)
 
         # For static/custom modes, use the static warped camera image (from
         # calibration results) for edge blend and isolation instead of the
@@ -822,6 +835,11 @@ class ProMapAnythingPipeline(Pipeline):
         # -- Edge feather (fade to black at projection boundaries) -----------
         if edge_feather > 0:
             rgb = self._apply_edge_feather(rgb, edge_feather)
+
+        # -- Submit VACE input preview to dashboard ----------------------------
+        if self._streamer is not None and self._streamer.is_running:
+            preview_np = (rgb.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            self._streamer.submit_input_preview(preview_np)
 
         # -- Resize to match what Scope / the main pipeline expects -----------
         out_w = kwargs.get("width", None)
@@ -1109,12 +1127,17 @@ class ProMapAnythingPipeline(Pipeline):
         # Read calibration params via _p() (dashboard override > kwargs > default)
         cal_brightness = int(self._p("calibration_brightness", kwargs, 128))
 
-        # Map calibration_speed (0=careful, 1=fast) to settle/capture frames
-        cal_speed = float(self._p("calibration_speed", kwargs, 0.5))
-        settle_frames = int(round(60 - 52 * cal_speed))   # 0→60, 1→8
-        capture_frames = int(round(5 - 3 * cal_speed))    # 0→5,  1→2
-        settle_frames = max(2, settle_frames)
-        capture_frames = max(1, capture_frames)
+        # Map calibration_speed (0=careful, 1=fast) to capture frames
+        # settle_frames is only a timeout — change detection handles timing.
+        # 0.0 = remote/RunPod (2 captures per pattern)
+        # 0.85 = default (1 capture per pattern)
+        # 1.0 = local fast (1 capture per pattern)
+        cal_speed = float(self._p("calibration_speed", kwargs, 0.85))
+        settle_frames = 60  # timeout only — change detection exits much earlier
+        capture_frames = 3 if cal_speed < 0.5 else 2
+        # Noise thresholds: tighter at slow speed for accuracy, relaxed at fast
+        change_threshold = 5.0 if cal_speed < 0.5 else 5.0
+        stability_threshold = 2.0 if cal_speed < 0.5 else 3.0
 
         # -- Toggled OFF or never started: cleanup and fall through ----------
         if not start:
@@ -1137,6 +1160,8 @@ class ProMapAnythingPipeline(Pipeline):
                 settle_frames=settle_frames,
                 capture_frames=capture_frames,
                 max_brightness=cal_brightness,
+                change_threshold=change_threshold,
+                stability_threshold=stability_threshold,
             )
             self._calib.start()
             self._calibrating = True
@@ -1144,9 +1169,10 @@ class ProMapAnythingPipeline(Pipeline):
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
             logger.info(
-                "Inline calibration started (%d patterns, %dx%d, speed=%.1f → settle=%d capture=%d)",
+                "Inline calibration started (%d patterns, %dx%d, speed=%.1f, "
+                "capture=%d, change-detection settle)",
                 self._calib.total_patterns, self.proj_w, self.proj_h,
-                cal_speed, settle_frames, capture_frames,
+                cal_speed, capture_frames,
             )
 
         # -- Step calibration -----------------------------------------------
@@ -1175,7 +1201,8 @@ class ProMapAnythingPipeline(Pipeline):
                     self._proj_valid_mask = self._calib.proj_valid_mask
 
                     # Clear cached depth so structured_light recomputes
-                    self._sl_depth_cache = None
+                    self._sl_depth_cache_displacement = None
+                    self._sl_depth_cache_jacobian = None
                     self._static_warped_camera = None
 
                     # Coverage
@@ -1354,75 +1381,33 @@ class ProMapAnythingPipeline(Pipeline):
         setattr(self, cache_key, frame)
         return frame
 
-    def _depth_then_warp(
-        self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
-    ) -> torch.Tensor:
-        """Estimate depth from raw camera, then warp to projector perspective."""
-        self._ensure_depth_model()
-        depth = self._depth.estimate(frame_f)
+    def _warped_rgb_static(self) -> torch.Tensor:
+        """Return the static warped camera image from calibration results."""
+        return self._get_static_warped_camera()
 
-        if temporal_smoothing > 0 and self._prev_depth is not None:
-            if self._prev_depth.shape == depth.shape:
-                depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
-        self._prev_depth = depth.clone()
-
-        if self._map_x is not None and self._map_y is not None:
-            return build_warped_depth_image(
-                depth,
-                self._map_x,
-                self._map_y,
-                self._proj_valid_mask,
-                self.proj_h,
-                self.proj_w,
-                blur=depth_blur,
-                colormap="grayscale",
-                device=self.device,
-            )
-
-        return self._depth_to_grayscale(depth, depth_blur)
-
-    def _warp_then_depth(
-        self, frame_f: torch.Tensor, depth_blur: float, temporal_smoothing: float,
-    ) -> torch.Tensor:
-        """Warp camera RGB to projector perspective, then estimate depth."""
-        self._ensure_depth_model()
-        warped_np = cv2.remap(
-            frame_f.cpu().numpy(), self._map_x, self._map_y,
-            cv2.INTER_LINEAR, borderValue=0,
+    def _grey_fallback(self, frame_f: torch.Tensor) -> torch.Tensor:
+        """Neutral grey fallback when no calibration is available."""
+        h, w = frame_f.shape[:2] if frame_f.ndim >= 2 else (self.proj_h, self.proj_w)
+        return torch.full(
+            (h, w, 3), 0.5, dtype=torch.float32, device=self.device,
         )
-        warped_t = torch.from_numpy(warped_np).to(self.device)
 
-        depth = self._depth.estimate(warped_t)
-
-        if temporal_smoothing > 0 and self._prev_depth is not None:
-            if self._prev_depth.shape == depth.shape:
-                depth = temporal_smoothing * self._prev_depth + (1 - temporal_smoothing) * depth
-        self._prev_depth = depth.clone()
-
-        return self._depth_to_grayscale(depth, depth_blur)
-
-    def _warped_rgb(self, frame_f: torch.Tensor) -> torch.Tensor:
-        """Warp camera RGB to projector perspective (no depth estimation)."""
-        warped_np = cv2.remap(
-            frame_f.cpu().numpy(), self._map_x, self._map_y,
-            cv2.INTER_LINEAR, borderValue=0,
-        )
-        return torch.from_numpy(warped_np).to(self.device)
-
-    def _structured_light_depth(self) -> torch.Tensor:
-        """Derive depth from structured light calibration (cached)."""
-        cached = getattr(self, "_sl_depth_cache", None)
+    def _structured_light_depth(self, method: str = "displacement") -> torch.Tensor:
+        """Derive depth from structured light calibration (cached per method)."""
+        cache_attr = f"_sl_depth_cache_{method}"
+        cached = getattr(self, cache_attr, None)
         if cached is not None:
             return cached
 
         depth = derive_depth_from_calibration(
             self._map_x, self._map_y, self._proj_valid_mask,
+            method=method,
         )
         # Convert to RGB tensor
         depth_rgb = np.stack([depth, depth, depth], axis=-1)
         result = torch.from_numpy(depth_rgb).to(self.device)
-        self._sl_depth_cache = result
-        logger.info("Structured light depth computed and cached")
+        setattr(self, cache_attr, result)
+        logger.info("Structured light depth (%s) computed and cached", method)
         return result
 
     def _canny_edges(
@@ -1482,8 +1467,6 @@ class ProMapAnythingPipeline(Pipeline):
 
         return depth_norm.unsqueeze(-1).expand(-1, -1, 3).to(self.device)
 
-    # _submit_input_preview removed — dashboard overhead reduction.
-    # Only the postprocessor streams to the projector now.
 
 
 # =============================================================================

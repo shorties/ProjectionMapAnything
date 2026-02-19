@@ -55,13 +55,13 @@ ProjectionMapAnything/
 |----------|------|--------------|----------------|
 | ProjectionMapAnything Depth | **Preprocessor** (primary) | `ProMapAnythingConfig` | `ProMapAnythingPipeline` |
 | ProjectionMapAnything Calibrate | **Main pipeline** (visualization) | `ProMapAnythingCalibrateConfig` | `ProMapAnythingCalibratePipeline` |
-| ProjectionMapAnything Projector (Legacy) | **Postprocessor** (deprecated) | `ProMapAnythingProjectorConfig` | `ProMapAnythingProjectorPipeline` |
+| ProjectionMapAnything Projector | **Postprocessor** (MJPEG relay) | `ProMapAnythingProjectorConfig` | `ProMapAnythingProjectorPipeline` |
 
 ### Pipeline IDs
 
 - `projectionmapanything-depth` — **primary, use this**
 - `projectionmapanything-calibrate` — calibration visualization
-- `projectionmapanything-projector` — legacy MJPEG delivery
+- `projectionmapanything-projector` — MJPEG relay to projector (required for projector output)
 
 ### Workflow
 
@@ -72,9 +72,9 @@ CALIBRATION (from within preprocessor):
   Auto-resumes depth mode when done
 
 NORMAL VJ MODE:
-  Main: Krea/VACE    Pre: ProjectionMapAnything Depth    Post: (none needed)
+  Main: Krea/VACE    Pre: ProjectionMapAnything Depth    Post: ProjectionMapAnything Projector
   Camera → depth estimation → warp → effects → isolation → edge feather → AI generation
-  AI output delivered via Scope's WebRTC (or legacy postprocessor for MJPEG)
+  AI output → postprocessor → MJPEG stream → /projector page
 ```
 
 ### Preprocessor Details (Primary Pipeline)
@@ -98,13 +98,13 @@ The preprocessor handles **everything** — calibration, depth conditioning, and
 
 **Calibration state machine**: `IDLE → WHITE → BLACK → PATTERNS → DECODING → DONE`
 
-### Projector Postprocessor (DEPRECATED)
+### Projector Postprocessor
 
-The postprocessor is deprecated. It only provides MJPEG delivery of AI output:
-- Edge feathering has **moved to the preprocessor** (applied to depth conditioning)
-- Subject masking was **always in the preprocessor** (isolation)
-- Color correction (brightness, gamma, contrast) is a client-side concern
-- Use Scope's WebRTC output instead of MJPEG for lower latency
+The postprocessor relays AI-generated frames to the projector via MJPEG:
+- **Required** for projector output — select as Postprocessor in Scope
+- Receives AI output → optional edge feather/mask/color correction → MJPEG stream
+- Stream available on the `/projector` page (dashboard port 8765)
+- Upscales to projector resolution if companion app/browser reports it
 
 ## Frame Server (MJPEG HTTP)
 
