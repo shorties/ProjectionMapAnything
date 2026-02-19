@@ -1,9 +1,18 @@
 """ProjectionMapAnything — pipelines.
 
 Registered pipelines:
-1. ProMapAnythingCalibratePipeline  — main pipeline (Gray code calibration)
-2. ProMapAnythingPipeline           — preprocessor (depth -> ControlNet)
-3. ProMapAnythingProjectorPipeline  — postprocessor (streams output to projector)
+1. ProMapAnythingCalibratePipeline  — main pipeline (calibration visualization, future)
+2. ProMapAnythingPipeline           — preprocessor (calibration + depth conditioning)
+3. ProMapAnythingProjectorPipeline  — postprocessor (LEGACY: MJPEG delivery)
+
+The preprocessor is the primary pipeline. It handles:
+- Gray code calibration (inline, via start_calibration toggle)
+- Depth estimation + projector warp
+- Edge processing, effects, subject isolation, edge feathering
+- All spatial masking is applied to the depth conditioning BEFORE the AI
+
+The postprocessor is deprecated — it only provides MJPEG delivery of AI output
+to the projector with optional color correction.
 """
 
 from __future__ import annotations
@@ -565,11 +574,18 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
 
 class ProMapAnythingPipeline(Pipeline):
-    """Depth estimation + projector warp preprocessor.
+    """Primary preprocessor — calibration + depth conditioning.
 
-    Estimates depth from the camera, warps it to the projector's perspective
-    using the saved calibration, and outputs a VACE-optimized grayscale
-    depth map.  No calibration code — use the Calibrate pipeline for that.
+    This is the main pipeline for ProjectionMapAnything. It handles:
+    - **Calibration**: Toggle ``start_calibration`` to run Gray code
+      structured light calibration inline (patterns go to projector via
+      FrameStreamer, captures come from Scope's camera input).
+    - **Depth conditioning**: Estimates depth, warps to projector perspective,
+      applies effects/isolation/edge feathering, outputs VACE-optimized
+      grayscale depth map.
+
+    The preprocessor chain:
+    ``depth → edge_processing → edge_blend → effect → isolation → edge_feather → resize``
     """
 
     @classmethod
@@ -585,14 +601,10 @@ class ProMapAnythingPipeline(Pipeline):
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        self._gen_res: str = kwargs.get("generation_resolution", "half")
-        self._depth_mode: str = kwargs.get("depth_mode", "depth_then_warp")
-        self._isolation_mode: str = kwargs.get("subject_isolation", "none")
-
         # Depth estimation — lazy-loaded on first use (avoids OOM in static mode)
         self._depth = None
 
-        # MJPEG streamer for input preview on dashboard
+        # MJPEG streamer for dashboard + projector pop-out
         port = kwargs.get("stream_port", 8765)
         self._streamer = get_or_create_streamer(port)
 
@@ -616,13 +628,8 @@ class ProMapAnythingPipeline(Pipeline):
         self._calib: CalibrationState | None = None
         self._calibrating = False
         self._calib_done = False
+        self._reset_armed = False
         self._ambient_frame: torch.Tensor | None = None
-
-        # Log init kwargs for debugging
-        logger.info(
-            "Depth preprocessor __init__ kwargs: %s",
-            {k: v for k, v in kwargs.items() if k != "device"},
-        )
 
         # Load calibration
         cal_path = _DEFAULT_CALIBRATION_PATH
@@ -642,9 +649,12 @@ class ProMapAnythingPipeline(Pipeline):
                 cal_path,
             )
 
-    def _get_generation_resolution(self) -> tuple[int, int]:
+        logger.info("Preprocessor ready on port %d", port)
+
+    def _get_generation_resolution(self, kwargs: dict | None = None) -> tuple[int, int]:
         """Compute generation resolution from projector res + preset."""
-        scale = self._RESOLUTION_SCALES.get(self._gen_res, 0.5)
+        gen_res = self._p("gen_resolution", kwargs or {}, "half")
+        scale = self._RESOLUTION_SCALES.get(gen_res, 0.5)
         gen_w = max(64, round(self.proj_w * scale / 8) * 8)
         gen_h = max(64, round(self.proj_h * scale / 8) * 8)
         return gen_w, gen_h
@@ -664,12 +674,20 @@ class ProMapAnythingPipeline(Pipeline):
             out_w = kwargs.get("width", None)
             out_h = kwargs.get("height", None)
             if out_w is None or out_h is None:
-                out_w, out_h = self._get_generation_resolution()
+                out_w, out_h = self._get_generation_resolution(kwargs)
             fallback = torch.full(
                 (int(out_h), int(out_w), 3), 0.5,
                 dtype=torch.float32, device=self.device,
             )
             return {"video": fallback.unsqueeze(0)}
+
+    def _p(self, key: str, kwargs: dict, default=None):
+        """Read a parameter: dashboard override > Scope kwargs > default."""
+        if self._streamer is not None:
+            ov = self._streamer._param_overrides.get(key)
+            if ov is not None:
+                return ov
+        return kwargs.get(key, default)
 
     def _call_inner(self, **kwargs) -> dict:
         video = kwargs.get("video")
@@ -678,28 +696,69 @@ class ProMapAnythingPipeline(Pipeline):
 
         frame = video[0]  # (1, H, W, C) [0, 255]
 
+        # -- Reset calibration (rising edge) ----------------------------------
+        reset_cal = self._p("reset_calibration", kwargs, False)
+        if reset_cal and not self._reset_armed:
+            self._reset_armed = True
+            self._map_x = None
+            self._map_y = None
+            self._proj_valid_mask = None
+            self._prev_depth = None
+            self._sl_depth_cache = None
+            self._static_warped_camera = None
+            self._calib = None
+            self._calibrating = False
+            self._calib_done = False
+            self._ambient_frame = None
+            # Delete calibration file
+            if _DEFAULT_CALIBRATION_PATH.is_file():
+                _DEFAULT_CALIBRATION_PATH.unlink()
+                logger.info("Deleted calibration file: %s", _DEFAULT_CALIBRATION_PATH)
+            if self._streamer is not None:
+                self._streamer.clear_calibration_results()
+                self._streamer.calibration_active = False
+            logger.info("Calibration reset — ready to recalibrate")
+        elif not reset_cal:
+            self._reset_armed = False
+
+        # -- Auto-detect projector resolution from companion app/projector page
+        if self._streamer is not None:
+            cfg = self._streamer.client_config
+            if cfg and "width" in cfg and "height" in cfg:
+                new_pw, new_ph = int(cfg["width"]), int(cfg["height"])
+                if new_pw != self.proj_w or new_ph != self.proj_h:
+                    self.proj_w = new_pw
+                    self.proj_h = new_ph
+                    # Invalidate caches that depend on projector resolution
+                    self._sl_depth_cache = None
+                    self._static_warped_camera = None
+                    logger.info("Projector resolution auto-detected: %dx%d", self.proj_w, self.proj_h)
+
         # -- Inline calibration -----------------------------------------------
-        start_cal = kwargs.get("start_calibration", False)
+        start_cal = self._p("start_calibration", kwargs, False)
         result = self._handle_inline_calibration(frame, start_cal, kwargs)
         if result is not None:
             return result
 
-        depth_mode = kwargs.get("depth_mode", self._depth_mode)
-        temporal_smoothing = kwargs.get("temporal_smoothing", 0.5)
-        depth_blur = kwargs.get("depth_blur", 0.0)
-        edge_erosion = int(kwargs.get("edge_erosion", 0))
-        depth_contrast = float(kwargs.get("depth_contrast", 1.0))
-        near_clip = float(kwargs.get("depth_near_clip", 0.0))
-        far_clip = float(kwargs.get("depth_far_clip", 1.0))
-        edge_blend = float(kwargs.get("edge_blend", 0.0))
-        edge_method = kwargs.get("edge_method", "sobel")
-        active_effect = kwargs.get("active_effect", "none")
-        effect_intensity = float(kwargs.get("effect_intensity", 0.5))
-        effect_speed = float(kwargs.get("effect_speed", 1.0))
-        isolation_mode = kwargs.get("subject_isolation", self._isolation_mode)
-        subject_depth_range = float(kwargs.get("subject_depth_range", 0.3))
-        subject_feather = float(kwargs.get("subject_feather", 5.0))
-        invert_mask = bool(kwargs.get("invert_subject_mask", False))
+        # All processing params — read from dashboard overrides with sensible defaults
+        # (disabled by default; advanced users tune via dashboard)
+        depth_mode = self._p("depth_mode", kwargs, "structured_light")
+        temporal_smoothing = self._p("temporal_smoothing", kwargs, 0.0)
+        depth_blur = self._p("depth_blur", kwargs, 0.0)
+        edge_erosion = int(self._p("edge_erosion", kwargs, 0))
+        depth_contrast = float(self._p("depth_contrast", kwargs, 1.0))
+        near_clip = float(self._p("depth_near_clip", kwargs, 0.0))
+        far_clip = float(self._p("depth_far_clip", kwargs, 1.0))
+        edge_blend = float(self._p("edge_blend", kwargs, 0.0))
+        edge_method = self._p("edge_method", kwargs, "sobel")
+        active_effect = self._p("active_effect", kwargs, "none")
+        effect_intensity = float(self._p("effect_intensity", kwargs, 0.5))
+        effect_speed = float(self._p("effect_speed", kwargs, 1.0))
+        isolation_mode = self._p("subject_isolation", kwargs, "none")
+        subject_depth_range = float(self._p("subject_depth_range", kwargs, 0.3))
+        subject_feather = float(self._p("subject_feather", kwargs, 5.0))
+        invert_mask = bool(self._p("invert_subject_mask", kwargs, False))
+        edge_feather = float(self._p("edge_feather", kwargs, 0.0))
 
         # Normalise input to [0, 1]
         frame_f = frame.squeeze(0).to(device=self.device, dtype=torch.float32)
@@ -760,11 +819,15 @@ class ProMapAnythingPipeline(Pipeline):
                 invert=invert_mask,
             )
 
+        # -- Edge feather (fade to black at projection boundaries) -----------
+        if edge_feather > 0:
+            rgb = self._apply_edge_feather(rgb, edge_feather)
+
         # -- Resize to match what Scope / the main pipeline expects -----------
         out_w = kwargs.get("width", None)
         out_h = kwargs.get("height", None)
         if out_w is None or out_h is None:
-            out_w, out_h = self._get_generation_resolution()
+            out_w, out_h = self._get_generation_resolution(kwargs)
         else:
             out_w, out_h = int(out_w), int(out_h)
         h, w = rgb.shape[:2]
@@ -1008,6 +1071,28 @@ class ProMapAnythingPipeline(Pipeline):
 
         return result
 
+    # -- Edge feather ---------------------------------------------------------
+
+    @staticmethod
+    def _apply_edge_feather(frame: torch.Tensor, radius: float) -> torch.Tensor:
+        """Fade to black at projection edges. Pure torch, vectorized."""
+        h, w = frame.shape[:2]
+        r = radius
+
+        rows = torch.arange(h, device=frame.device, dtype=torch.float32)
+        cols = torch.arange(w, device=frame.device, dtype=torch.float32)
+
+        top = (rows / r).clamp(0, 1)
+        bottom = ((h - 1 - rows) / r).clamp(0, 1)
+        left = (cols / r).clamp(0, 1)
+        right = ((w - 1 - cols) / r).clamp(0, 1)
+
+        vert = torch.min(top, bottom).unsqueeze(1)   # (H, 1)
+        horiz = torch.min(left, right).unsqueeze(0)   # (1, W)
+        mask = (vert * horiz).unsqueeze(-1)            # (H, W, 1)
+
+        return frame * mask
+
     # -- Inline calibration ---------------------------------------------------
 
     def _handle_inline_calibration(
@@ -1021,9 +1106,15 @@ class ProMapAnythingPipeline(Pipeline):
         Returns a preprocessor output dict while calibrating, or None
         to fall through to normal depth processing.
         """
-        cal_brightness = int(kwargs.get("calibration_brightness", 128))
-        cal_proj_w = int(kwargs.get("projector_width", self.proj_w))
-        cal_proj_h = int(kwargs.get("projector_height", self.proj_h))
+        # Read calibration params via _p() (dashboard override > kwargs > default)
+        cal_brightness = int(self._p("calibration_brightness", kwargs, 128))
+
+        # Map calibration_speed (0=careful, 1=fast) to settle/capture frames
+        cal_speed = float(self._p("calibration_speed", kwargs, 0.5))
+        settle_frames = int(round(60 - 52 * cal_speed))   # 0→60, 1→8
+        capture_frames = int(round(5 - 3 * cal_speed))    # 0→5,  1→2
+        settle_frames = max(2, settle_frames)
+        capture_frames = max(1, capture_frames)
 
         # -- Toggled OFF or never started: cleanup and fall through ----------
         if not start:
@@ -1042,9 +1133,9 @@ class ProMapAnythingPipeline(Pipeline):
         # -- First toggle ON: create CalibrationState -----------------------
         if start and not self._calibrating and not self._calib_done:
             self._calib = CalibrationState(
-                cal_proj_w, cal_proj_h,
-                settle_frames=15,
-                capture_frames=3,
+                self.proj_w, self.proj_h,
+                settle_frames=settle_frames,
+                capture_frames=capture_frames,
                 max_brightness=cal_brightness,
             )
             self._calib.start()
@@ -1053,8 +1144,9 @@ class ProMapAnythingPipeline(Pipeline):
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
             logger.info(
-                "Inline calibration started (%d patterns, %dx%d)",
-                self._calib.total_patterns, cal_proj_w, cal_proj_h,
+                "Inline calibration started (%d patterns, %dx%d, speed=%.1f → settle=%d capture=%d)",
+                self._calib.total_patterns, self.proj_w, self.proj_h,
+                cal_speed, settle_frames, capture_frames,
             )
 
         # -- Step calibration -----------------------------------------------
@@ -1073,15 +1165,13 @@ class ProMapAnythingPipeline(Pipeline):
                     map_x, map_y = mapping
                     save_calibration(
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
-                        cal_proj_w, cal_proj_h,
+                        self.proj_w, self.proj_h,
                     )
                     logger.info("Inline calibration saved to %s", _DEFAULT_CALIBRATION_PATH)
 
                     # Update live state
                     self._map_x = map_x
                     self._map_y = map_y
-                    self.proj_w = cal_proj_w
-                    self.proj_h = cal_proj_h
                     self._proj_valid_mask = self._calib.proj_valid_mask
 
                     # Clear cached depth so structured_light recomputes
@@ -1110,7 +1200,7 @@ class ProMapAnythingPipeline(Pipeline):
                         publish_calibration_results(
                             map_x=map_x, map_y=map_y,
                             rgb_frame_np=ambient_np,
-                            proj_w=cal_proj_w, proj_h=cal_proj_h,
+                            proj_w=self.proj_w, proj_h=self.proj_h,
                             proj_valid_mask=_pvm,
                             coverage_pct=coverage_pct,
                             streamer=_str,
@@ -1148,7 +1238,7 @@ class ProMapAnythingPipeline(Pipeline):
         out_w = kwargs.get("width", None)
         out_h = kwargs.get("height", None)
         if out_w is None or out_h is None:
-            out_w, out_h = self._get_generation_resolution()
+            out_w, out_h = self._get_generation_resolution(kwargs)
         else:
             out_w, out_h = int(out_w), int(out_h)
         grey = torch.full(

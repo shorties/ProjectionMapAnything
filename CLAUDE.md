@@ -47,50 +47,41 @@ ProjectionMapAnything/
         └── examples/vfx-pack.md     # Working plugin example
 ```
 
-## Scope Plugin — 3 Pipeline Architecture
+## Scope Plugin Architecture
 
 ### Pipelines
 
 | Pipeline | Role | Config Class | Pipeline Class |
 |----------|------|--------------|----------------|
-| ProjectionMapAnything Calibrate | **Main pipeline** | `ProjectionMapAnythingCalibrateConfig` | `ProjectionMapAnythingCalibratePipeline` |
-| ProjectionMapAnything Depth | **Preprocessor** | `ProjectionMapAnythingConfig` | `ProjectionMapAnythingPipeline` |
-| ProjectionMapAnything Projector | **Postprocessor** | `ProjectionMapAnythingProjectorConfig` | `ProjectionMapAnythingProjectorPipeline` |
+| ProjectionMapAnything Depth | **Preprocessor** (primary) | `ProMapAnythingConfig` | `ProMapAnythingPipeline` |
+| ProjectionMapAnything Calibrate | **Main pipeline** (visualization) | `ProMapAnythingCalibrateConfig` | `ProMapAnythingCalibratePipeline` |
+| ProjectionMapAnything Projector (Legacy) | **Postprocessor** (deprecated) | `ProMapAnythingProjectorConfig` | `ProMapAnythingProjectorPipeline` |
 
 ### Pipeline IDs
 
-- `projectionmapanything-calibrate`
-- `projectionmapanything-depth`
-- `projectionmapanything-projector`
+- `projectionmapanything-depth` — **primary, use this**
+- `projectionmapanything-calibrate` — calibration visualization
+- `projectionmapanything-projector` — legacy MJPEG delivery
 
 ### Workflow
 
 ```
-CALIBRATION (standalone — no pre/post needed):
-  Select "ProjectionMapAnything Calibrate" as main pipeline → hit play
-  Grey test card on projector → user toggles "Start Calibration"
+CALIBRATION (from within preprocessor):
+  Select preprocessor → toggle "Start Calibration" in Scope settings
   Gray code patterns → camera captures → decode → save calibration
-  Uploads result images to Scope gallery for VACE conditioning
+  Auto-resumes depth mode when done
 
 NORMAL VJ MODE:
-  Main: Krea/VACE    Pre: ProjectionMapAnything Depth    Post: ProjectionMapAnything Projector
-  Camera → depth estimation → warp to projector perspective → effects → isolation → AI generation → MJPEG stream
+  Main: Krea/VACE    Pre: ProjectionMapAnything Depth    Post: (none needed)
+  Camera → depth estimation → warp → effects → isolation → edge feather → AI generation
+  AI output delivered via Scope's WebRTC (or legacy postprocessor for MJPEG)
 ```
 
-### Calibration Pipeline Details
+### Preprocessor Details (Primary Pipeline)
 
-**State machine phases**: `IDLE → WHITE → BLACK → PATTERNS → DECODING → DONE`
+The preprocessor handles **everything** — calibration, depth conditioning, and all spatial masking:
 
-- Shows grey test card before calibration (prevents camera-projector feedback loop)
-- `settle_frames=6` between patterns for camera/projector sync (~200ms at 30fps)
-- `capture_frames=3` per pattern (averaged for noise rejection)
-- Per-bit reliability thresholding + spatial consistency filtering
-- Gaussian splat fill + inpainting for dense correspondence
-- Saves to `~/.projectionmapanything_calibration.json` with UTC timestamp
-- Publishes downloadable results via frame_server + uploads to Scope asset gallery
-
-### Depth Preprocessor Details
-
+- **Calibration**: Inline Gray code calibration via `start_calibration` toggle
 - Loads calibration automatically from `~/.projectionmapanything_calibration.json`
 - Uses Depth Anything V2 (tries Scope built-in first, falls back to transformers)
 - Warps depth from camera→projector perspective using calibration maps
@@ -99,19 +90,21 @@ NORMAL VJ MODE:
 - Edge blend: Sobel/Canny edge detection blended into depth
 - Depth effects: Surface-masked animated effects (noise, flow, pulse, wave, kaleido, etc.)
 - Subject isolation: depth_band, custom mask, or rembg AI background removal
+- Edge feathering: fade depth conditioning to black at projection boundaries
 - Custom depth: User-uploaded depth map via dashboard
 - Resizes to generation resolution (quarter/half/native of projector res)
 
-**Preprocessor chain**: `depth → edge_processing → edge_blend → surface-masked effect → isolation → preview → resize`
+**Preprocessor chain**: `depth → edge_processing → edge_blend → surface-masked effect → isolation → edge_feather → resize`
 
-### Projector Postprocessor Details
+**Calibration state machine**: `IDLE → WHITE → BLACK → PATTERNS → DECODING → DONE`
 
-- Streams final AI output to projector via MJPEG
-- Edge feathering: fade to black at projection edges
-- Subject masking: apply preprocessor isolation mask
-- Color correction: brightness, gamma, contrast adjustments
-- Optionally upscales to projector resolution (from companion app config)
-- Shares singleton FrameStreamer with calibration pipeline
+### Projector Postprocessor (DEPRECATED)
+
+The postprocessor is deprecated. It only provides MJPEG delivery of AI output:
+- Edge feathering has **moved to the preprocessor** (applied to depth conditioning)
+- Subject masking was **always in the preprocessor** (isolation)
+- Color correction (brightness, gamma, contrast) is a client-side concern
+- Use Scope's WebRTC output instead of MJPEG for lower latency
 
 ## Frame Server (MJPEG HTTP)
 
@@ -140,9 +133,14 @@ Fields use `category` in `ui_field_config()` to control panel placement:
 - `category="input"` → **Left panel** (input side) — runtime controls users adjust frequently
 - `category="configuration"` → **Right panel** (settings) — load-time config set once
 
-Current layout:
-- **Input side**: Start Calibration toggle, Temporal Smoothing, Depth Blur, Edge Erosion, Depth Contrast, Near/Far Clip, Edge Blend, Edge Method, Active Effect, Effect Intensity, Effect Speed, Subject Depth Range, Subject Feather, Upscale to Projector, Edge Feather, Apply Subject Mask, Brightness, Gamma, Contrast
-- **Settings side**: Projector Width/Height, Stream Port, Projector URL, Calibration File, Gen Resolution, Depth Mode, Subject Isolation
+Current preprocessor layout (all "configuration" category — Scope limitation for preprocessors):
+- Depth Mode, Temporal Smoothing, Depth Blur, Edge Erosion, Depth Contrast, Near/Far Clip
+- Edge Blend, Edge Method
+- Active Effect, Effect Intensity, Effect Speed
+- Subject Isolation, Depth Range, Feather, Invert Mask
+- Edge Feather
+- Start Calibration, Calibration Brightness, Projector Width/Height
+- Stream Port, Generation Resolution (load-time)
 
 ## Critical Implementation Notes
 

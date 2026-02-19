@@ -186,352 +186,98 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
 
 
 class ProMapAnythingConfig(BasePipelineConfig):
-    """Projection mapping depth preprocessor (VACE-optimized).
+    """Projection mapping preprocessor — calibration + depth conditioning.
 
-    Appears in the **Preprocessor** dropdown.  Estimates depth from the
-    camera, warps it to the projector's perspective using saved calibration,
-    and outputs a VACE-optimized grayscale depth map (near=bright, far=dark).
+    Select as the **Preprocessor**.  Handles calibration (toggle Start
+    Calibration) and depth conditioning for VACE/ControlNet.  All depth
+    processing controls are available via the dashboard (port 8765) —
+    only essential controls appear here.
     """
 
     pipeline_id = "projectionmapanything-depth"
-    pipeline_name = "ProjectionMapAnything Depth"
+    pipeline_name = "ProjectionMapAnything"
     pipeline_description = (
-        "Depth preprocessor — estimates depth and warps to projector "
-        "perspective using saved calibration.  Outputs VACE-optimized "
-        "grayscale depth (near=bright, far=dark)."
+        "Projection mapping preprocessor — calibration + depth conditioning. "
+        "Toggle Start Calibration to run Gray code calibration. "
+        "Open the dashboard (port 8765) for advanced depth controls."
     )
 
     supports_prompts = False
     modes = {"video": ModeDefaults(default=True)}
     usage = [UsageType.PREPROCESSOR]
 
-    # -- Configuration (settings panel) ---------------------------------------
-    # NOTE: Scope only renders "configuration" fields for preprocessors.
-    # "input" category fields are invisible for preprocessor pipelines.
-
-    depth_mode: Literal[
-        "structured_light",
-        "canny",
-        "depth_then_warp",
-        "warp_then_depth",
-        "warped_rgb",
-        "static_depth_warped",
-        "static_depth_from_warped",
-        "static_warped_camera",
-        "custom",
-    ] = Field(
-        default="structured_light",
-        description=(
-            "Conditioning input for the AI model. "
-            "STRUCTURED LIGHT: structured_light (real depth derived from "
-            "calibration scan — no GPU depth model needed). "
-            "CANNY: canny (edge detection on warped camera — great for VACE). "
-            "LIVE: depth_then_warp, warp_then_depth, warped_rgb (need GPU depth model). "
-            "STATIC: static_depth_warped, static_depth_from_warped, "
-            "static_warped_camera (from calibration images). "
-            "CUSTOM: custom (upload your own depth map via the dashboard)."
-        ),
-        json_schema_extra=ui_field_config(
-            order=0,
-            label="Depth Mode",
-            is_load_param=True,
-            category="configuration",
-        ),
-    )
-
-    temporal_smoothing: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=0.99,
-        description="Blend factor with the previous depth frame. Higher = smoother.",
-        json_schema_extra=ui_field_config(
-            order=1,
-            label="Temporal Smoothing",
-            category="configuration",
-        ),
-    )
-
-    depth_blur: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=20.0,
-        description="Gaussian blur radius on the depth map. 0 = sharp.",
-        json_schema_extra=ui_field_config(
-            order=2,
-            label="Depth Blur",
-            category="configuration",
-        ),
-    )
-
-    edge_erosion: int = Field(
-        default=0,
-        ge=0,
-        le=50,
-        description=(
-            "Erode the valid depth region by this many pixels. "
-            "Trims overshoot at object edges where depth bleeds "
-            "onto background surfaces. 0 = no erosion."
-        ),
-        json_schema_extra=ui_field_config(
-            order=3,
-            label="Edge Erosion",
-            category="configuration",
-        ),
-    )
-
-    depth_contrast: float = Field(
-        default=1.0,
-        ge=0.5,
-        le=5.0,
-        description=(
-            "Contrast multiplier for the depth map. Values > 1 sharpen "
-            "depth transitions at object edges. 1.0 = no change."
-        ),
-        json_schema_extra=ui_field_config(
-            order=4,
-            label="Depth Contrast",
-            category="configuration",
-        ),
-    )
-
-    depth_near_clip: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Clip depth values below this threshold (0-1 normalized). "
-            "Pixels closer than this become black. Useful for isolating "
-            "foreground objects."
-        ),
-        json_schema_extra=ui_field_config(
-            order=5,
-            label="Near Clip",
-            category="configuration",
-        ),
-    )
-
-    depth_far_clip: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Clip depth values above this threshold (0-1 normalized). "
-            "Pixels farther than this become black. Useful for removing "
-            "background surfaces."
-        ),
-        json_schema_extra=ui_field_config(
-            order=6,
-            label="Far Clip",
-            category="configuration",
-        ),
-    )
-
-    # -- Edge blend -----------------------------------------------------------
-
-    edge_blend: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Blend surface edges (from the warped camera image) into the "
-            "depth map. 0 = no edges, 1 = full edge overlay."
-        ),
-        json_schema_extra=ui_field_config(
-            order=7,
-            label="Edge Blend",
-            category="configuration",
-        ),
-    )
-
-    edge_method: Literal["sobel", "canny"] = Field(
-        default="sobel",
-        description="Edge detection algorithm for edge blending.",
-        json_schema_extra=ui_field_config(
-            order=8,
-            label="Edge Method",
-            category="configuration",
-        ),
-    )
-
-    # -- Depth effects --------------------------------------------------------
-
-    active_effect: Literal[
-        "none",
-        "noise_blend",
-        "flow_warp",
-        "pulse",
-        "wave_warp",
-        "kaleido",
-        "shockwave",
-        "wobble",
-        "geometry_edges",
-        "depth_fog",
-        "radial_zoom",
-    ] = Field(
-        default="none",
-        description="Animated effect to apply to the depth map before sending to the AI model.",
-        json_schema_extra=ui_field_config(
-            order=9,
-            label="Active Effect",
-            category="configuration",
-        ),
-    )
-
-    effect_intensity: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=2.0,
-        description="Strength of the active depth effect. 0 = off.",
-        json_schema_extra=ui_field_config(
-            order=10,
-            label="Effect Intensity",
-            category="configuration",
-        ),
-    )
-
-    effect_speed: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=5.0,
-        description="Animation speed for the active depth effect.",
-        json_schema_extra=ui_field_config(
-            order=11,
-            label="Effect Speed",
-            category="configuration",
-        ),
-    )
-
-    # -- Subject isolation ----------------------------------------------------
-
-    subject_isolation: Literal["none", "depth_band", "mask", "rembg"] = Field(
-        default="none",
-        description=(
-            "Isolate subjects in the depth map. "
-            "depth_band: auto-detect nearest surfaces. "
-            "mask: use an uploaded mask image. "
-            "rembg: AI background removal (requires rembg)."
-        ),
-        json_schema_extra=ui_field_config(
-            order=12,
-            label="Subject Isolation",
-            category="configuration",
-        ),
-    )
-
-    subject_depth_range: float = Field(
-        default=0.3,
-        ge=0.05,
-        le=1.0,
-        description=(
-            "Depth band width for depth_band isolation. "
-            "Fraction of the depth range around the nearest peak to keep."
-        ),
-        json_schema_extra=ui_field_config(
-            order=13,
-            label="Subject Depth Range",
-            category="configuration",
-        ),
-    )
-
-    subject_feather: float = Field(
-        default=5.0,
-        ge=0.0,
-        le=30.0,
-        description="Feather (blur) radius for the isolation mask edges.",
-        json_schema_extra=ui_field_config(
-            order=14,
-            label="Subject Feather",
-            category="configuration",
-        ),
-    )
-
-    invert_subject_mask: bool = Field(
-        default=False,
-        description="Invert the subject isolation mask (keep background, remove subject).",
-        json_schema_extra=ui_field_config(
-            order=15,
-            label="Invert Subject Mask",
-            category="configuration",
-        ),
-    )
-
-    # -- Inline calibration ---------------------------------------------------
+    # -- Calibration controls -------------------------------------------------
 
     start_calibration: bool = Field(
         default=False,
         description=(
-            "Run Gray code calibration while the AI model stays loaded. "
-            "Overrides projector output with calibration patterns. "
-            "Toggle OFF when done or to cancel."
+            "Start Gray code calibration. Open the projector page first "
+            "(dashboard port 8765 → Projector button), then toggle ON. "
+            "Patterns are projected and captured automatically. "
+            "Toggle OFF to cancel."
         ),
         json_schema_extra=ui_field_config(
-            order=16,
+            order=0,
             label="Start Calibration",
             category="configuration",
         ),
     )
 
-    calibration_brightness: int = Field(
-        default=128,
-        ge=10,
-        le=255,
-        description="Brightness for calibration patterns and test card.",
+    reset_calibration: bool = Field(
+        default=False,
+        description=(
+            "Clear saved calibration and start fresh. Toggle ON to reset, "
+            "then toggle OFF. The next calibration will overwrite the file."
+        ),
         json_schema_extra=ui_field_config(
-            order=17,
-            label="Calibration Brightness",
+            order=1,
+            label="Reset Calibration",
             category="configuration",
         ),
     )
 
-    projector_width: int = Field(
-        default=1920,
-        ge=1,
-        le=7680,
-        description="Projector resolution width (for calibration pattern generation).",
+    calibration_speed: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Calibration speed. 0 = careful (60 settle frames, 5 captures "
+            "per pattern — best for remote/RunPod). 1 = fast (8 settle "
+            "frames, 2 captures — for local low-latency setups)."
+        ),
         json_schema_extra=ui_field_config(
-            order=18,
-            label="Projector Width",
+            order=2,
+            label="Calibration Speed",
             category="configuration",
         ),
     )
 
-    projector_height: int = Field(
-        default=1080,
-        ge=1,
-        le=4320,
-        description="Projector resolution height (for calibration pattern generation).",
-        json_schema_extra=ui_field_config(
-            order=19,
-            label="Projector Height",
-            category="configuration",
+    # -- Dashboard link -------------------------------------------------------
+
+    dashboard_url: str = Field(
+        default="Change 8000 to 8765 in this page's URL",
+        description=(
+            "Open the dashboard for projector pop-out, advanced depth "
+            "controls, calibration results, and custom uploads."
         ),
-    )
-
-    # -- Load-time config -----------------------------------------------------
-
-    stream_port: int = Field(
-        default=8765,
-        ge=1024,
-        le=65535,
-        description="MJPEG stream port for the dashboard input preview.",
         json_schema_extra=ui_field_config(
-            order=20,
-            label="Stream Port",
+            order=3,
+            label="Dashboard",
             is_load_param=True,
             category="configuration",
         ),
     )
 
-    generation_resolution: Literal["quarter", "half", "native"] = Field(
-        default="half",
-        description=(
-            "Resolution for AI generation relative to the projector. "
-            "'quarter' = 1/4 res (fast), 'half' = 1/2 res (balanced), "
-            "'native' = full projector res (slow, highest quality)."
-        ),
+    # -- Load-time config (rarely changed) ------------------------------------
+
+    stream_port: int = Field(
+        default=8765,
+        ge=1024,
+        le=65535,
+        description="HTTP port for the dashboard and MJPEG projector stream.",
         json_schema_extra=ui_field_config(
-            order=21,
-            label="Generation Resolution",
+            order=10,
+            label="Stream Port",
             is_load_param=True,
             category="configuration",
         ),
@@ -544,17 +290,25 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
 
 class ProMapAnythingProjectorConfig(BasePipelineConfig):
-    """Projector output postprocessor.
+    """Projector output postprocessor (DEPRECATED).
+
+    .. deprecated::
+        Edge feathering and subject masking have moved to the preprocessor.
+        The preprocessor now handles calibration, depth conditioning, and
+        all spatial masking. This postprocessor is only needed if you want
+        MJPEG delivery of the AI output to the projector with color correction.
+        Consider using a WebRTC client instead.
 
     Appears in the **Postprocessor** dropdown.  Streams the final output
     to the companion app via MJPEG.  Auto-starts the stream when selected.
     """
 
     pipeline_id = "projectionmapanything-projector"
-    pipeline_name = "ProjectionMapAnything Projector"
+    pipeline_name = "ProjectionMapAnything Projector (Legacy)"
     pipeline_description = (
-        "Streams the final pipeline output to a projector via MJPEG. "
-        "Optionally upscales to projector resolution with color correction."
+        "LEGACY: Streams AI output to projector via MJPEG with color correction. "
+        "Edge feathering has moved to the preprocessor — use this only if you "
+        "need MJPEG delivery of the final AI output."
     )
 
     supports_prompts = False

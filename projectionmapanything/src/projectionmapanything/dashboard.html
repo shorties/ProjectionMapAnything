@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=360">
+<title>PMA Dashboard</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#111318; color:#ccc;
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+         font-size:13px; line-height:1.4; min-height:100vh; }
+  .dash { max-width:360px; margin:0 auto; padding:10px; display:flex;
+          flex-direction:column; gap:8px; }
+
+  /* Header */
+  .hdr { display:flex; align-items:center; justify-content:space-between; padding:6px 0; }
+  .hdr h1 { font-size:15px; font-weight:700; color:#e94560; letter-spacing:-0.3px; }
+  .badge { font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; }
+  .badge-local { background:#1a3a1a; color:#4ecca3; }
+  .badge-remote { background:#3a1a1a; color:#e94560; }
+
+  /* Buttons */
+  .btn-row { display:flex; gap:6px; }
+  .btn { padding:7px 14px; border:none; border-radius:6px; font-size:12px;
+         font-weight:600; cursor:pointer; transition:all 0.15s; flex:1; }
+  .btn-p { background:#e94560; color:#fff; }
+  .btn-p:hover { background:#d13a54; }
+  .btn-s { background:#1a2440; color:#aaa; }
+  .btn-s:hover { background:#243050; color:#ddd; }
+  .btn-sm { padding:5px 10px; font-size:11px; flex:none; }
+
+  /* Sections (collapsible) */
+  details { background:#181c24; border-radius:8px; overflow:hidden; }
+  details[open] { background:#181c24; }
+  summary { padding:10px 12px; font-size:12px; font-weight:600; color:#888;
+            text-transform:uppercase; letter-spacing:0.8px; cursor:pointer;
+            user-select:none; list-style:none; display:flex;
+            align-items:center; justify-content:space-between; }
+  summary::-webkit-details-marker { display:none; }
+  summary::after { content:'\25B8'; color:#555; font-size:10px; transition:transform 0.15s; }
+  details[open] > summary::after { transform:rotate(90deg); }
+  summary:hover { color:#bbb; }
+  .sec { padding:0 12px 12px; display:flex; flex-direction:column; gap:8px; }
+
+  /* Preview */
+  .preview { border-radius:6px; overflow:hidden; background:#000;
+             width:100%; aspect-ratio:16/9; }
+  .preview img { width:100%; height:100%; object-fit:contain; display:block; }
+
+  /* Form controls */
+  .ctrl { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .ctrl-label { font-size:11px; color:#777; white-space:nowrap; min-width:80px; }
+  .ctrl select, .ctrl input[type=number], .ctrl input[type=text] {
+    flex:1; padding:5px 8px; background:#0d1117; color:#ddd; border:1px solid #2a2f3a;
+    border-radius:4px; font-size:12px; outline:none; min-width:0; }
+  .ctrl select:focus, .ctrl input:focus { border-color:#4ecca3; }
+  .ctrl input[type=range] { flex:1; accent-color:#4ecca3; }
+  .range-val { font-size:11px; color:#4ecca3; min-width:36px; text-align:right;
+               font-variant-numeric:tabular-nums; }
+
+  /* Toggle switch */
+  .toggle { position:relative; width:36px; height:20px; flex-shrink:0; }
+  .toggle input { opacity:0; width:0; height:0; }
+  .toggle .slider { position:absolute; inset:0; background:#2a2f3a; border-radius:10px;
+                    cursor:pointer; transition:background 0.2s; }
+  .toggle .slider::before { content:''; position:absolute; width:16px; height:16px;
+    left:2px; top:2px; background:#666; border-radius:50%; transition:all 0.2s; }
+  .toggle input:checked + .slider { background:#1a4a2a; }
+  .toggle input:checked + .slider::before { transform:translateX(16px); background:#4ecca3; }
+
+  /* Progress */
+  .prog-wrap { background:#0d1117; border-radius:4px; height:18px;
+               overflow:hidden; position:relative; }
+  .prog-bar { height:100%; background:linear-gradient(90deg,#4ecca3,#36b88e);
+              border-radius:4px; transition:width 0.3s; }
+  .prog-text { position:absolute; inset:0; display:flex; align-items:center;
+               justify-content:center; font-size:10px; font-weight:600; color:#fff; }
+
+  /* Status dots */
+  .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .dot-g { background:#4ecca3; box-shadow:0 0 4px #4ecca3; }
+  .dot-y { background:#f0c040; box-shadow:0 0 4px #f0c040; }
+  .dot-r { background:#e94560; }
+
+  /* File list */
+  .file-row { display:flex; align-items:center; justify-content:space-between;
+              background:#0d1117; border-radius:4px; padding:5px 8px; }
+  .file-name { font-size:11px; font-family:monospace; color:#aaa; overflow:hidden;
+               text-overflow:ellipsis; white-space:nowrap; }
+
+  /* Thumbs */
+  .thumb-row { display:flex; gap:6px; flex-wrap:wrap; }
+  .thumb { width:100px; height:56px; border-radius:4px; overflow:hidden;
+           background:#0d1117; cursor:pointer; border:1px solid transparent; }
+  .thumb:hover { border-color:#4ecca3; }
+  .thumb img { width:100%; height:100%; object-fit:cover; }
+
+  /* Webcam section */
+  .sc-wrap { border-radius:6px; overflow:hidden; background:#000;
+             width:100%; aspect-ratio:16/9; }
+  .sc-wrap video { width:100%; height:100%; object-fit:contain; display:block; }
+  .sc-wrap canvas { display:none; }
+
+  /* Misc */
+  .hidden { display:none !important; }
+  .muted { font-size:11px; color:#555; }
+  .hint { font-size:11px; color:#666; line-height:1.5; }
+  .err { color:#e94560; }
+  .ok { color:#4ecca3; }
+  a { color:#4ecca3; }
+</style>
+</head><body>
+<div class="dash">
+
+  <!-- Header -->
+  <div class="hdr">
+    <h1>PMA</h1>
+    <span class="badge" id="env-badge"></span>
+  </div>
+
+  <!-- Action buttons -->
+  <div class="btn-row">
+    <button class="btn btn-p" onclick="openProjector()">Projector</button>
+    <button class="btn btn-s" onclick="openScope()">Scope</button>
+  </div>
+
+  <!-- Preview -->
+  <details open>
+    <summary>Preview</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Output</span>
+        <label class="toggle"><input type="checkbox" checked id="p-preview_enabled" onchange="toggleOutputPreview(this.checked)" /><span class="slider"></span></label>
+      </div>
+      <div class="preview" id="preview-wrap"><img id="preview" src="/frame" /></div>
+      <div class="ctrl">
+        <span class="ctrl-label">VACE Input</span>
+        <label class="toggle"><input type="checkbox" checked id="p-input_preview_enabled" onchange="toggleInputPreview(this.checked)" /><span class="slider"></span></label>
+      </div>
+      <div class="preview hidden" id="input-preview-wrap">
+        <img id="input-preview" />
+      </div>
+    </div>
+  </details>
+
+  <!-- Calibration -->
+  <details>
+    <summary>Calibration</summary>
+    <div class="sec">
+      <div class="sc-wrap hidden" id="sc-video-wrap">
+        <video id="sc-video" autoplay playsinline muted></video>
+        <canvas id="sc-canvas"></canvas>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-s btn-sm" id="sc-webcam-btn" onclick="scToggleWebcam()">Webcam</button>
+        <button class="btn btn-p btn-sm" id="sc-start-btn" onclick="scStartCalibration()" disabled>Start</button>
+        <button class="btn btn-s btn-sm hidden" id="sc-stop-btn" onclick="scStopCalibration()">Cancel</button>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Proj W</span>
+        <input type="number" id="sc-proj-w" value="1920" min="320" max="7680" />
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Proj H</span>
+        <input type="number" id="sc-proj-h" value="1080" min="240" max="4320" />
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Brightness</span>
+        <input type="number" id="sc-brightness" value="128" min="10" max="255" />
+      </div>
+      <div class="hint" id="sc-status">Enable webcam for standalone calibration</div>
+      <!-- Progress -->
+      <div id="calib-progress" class="hidden">
+        <div class="prog-wrap">
+          <div class="prog-bar" id="calib-bar" style="width:0%"></div>
+          <div class="prog-text" id="calib-pct">0%</div>
+        </div>
+        <div class="muted" id="calib-detail"></div>
+      </div>
+      <div class="hint" id="calib-idle">Idle</div>
+    </div>
+  </details>
+
+  <!-- Depth -->
+  <details>
+    <summary>Depth</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Mode</span>
+        <select onchange="param('depth_mode',this.value)" id="p-depth_mode">
+          <option value="structured_light">Structured Light</option>
+          <option value="canny">Canny Edges</option>
+          <option value="depth_then_warp">Depth then Warp</option>
+          <option value="warp_then_depth">Warp then Depth</option>
+          <option value="warped_rgb">Warped RGB</option>
+          <option value="static_depth_warped">Static Depth (warped)</option>
+          <option value="static_depth_from_warped">Static Depth (from warped)</option>
+          <option value="static_warped_camera">Static Warped Camera</option>
+          <option value="custom">Custom Upload</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Smoothing</span>
+        <input type="range" min="0" max="0.99" step="0.05" value="0.5"
+               oninput="param('temporal_smoothing',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-temporal_smoothing" />
+        <span class="range-val">0.50</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Blur</span>
+        <input type="range" min="0" max="20" step="0.5" value="0"
+               oninput="param('depth_blur',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(1)" id="p-depth_blur" />
+        <span class="range-val">0.0</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Erosion</span>
+        <input type="range" min="0" max="50" step="1" value="0"
+               oninput="param('edge_erosion',+this.value);this.nextElementSibling.textContent=this.value" id="p-edge_erosion" />
+        <span class="range-val">0</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Contrast</span>
+        <input type="range" min="0.5" max="5" step="0.1" value="1"
+               oninput="param('depth_contrast',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(1)" id="p-depth_contrast" />
+        <span class="range-val">1.0</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Near Clip</span>
+        <input type="range" min="0" max="1" step="0.01" value="0"
+               oninput="param('depth_near_clip',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-depth_near_clip" />
+        <span class="range-val">0.00</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Far Clip</span>
+        <input type="range" min="0" max="1" step="0.01" value="1"
+               oninput="param('depth_far_clip',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-depth_far_clip" />
+        <span class="range-val">1.00</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Edge Blend</span>
+        <input type="range" min="0" max="1" step="0.05" value="0"
+               oninput="param('edge_blend',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-edge_blend" />
+        <span class="range-val">0.00</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Edge Method</span>
+        <select onchange="param('edge_method',this.value)" id="p-edge_method">
+          <option value="sobel">Sobel</option>
+          <option value="canny">Canny</option>
+        </select>
+      </div>
+    </div>
+  </details>
+
+  <!-- Effects -->
+  <details>
+    <summary>Effects</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Effect</span>
+        <select onchange="param('active_effect',this.value)" id="p-active_effect">
+          <option value="none">None</option>
+          <option value="noise_blend">Noise Blend</option>
+          <option value="flow_warp">Flow Warp</option>
+          <option value="pulse">Pulse</option>
+          <option value="wave_warp">Wave Warp</option>
+          <option value="kaleido">Kaleido</option>
+          <option value="shockwave">Shockwave</option>
+          <option value="wobble">Wobble</option>
+          <option value="geometry_edges">Geometry Edges</option>
+          <option value="depth_fog">Depth Fog</option>
+          <option value="radial_zoom">Radial Zoom</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Intensity</span>
+        <input type="range" min="0" max="2" step="0.05" value="0.5"
+               oninput="param('effect_intensity',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-effect_intensity" />
+        <span class="range-val">0.50</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Speed</span>
+        <input type="range" min="0" max="5" step="0.1" value="1"
+               oninput="param('effect_speed',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(1)" id="p-effect_speed" />
+        <span class="range-val">1.0</span>
+      </div>
+    </div>
+  </details>
+
+  <!-- Subject Isolation -->
+  <details>
+    <summary>Subject</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Mode</span>
+        <select onchange="param('subject_isolation',this.value)" id="p-subject_isolation">
+          <option value="none">None</option>
+          <option value="depth_band">Depth Band</option>
+          <option value="mask">Custom Mask</option>
+          <option value="rembg">RemBG (AI)</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Depth Range</span>
+        <input type="range" min="0.05" max="1" step="0.05" value="0.3"
+               oninput="param('subject_depth_range',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-subject_depth_range" />
+        <span class="range-val">0.30</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Feather</span>
+        <input type="range" min="0" max="30" step="1" value="5"
+               oninput="param('subject_feather',+this.value);this.nextElementSibling.textContent=this.value" id="p-subject_feather" />
+        <span class="range-val">5</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Invert</span>
+        <label class="toggle"><input type="checkbox" onchange="param('invert_subject_mask',this.checked)" id="p-invert_subject_mask" /><span class="slider"></span></label>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Edge Feather</span>
+        <input type="range" min="0" max="50" step="1" value="0"
+               oninput="param('edge_feather',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(0)" id="p-edge_feather" />
+        <span class="range-val">0</span>
+      </div>
+    </div>
+  </details>
+
+  <!-- Legacy Postprocessor Output -->
+  <details>
+    <summary>Output (Postprocessor)</summary>
+    <div class="sec">
+      <div class="hint">Only applies when using the legacy Projector postprocessor.</div>
+      <div class="ctrl">
+        <span class="ctrl-label">Upscale</span>
+        <label class="toggle"><input type="checkbox" checked onchange="param('upscale_to_projector',this.checked)" id="p-upscale_to_projector" /><span class="slider"></span></label>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Subject Mask</span>
+        <label class="toggle"><input type="checkbox" onchange="param('apply_subject_mask',this.checked)" id="p-apply_subject_mask" /><span class="slider"></span></label>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Brightness</span>
+        <input type="range" min="-0.5" max="0.5" step="0.01" value="0"
+               oninput="param('brightness',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-brightness" />
+        <span class="range-val">0.00</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Gamma</span>
+        <input type="range" min="0.2" max="3" step="0.05" value="1"
+               oninput="param('gamma',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-gamma" />
+        <span class="range-val">1.00</span>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Contrast</span>
+        <input type="range" min="0.5" max="2" step="0.05" value="1"
+               oninput="param('contrast',+this.value);this.nextElementSibling.textContent=Number(this.value).toFixed(2)" id="p-contrast" />
+        <span class="range-val">1.00</span>
+      </div>
+    </div>
+  </details>
+
+  <!-- Upload -->
+  <details>
+    <summary>Upload</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Stage</span>
+        <select id="upload-stage">
+          <option value="depth_warped">Depth (warped)</option>
+          <option value="depth_estimated">Depth (needs warp)</option>
+          <option value="raw_camera">Raw camera</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Type</span>
+        <select id="upload-type">
+          <option value="depth">Depth Map</option>
+          <option value="mask">Isolation Mask</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <input type="file" id="upload-file" accept="image/*" style="flex:1;font-size:11px;color:#aaa;" />
+        <button class="btn btn-s btn-sm" onclick="uploadCustom()">Upload</button>
+      </div>
+      <div class="hint" id="upload-status"></div>
+    </div>
+  </details>
+
+  <!-- Results -->
+  <details class="hidden" id="results-section">
+    <summary>Results</summary>
+    <div class="sec">
+      <div class="muted" id="result-meta"></div>
+      <div class="thumb-row" id="result-thumbs"></div>
+      <div id="result-files"></div>
+      <button class="btn btn-s btn-sm" onclick="downloadAll()">Download All</button>
+    </div>
+  </details>
+
+  <!-- Status -->
+  <details>
+    <summary>Status</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Projector</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div class="dot" id="proj-dot"></div>
+          <span class="muted" id="proj-status">Checking...</span>
+        </div>
+      </div>
+      <div class="muted" id="proj-resolution"></div>
+      <div class="btn-row">
+        <button class="btn btn-s btn-sm" onclick="exportCalibration()">Export .zip</button>
+        <label class="btn btn-s btn-sm" style="cursor:pointer;">
+          Import .zip
+          <input type="file" id="import-file" accept=".zip" style="display:none;" onchange="importCalibration()" />
+        </label>
+      </div>
+      <div class="hint" id="transfer-status"></div>
+      <div class="ctrl">
+        <span class="ctrl-label">Scope</span>
+        <input type="text" id="scope-url" placeholder="Scope URL" spellcheck="false" />
+      </div>
+      <div class="muted">
+        <a href="/projector" target="_blank">/projector</a> &middot;
+        <a href="/stream" target="_blank">/stream</a> &middot;
+        <a href="/frame" target="_blank">/frame</a> &middot;
+        <a href="/calibration/status" target="_blank">/status</a>
+      </div>
+    </div>
+  </details>
+
+</div>
+
+<script>
+// -- Helpers --
+const host = location.hostname;
+const isRunPod = host.includes('.proxy.runpod.net');
+const badge = document.getElementById('env-badge');
+badge.textContent = isRunPod ? 'RunPod' : 'Local';
+badge.className = 'badge ' + (isRunPod ? 'badge-remote' : 'badge-local');
+
+// -- Parameter API --
+function param(key, val) {
+  const body = {}; body[key] = val;
+  fetch('/api/params', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).catch(() => {});
+}
+
+// Load current params and sync UI
+async function loadParams() {
+  try {
+    const r = await fetch('/api/params');
+    const p = await r.json();
+    for (const [k, v] of Object.entries(p)) {
+      const el = document.getElementById('p-' + k);
+      if (!el) continue;
+      if (el.type === 'checkbox') {
+        el.checked = !!v;
+        el.dispatchEvent(new Event('change'));
+      } else if (el.type === 'range') {
+        el.value = v;
+        const rv = el.nextElementSibling;
+        if (rv) rv.textContent = typeof v === 'number' ? (v % 1 === 0 ? v : Number(v).toFixed(2)) : v;
+      } else el.value = v;
+    }
+  } catch {}
+}
+loadParams();
+
+// -- Scope URL --
+const scopeInput = document.getElementById('scope-url');
+const savedScope = localStorage.getItem('pma_scope_url');
+if (savedScope) scopeInput.value = savedScope;
+else if (isRunPod) {
+  const m = host.match(/^(.+)-\d+\.proxy\.runpod\.net$/);
+  if (m) scopeInput.value = 'https://' + m[1] + '-8000.proxy.runpod.net';
+} else scopeInput.value = 'http://localhost:8000';
+
+function openScope() {
+  const url = scopeInput.value.trim();
+  if (url) { localStorage.setItem('pma_scope_url', url); window.open(url, '_blank'); }
+}
+function openProjector() {
+  const w = window.open('/projector', 'promap-projector',
+    'width=960,height=540,menubar=no,toolbar=no,location=no,status=no');
+  if (w) w.focus();
+}
+
+// -- Preview --
+let outputPreviewOn = true;
+let inputPreviewOn = true;
+
+function toggleOutputPreview(on) {
+  outputPreviewOn = on;
+  param('preview_enabled', on);
+  const wrap = document.getElementById('preview-wrap');
+  wrap.classList.toggle('hidden', !on);
+  if (!on) document.getElementById('preview').removeAttribute('src');
+}
+
+function toggleInputPreview(on) {
+  inputPreviewOn = on;
+  param('input_preview_enabled', on);
+  if (!on) document.getElementById('input-preview-wrap').classList.add('hidden');
+}
+
+setInterval(() => {
+  if (outputPreviewOn) document.getElementById('preview').src = '/frame?t=' + Date.now();
+}, 2000);
+
+let inputActive = false;
+async function checkInput() {
+  if (!inputPreviewOn) return;
+  try {
+    const r = await fetch('/input-frame', { method: 'HEAD' });
+    const wrap = document.getElementById('input-preview-wrap');
+    if (r.status === 200) {
+      wrap.classList.remove('hidden');
+      document.getElementById('input-preview').src = '/input-frame?t=' + Date.now();
+      inputActive = true;
+    } else if (inputActive) { wrap.classList.add('hidden'); inputActive = false; }
+  } catch {}
+}
+setInterval(checkInput, 3000);
+
+// -- Projector status --
+function updateProj() {
+  fetch('/config').then(r => r.json()).then(cfg => {
+    const dot = document.getElementById('proj-dot');
+    const st = document.getElementById('proj-status');
+    const res = document.getElementById('proj-resolution');
+    if (cfg && cfg.width) {
+      dot.className = 'dot dot-g'; st.textContent = 'Connected';
+      res.textContent = cfg.width + ' x ' + cfg.height;
+    } else { dot.className = 'dot dot-y'; st.textContent = 'Waiting...'; res.textContent = ''; }
+  }).catch(() => {
+    document.getElementById('proj-dot').className = 'dot dot-r';
+    document.getElementById('proj-status').textContent = 'Offline';
+  });
+}
+updateProj(); setInterval(updateProj, 5000);
+
+// -- Calibration polling --
+let resultFiles = [];
+let lastCalibTs = '';
+
+function triggerDl(name) {
+  const a = document.createElement('a');
+  a.href = '/calibration/download/' + encodeURIComponent(name);
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+}
+function downloadAll() { let d = 0; resultFiles.forEach(n => { setTimeout(() => triggerDl(n), d); d += 300; }); }
+
+function updateCalib(data) {
+  const prog = document.getElementById('calib-progress');
+  const idle = document.getElementById('calib-idle');
+  const results = document.getElementById('results-section');
+
+  if (data.active && !data.complete) {
+    prog.classList.remove('hidden'); idle.classList.add('hidden');
+    const pct = Math.round(data.progress * 100);
+    document.getElementById('calib-bar').style.width = pct + '%';
+    document.getElementById('calib-pct').textContent = pct + '%';
+    document.getElementById('calib-detail').textContent =
+      (data.phase || '') + ' ' + (data.pattern_info || '');
+  } else {
+    prog.classList.add('hidden'); idle.classList.remove('hidden');
+    idle.textContent = data.complete ? 'Calibration complete' : 'Idle';
+  }
+
+  if (data.complete && data.files && data.files.length > 0) {
+    results.classList.remove('hidden');
+    resultFiles = data.files;
+    const meta = document.getElementById('result-meta');
+    let txt = '';
+    if (data.timestamp) txt += new Date(data.timestamp).toLocaleString();
+    if (data.coverage_pct > 0) txt += ' \u2014 ' + data.coverage_pct.toFixed(1) + '% coverage';
+    meta.textContent = txt;
+
+    if (data.timestamp !== lastCalibTs) {
+      lastCalibTs = data.timestamp;
+      const filesDiv = document.getElementById('result-files');
+      filesDiv.innerHTML = '';
+      data.files.forEach(name => {
+        const row = document.createElement('div');
+        row.className = 'file-row';
+        row.innerHTML = '<span class="file-name">' + name + '</span>' +
+          '<button class="btn btn-s btn-sm" onclick="triggerDl(\'' +
+          name.replace(/'/g, "\\'") + '\')">DL</button>';
+        filesDiv.appendChild(row);
+      });
+      const thumbDiv = document.getElementById('result-thumbs');
+      thumbDiv.innerHTML = '';
+      data.files.filter(n => n.endsWith('.png')).forEach(name => {
+        const t = document.createElement('div');
+        t.className = 'thumb'; t.title = name;
+        t.onclick = () => window.open('/calibration/preview/' + encodeURIComponent(name), '_blank');
+        t.innerHTML = '<img src="/calibration/preview/' + encodeURIComponent(name) + '?t=' + Date.now() + '" />';
+        thumbDiv.appendChild(t);
+      });
+    }
+  } else { results.classList.add('hidden'); }
+}
+
+let calibIsActive = false;
+async function calibPoll() {
+  try {
+    const data = await (await fetch('/calibration/status')).json();
+    calibIsActive = data.active && !data.complete;
+    updateCalib(data);
+  } catch {}
+  setTimeout(calibPoll, calibIsActive ? 1000 : 3000);
+}
+calibPoll();
+
+// -- Upload --
+async function uploadCustom() {
+  const f = document.getElementById('upload-file');
+  const st = document.getElementById('upload-status');
+  if (!f.files || !f.files[0]) { st.textContent = 'No file selected'; st.className = 'hint err'; return; }
+  st.textContent = 'Uploading...'; st.className = 'hint';
+  try {
+    const stage = document.getElementById('upload-stage').value;
+    const type = document.getElementById('upload-type').value;
+    const buf = await f.files[0].arrayBuffer();
+    const r = await fetch('/upload?stage=' + stage + '&type=' + type, {
+      method: 'POST', headers: {'Content-Type': 'application/octet-stream'}, body: buf
+    });
+    const d = await r.json();
+    if (d.ok) { st.textContent = 'Uploaded: ' + d.filename; st.className = 'hint ok'; }
+    else { st.textContent = 'Failed: ' + (d.error || ''); st.className = 'hint err'; }
+  } catch (e) { st.textContent = 'Error: ' + e.message; st.className = 'hint err'; }
+}
+
+// -- Webcam calibration --
+let scStream = null, scRunning = false, scWebcamOn = false;
+
+async function scToggleWebcam() {
+  const video = document.getElementById('sc-video');
+  const wrap = document.getElementById('sc-video-wrap');
+  const btn = document.getElementById('sc-webcam-btn');
+  const startBtn = document.getElementById('sc-start-btn');
+  const st = document.getElementById('sc-status');
+
+  if (scWebcamOn) {
+    if (scStream) { scStream.getTracks().forEach(t => t.stop()); scStream = null; }
+    video.srcObject = null; wrap.classList.add('hidden');
+    btn.textContent = 'Webcam'; startBtn.disabled = true; scWebcamOn = false;
+    st.textContent = 'Webcam disabled'; return;
+  }
+  try {
+    st.textContent = 'Requesting camera...';
+    scStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = scStream; wrap.classList.remove('hidden');
+    btn.textContent = 'Stop Cam'; startBtn.disabled = false; scWebcamOn = true;
+    st.textContent = 'Ready. Open projector, then Start.';
+    try {
+      const cfg = await (await fetch('/config')).json();
+      if (cfg && cfg.width) {
+        document.getElementById('sc-proj-w').value = cfg.width;
+        document.getElementById('sc-proj-h').value = cfg.height;
+      }
+    } catch {}
+  } catch (e) { st.textContent = 'Camera error: ' + e.message; st.className = 'hint err'; }
+}
+
+async function scStartCalibration() {
+  if (!scWebcamOn || scRunning) return;
+  const st = document.getElementById('sc-status');
+  const config = {
+    proj_w: parseInt(document.getElementById('sc-proj-w').value) || 1920,
+    proj_h: parseInt(document.getElementById('sc-proj-h').value) || 1080,
+    max_brightness: parseInt(document.getElementById('sc-brightness').value) || 128,
+  };
+  st.textContent = 'Starting...';
+  try {
+    const r = await fetch('/calibrate/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(config)
+    });
+    const d = await r.json();
+    if (!d.ok) { st.textContent = 'Failed: ' + (d.error || ''); return; }
+    openProjector();
+    scRunning = true;
+    document.getElementById('sc-start-btn').disabled = true;
+    document.getElementById('sc-stop-btn').classList.remove('hidden');
+    st.textContent = 'Calibrating... ' + d.total_patterns + ' patterns';
+    scCaptureLoop();
+  } catch (e) { st.textContent = 'Error: ' + e.message; }
+}
+
+async function scCaptureLoop() {
+  if (!scRunning) return;
+  const video = document.getElementById('sc-video');
+  const canvas = document.getElementById('sc-canvas');
+  const st = document.getElementById('sc-status');
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+  const ctx = canvas.getContext('2d');
+
+  while (scRunning) {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    try {
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+      if (!blob || !scRunning) break;
+      const r = await fetch('/calibrate/frame', {
+        method: 'POST', headers: {'Content-Type': 'application/octet-stream'}, body: blob
+      });
+      const d = await r.json();
+      if (d.error) { st.textContent = 'Error: ' + d.error; }
+      else if (d.done) {
+        scRunning = false;
+        st.textContent = 'Complete!' + (d.coverage_pct ? ' (' + d.coverage_pct.toFixed(1) + '%)' : '');
+        st.className = 'hint ok';
+        document.getElementById('sc-start-btn').disabled = false;
+        document.getElementById('sc-stop-btn').classList.add('hidden');
+        break;
+      } else {
+        let msg = d.phase + ' ' + (d.pattern_info || '') + ' (' + Math.round((d.progress || 0) * 100) + '%)';
+        if (d.settling) msg += ' [settling]';
+        st.textContent = msg;
+      }
+    } catch (e) { st.textContent = 'Frame error: ' + e.message; }
+    await new Promise(r => setTimeout(r, 80));
+  }
+}
+
+async function scStopCalibration() {
+  scRunning = false;
+  try { await fetch('/calibrate/stop', { method: 'POST' }); } catch {}
+  document.getElementById('sc-status').textContent = 'Cancelled';
+  document.getElementById('sc-start-btn').disabled = !scWebcamOn;
+  document.getElementById('sc-stop-btn').classList.add('hidden');
+}
+
+// -- Transfer --
+function exportCalibration() {
+  const st = document.getElementById('transfer-status');
+  st.textContent = 'Exporting...'; st.className = 'hint';
+  fetch('/calibration/export').then(r => {
+    if (!r.ok) throw new Error('No calibration');
+    return r.blob();
+  }).then(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'pma_calibration.zip';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href);
+    st.textContent = 'Exported'; st.className = 'hint ok';
+  }).catch(e => { st.textContent = 'Failed: ' + e.message; st.className = 'hint err'; });
+}
+
+async function importCalibration() {
+  const f = document.getElementById('import-file');
+  const st = document.getElementById('transfer-status');
+  if (!f.files || !f.files[0]) return;
+  st.textContent = 'Importing...'; st.className = 'hint';
+  try {
+    const buf = await f.files[0].arrayBuffer();
+    const r = await fetch('/calibration/import', {
+      method: 'POST', headers: {'Content-Type': 'application/zip'}, body: buf
+    });
+    const d = await r.json();
+    if (d.ok) { st.textContent = 'Imported ' + d.files + ' files'; st.className = 'hint ok'; }
+    else { st.textContent = 'Failed: ' + (d.error || ''); st.className = 'hint err'; }
+  } catch (e) { st.textContent = 'Error: ' + e.message; st.className = 'hint err'; }
+  f.value = '';
+}
+</script>
+</body></html>

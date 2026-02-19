@@ -33,8 +33,11 @@ def register_pipelines(register):
         ProMapAnythingProjectorPipeline,
     )
 
-    register(ProMapAnythingCalibratePipeline)
+    # Primary pipeline — handles calibration + depth conditioning
     register(ProMapAnythingPipeline)
+    # Calibration visualization (main pipeline slot)
+    register(ProMapAnythingCalibratePipeline)
+    # Legacy: MJPEG delivery of AI output (deprecated — use WebRTC client)
     register(ProMapAnythingProjectorPipeline)
 
     # Start pre-cache AFTER registration completes

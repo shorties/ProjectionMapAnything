@@ -136,773 +136,7 @@ setInterval(postConfig, 30000);
 </body></html>
 """
 
-_CONTROL_PANEL_HTML = """\
-<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<title>ProjectionMapAnything</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#1a1a2e; color:#e0e0e0;
-         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         min-height:100vh; padding:24px; }
-  .container { max-width:720px; margin:0 auto; display:flex;
-               flex-direction:column; gap:20px; }
-
-  /* Header */
-  .header { display:flex; align-items:center; justify-content:space-between; }
-  h1 { font-size:22px; color:#e94560; }
-  .env-badge { display:inline-block; padding:2px 8px; border-radius:4px;
-               font-size:11px; font-weight:600; margin-left:8px; }
-  .env-local { background:#1a4a1a; color:#4ecca3; }
-  .env-remote { background:#4a1a1a; color:#e94560; }
-
-  /* Buttons row */
-  .btn-row { display:flex; gap:10px; flex-wrap:wrap; }
-  .btn { padding:10px 20px; border:none; border-radius:8px;
-         font-size:14px; font-weight:600; cursor:pointer; transition:background 0.2s; }
-  .btn-primary { background:#e94560; color:#fff; box-shadow:0 2px 12px rgba(233,69,96,0.3); }
-  .btn-primary:hover { background:#c73652; }
-  .btn-secondary { background:#0f3460; color:#ddd; }
-  .btn-secondary:hover { background:#1a4a80; }
-
-  /* Cards */
-  .card { background:#16213e; border-radius:10px; padding:16px; }
-  .card h2 { font-size:14px; color:#888; text-transform:uppercase;
-             letter-spacing:1px; margin-bottom:12px; }
-
-  /* Live preview */
-  .preview { border-radius:8px; overflow:hidden; background:#000;
-             width:100%; aspect-ratio:16/9; }
-  .preview img { width:100%; height:100%; object-fit:contain; display:block; }
-
-  /* Progress bar */
-  .progress-wrap { background:#0d1b2e; border-radius:6px; height:22px;
-                   overflow:hidden; position:relative; }
-  .progress-bar { height:100%; background:linear-gradient(90deg, #4ecca3, #36b88e);
-                  border-radius:6px; transition:width 0.3s ease; min-width:0; }
-  .progress-text { position:absolute; inset:0; display:flex;
-                   align-items:center; justify-content:center;
-                   font-size:11px; font-weight:600; color:#fff; }
-  .calib-detail { font-size:12px; color:#aaa; margin-top:8px; line-height:1.6; }
-  .calib-detail .label { color:#666; }
-  .calib-errors { color:#e94560; font-size:12px; margin-top:6px; }
-  .calib-idle { color:#555; font-size:13px; font-style:italic; }
-
-  /* Results */
-  .result-meta { font-size:12px; color:#888; margin-bottom:12px; }
-  .file-list { display:flex; flex-direction:column; gap:6px; }
-  .file-row { display:flex; align-items:center; justify-content:space-between;
-              background:#0d1b2e; border-radius:6px; padding:8px 12px; }
-  .file-name { font-size:13px; font-family:monospace; color:#ddd; }
-  .file-icon { margin-right:6px; }
-  .dl-btn { padding:4px 12px; border:none; border-radius:4px;
-            background:#4ecca3; color:#000; font:bold 11px sans-serif;
-            cursor:pointer; transition:background 0.2s; }
-  .dl-btn:hover { background:#3db893; }
-  .result-actions { display:flex; gap:8px; margin-top:10px; }
-  .btn-dl-all { padding:8px 18px; border:none; border-radius:6px;
-                background:#e94560; color:#fff; font:bold 13px sans-serif;
-                cursor:pointer; }
-  .btn-dl-all:hover { background:#c73652; }
-
-  /* Thumbnails */
-  .thumb-row { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .thumb { width:140px; height:80px; border-radius:6px; overflow:hidden;
-           background:#0d1b2e; cursor:pointer; border:2px solid transparent;
-           transition:border-color 0.2s; }
-  .thumb:hover { border-color:#4ecca3; }
-  .thumb img { width:100%; height:100%; object-fit:cover; }
-
-  /* Projector status */
-  .status-row { display:flex; align-items:center; gap:8px; font-size:13px; }
-  .dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-  .dot.green { background:#4ecca3; box-shadow:0 0 6px #4ecca3; }
-  .dot.yellow { background:#f0c040; box-shadow:0 0 6px #f0c040; }
-  .dot.red { background:#e94560; }
-  .status-detail { font-size:11px; color:#666; margin-top:2px; }
-
-  /* Scope section */
-  .scope-row { display:flex; align-items:center; gap:8px; }
-  .scope-row input { flex:1; padding:6px 10px; border:1px solid #333; border-radius:4px;
-                     background:#0d1b2e; color:#fff; font-size:12px; outline:none; }
-  .scope-row input:focus { border-color:#e94560; }
-
-  /* Footer links */
-  .links { font-size:12px; color:#555; text-align:center; }
-  .links a { color:#4ecca3; }
-
-  /* Hidden */
-  .hidden { display:none !important; }
-
-  /* Standalone calibration */
-  .sc-video-wrap { position:relative; border-radius:8px; overflow:hidden;
-                   background:#000; width:100%; aspect-ratio:16/9; }
-  .sc-video-wrap video { width:100%; height:100%; object-fit:contain; display:block; }
-  .sc-video-wrap canvas { display:none; }
-  .sc-controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
-  .sc-controls label { font-size:12px; color:#aaa; }
-  .sc-controls input[type=number] { width:70px; padding:4px 6px; background:#0d1b2e;
-    color:#fff; border:1px solid #333; border-radius:4px; font-size:12px; }
-  .sc-status { font-size:12px; color:#888; margin-top:8px; min-height:18px; }
-  .sc-status.error { color:#e94560; }
-  .sc-status.success { color:#4ecca3; }
-</style>
-</head><body>
-<div class="container">
-
-  <!-- Header -->
-  <div class="header">
-    <h1>ProjectionMapAnything <span class="env-badge" id="env-badge"></span></h1>
-  </div>
-
-  <!-- Action buttons -->
-  <div class="btn-row">
-    <button class="btn btn-primary" onclick="openProjector()">Open Projector Window</button>
-    <button class="btn btn-secondary" onclick="openScope()">Open Scope</button>
-  </div>
-
-  <!-- Live Preview -->
-  <div class="card">
-    <h2>Live Preview</h2>
-    <div class="preview">
-      <img id="preview" src="/frame" />
-    </div>
-  </div>
-
-  <!-- VACE Input Preview (hidden until preprocessor feeds frames) -->
-  <div class="card hidden" id="input-preview-card">
-    <h2>VACE Input (preprocessor output)</h2>
-    <div class="preview">
-      <img id="input-preview" />
-    </div>
-  </div>
-
-  <!-- Standalone Calibration (browser webcam) -->
-  <div class="card">
-    <h2>Standalone Calibration</h2>
-    <div class="sc-video-wrap" id="sc-video-wrap" style="display:none;">
-      <video id="sc-video" autoplay playsinline muted></video>
-      <canvas id="sc-canvas"></canvas>
-    </div>
-    <div class="sc-controls">
-      <button class="btn btn-secondary" id="sc-webcam-btn" onclick="scToggleWebcam()">Enable Webcam</button>
-      <button class="btn btn-primary" id="sc-start-btn" onclick="scStartCalibration()" disabled>Start Calibration</button>
-      <button class="btn btn-secondary" id="sc-stop-btn" onclick="scStopCalibration()" style="display:none;">Cancel</button>
-    </div>
-    <div class="sc-controls">
-      <label>Proj W: <input type="number" id="sc-proj-w" value="1920" min="320" max="7680" /></label>
-      <label>Proj H: <input type="number" id="sc-proj-h" value="1080" min="240" max="4320" /></label>
-      <label>Brightness: <input type="number" id="sc-brightness" value="128" min="10" max="255" /></label>
-    </div>
-    <div class="sc-status" id="sc-status">Enable webcam to begin standalone calibration (no Scope required)</div>
-  </div>
-
-  <!-- Calibration Status -->
-  <div class="card" id="calib-status-card">
-    <h2>Calibration Status</h2>
-    <div id="calib-idle" class="calib-idle">Idle &mdash; use Standalone Calibration above or toggle Start Calibration in Scope</div>
-    <div id="calib-active" class="hidden">
-      <div class="progress-wrap">
-        <div class="progress-bar" id="calib-bar" style="width:0%"></div>
-        <div class="progress-text" id="calib-pct">0%</div>
-      </div>
-      <div class="calib-detail">
-        <div><span class="label">Phase:</span> <span id="calib-phase">---</span></div>
-        <div><span class="label">Pattern:</span> <span id="calib-pattern">---</span></div>
-      </div>
-      <div class="calib-errors hidden" id="calib-errors"></div>
-    </div>
-  </div>
-
-  <!-- Calibration Results -->
-  <div class="card hidden" id="calib-results-card">
-    <h2>Calibration Results</h2>
-    <div class="result-meta" id="result-meta"></div>
-    <div class="file-list" id="result-files"></div>
-    <div class="result-actions">
-      <button class="btn-dl-all" onclick="downloadAll()">Download All</button>
-    </div>
-    <div class="thumb-row" id="result-thumbs"></div>
-  </div>
-
-  <!-- Calibration Transfer -->
-  <div class="card">
-    <h2>Calibration Transfer</h2>
-    <div style="display:flex; flex-direction:column; gap:10px;">
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <button class="btn btn-secondary" onclick="exportCalibration()" style="white-space:nowrap;">Export Calibration (.zip)</button>
-        <label class="btn btn-secondary" style="white-space:nowrap; cursor:pointer;">
-          Import Calibration (.zip)
-          <input type="file" id="import-file" accept=".zip" style="display:none;" onchange="importCalibration()" />
-        </label>
-      </div>
-      <div id="transfer-status" style="font-size:12px; color:#666;"></div>
-    </div>
-  </div>
-
-  <!-- Custom Depth Upload -->
-  <div class="card">
-    <h2>Custom Depth Map</h2>
-    <div style="display:flex; flex-direction:column; gap:10px;">
-      <div style="display:flex; gap:8px; align-items:center;">
-        <select id="upload-stage" style="padding:6px 10px; background:#0d1b2e; color:#fff; border:1px solid #333; border-radius:4px; font-size:12px;">
-          <option value="depth_warped">Depth (warped, ready)</option>
-          <option value="depth_estimated">Depth (needs warp)</option>
-          <option value="raw_camera">Raw camera (needs depth+warp)</option>
-        </select>
-        <select id="upload-type" style="padding:6px 10px; background:#0d1b2e; color:#fff; border:1px solid #333; border-radius:4px; font-size:12px;">
-          <option value="depth">Depth Map</option>
-          <option value="mask">Isolation Mask</option>
-        </select>
-      </div>
-      <div style="display:flex; gap:8px; align-items:center;">
-        <input type="file" id="upload-file" accept="image/*" style="flex:1; font-size:12px; color:#aaa;" />
-        <button class="btn btn-secondary" onclick="uploadCustom()" style="white-space:nowrap;">Upload</button>
-      </div>
-      <div id="upload-status" style="font-size:12px; color:#666;"></div>
-      <div id="upload-preview" style="display:none; max-width:200px;">
-        <img id="upload-thumb" style="width:100%; border-radius:4px;" />
-      </div>
-    </div>
-  </div>
-
-  <!-- Projector Status -->
-  <div class="card">
-    <h2>Projector Status</h2>
-    <div class="status-row">
-      <div class="dot" id="proj-dot"></div>
-      <span id="proj-status">Checking...</span>
-    </div>
-    <div class="status-detail" id="proj-resolution"></div>
-  </div>
-
-  <!-- Scope URL -->
-  <div class="card">
-    <h2>Scope Connection</h2>
-    <div class="scope-row">
-      <input type="text" id="scope-url"
-             placeholder="Scope URL (auto-detected or paste RunPod URL)" spellcheck="false" />
-      <button class="btn btn-secondary" onclick="openScope()">Open</button>
-    </div>
-  </div>
-
-  <!-- Dashboard URL (for sharing) -->
-  <div class="card">
-    <h2>Dashboard URL</h2>
-    <div style="font-size:12px; color:#aaa; line-height:1.6;">
-      <div id="dashboard-url-hint"></div>
-    </div>
-  </div>
-
-  <!-- Links -->
-  <div class="links">
-    <a href="/projector" target="_blank">/projector</a> &middot;
-    <a href="/stream" target="_blank">/stream</a> &middot;
-    <a href="/frame" target="_blank">/frame</a> &middot;
-    <a href="/config" target="_blank">/config</a> &middot;
-    <a href="/calibration/status" target="_blank">/calibration/status</a> &middot;
-    <a href="/input-stream" target="_blank">/input-stream</a>
-  </div>
-
-</div>
-
-<script>
-// -- Environment detection --
-const host = window.location.hostname;
-const isRunPod = host.includes('.proxy.runpod.net');
-const badge = document.getElementById('env-badge');
-badge.textContent = isRunPod ? 'RunPod' : 'Local';
-badge.className = 'env-badge ' + (isRunPod ? 'env-remote' : 'env-local');
-
-// -- Scope URL auto-fill --
-const scopeInput = document.getElementById('scope-url');
-const savedScope = localStorage.getItem('pma_scope_url');
-if (savedScope) {
-  scopeInput.value = savedScope;
-} else if (isRunPod) {
-  const m = host.match(/^(.+)-\\d+\\.proxy\\.runpod\\.net$/);
-  if (m) scopeInput.value = 'https://' + m[1] + '-8000.proxy.runpod.net';
-} else {
-  scopeInput.value = 'http://localhost:8000';
-}
-
-// -- Dashboard URL hint (dynamic) --
-(function() {
-  const hintEl = document.getElementById('dashboard-url-hint');
-  const curUrl = window.location.href.replace(/\\/+$/, '');
-  if (isRunPod) {
-    // Build the Scope URL by replacing port in the RunPod proxy URL
-    const scopeUrl = curUrl.replace(/-\\d+\\.proxy\\.runpod\\.net/, '-8000.proxy.runpod.net');
-    hintEl.innerHTML = 'This dashboard: <a href="' + curUrl + '" style="color:#4ecca3;word-break:break-all;">' + curUrl + '</a>' +
-      '<br>Scope UI: <a href="' + scopeUrl + '" target="_blank" style="color:#4ecca3;word-break:break-all;">' + scopeUrl + '</a>' +
-      '<br><span style="color:#666;">Tip: change <b>-8000.</b> to <b>-8765.</b> in the Scope URL to get here.</span>';
-  } else {
-    const dashPort = window.location.port || '8765';
-    hintEl.innerHTML = 'This dashboard: <a href="' + curUrl + '" style="color:#4ecca3;">' + curUrl + '</a>' +
-      '<br>Scope UI: <a href="http://localhost:8000" target="_blank" style="color:#4ecca3;">http://localhost:8000</a>' +
-      '<br><span style="color:#666;">Tip: change <b>:8000</b> to <b>:' + dashPort + '</b> in the Scope URL to get here.</span>';
-  }
-})();
-
-function openScope() {
-  const url = scopeInput.value.trim();
-  if (url) {
-    localStorage.setItem('pma_scope_url', url);
-    window.open(url, '_blank');
-  }
-}
-
-function openProjector() {
-  const w = window.open('/projector', 'promap-projector',
-    'width=960,height=540,menubar=no,toolbar=no,location=no,status=no');
-  if (w) w.focus();
-}
-
-// -- Preview auto-refresh --
-setInterval(() => {
-  document.getElementById('preview').src = '/frame?t=' + Date.now();
-}, 2000);
-
-// Input preview: only poll if the endpoint has content (avoids 204 flicker)
-let inputPreviewActive = false;
-async function checkInputPreview() {
-  try {
-    const r = await fetch('/input-frame', { method: 'HEAD' });
-    if (r.status === 200) {
-      document.getElementById('input-preview-card').classList.remove('hidden');
-      document.getElementById('input-preview').src = '/input-frame?t=' + Date.now();
-      inputPreviewActive = true;
-    } else if (inputPreviewActive) {
-      inputPreviewActive = false;
-      document.getElementById('input-preview-card').classList.add('hidden');
-    }
-  } catch {}
-}
-setInterval(checkInputPreview, 3000);
-
-// -- Projector status polling --
-function updateProjectorStatus() {
-  fetch('/config').then(r => r.json()).then(cfg => {
-    const dot = document.getElementById('proj-dot');
-    const st = document.getElementById('proj-status');
-    const res = document.getElementById('proj-resolution');
-    if (cfg && cfg.width) {
-      dot.className = 'dot green';
-      st.textContent = 'Projector connected';
-      res.textContent = cfg.width + ' x ' + cfg.height +
-        (cfg.monitor_name ? ' (' + cfg.monitor_name + ')' : '');
-    } else {
-      dot.className = 'dot yellow';
-      st.textContent = 'Waiting for projector window...';
-      res.textContent = '';
-    }
-  }).catch(() => {
-    document.getElementById('proj-dot').className = 'dot red';
-    document.getElementById('proj-status').textContent = 'Unreachable';
-    document.getElementById('proj-resolution').textContent = '';
-  });
-}
-updateProjectorStatus();
-setInterval(updateProjectorStatus, 5000);
-
-// -- Calibration status polling --
-let lastCalibTs = '';
-let resultFiles = [];
-
-function triggerDownload(name) {
-  const a = document.createElement('a');
-  a.href = '/calibration/download/' + encodeURIComponent(name);
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-function downloadAll() {
-  let delay = 0;
-  resultFiles.forEach(name => {
-    setTimeout(() => triggerDownload(name), delay);
-    delay += 300;
-  });
-}
-
-function updateCalibrationUI(data) {
-  const idleEl = document.getElementById('calib-idle');
-  const activeEl = document.getElementById('calib-active');
-  const resultsCard = document.getElementById('calib-results-card');
-
-  // Active calibration
-  if (data.active && !data.complete) {
-    idleEl.classList.add('hidden');
-    activeEl.classList.remove('hidden');
-
-    const pct = Math.round(data.progress * 100);
-    document.getElementById('calib-bar').style.width = pct + '%';
-    document.getElementById('calib-pct').textContent = pct + '%';
-    document.getElementById('calib-phase').textContent = data.phase || '---';
-    document.getElementById('calib-pattern').textContent = data.pattern_info || '---';
-
-    const errEl = document.getElementById('calib-errors');
-    if (data.errors && data.errors.length > 0) {
-      errEl.classList.remove('hidden');
-      errEl.textContent = data.errors.join('; ');
-    } else {
-      errEl.classList.add('hidden');
-    }
-  } else if (!data.active && !data.complete) {
-    // Idle
-    idleEl.classList.remove('hidden');
-    activeEl.classList.add('hidden');
-
-    idleEl.textContent = 'Idle \\u2014 use Standalone Calibration above or toggle Start Calibration in Scope';
-  } else {
-    // Complete
-    idleEl.classList.remove('hidden');
-    activeEl.classList.add('hidden');
-    idleEl.textContent = 'Calibration complete';
-  }
-
-  // Results section
-  if (data.complete && data.files && data.files.length > 0) {
-    resultsCard.classList.remove('hidden');
-    resultFiles = data.files;
-
-    // Meta
-    const meta = document.getElementById('result-meta');
-    let metaText = '';
-    if (data.timestamp) {
-      metaText += 'Captured: ' + new Date(data.timestamp).toLocaleString();
-    }
-    if (data.coverage_pct > 0) {
-      metaText += ' \\u2014 Coverage: ' + data.coverage_pct.toFixed(1) + '%';
-    }
-    meta.textContent = metaText;
-
-    // File list (only rebuild if timestamp changed)
-    if (data.timestamp !== lastCalibTs) {
-      lastCalibTs = data.timestamp;
-      const filesDiv = document.getElementById('result-files');
-      filesDiv.innerHTML = '';
-      data.files.forEach(name => {
-        const row = document.createElement('div');
-        row.className = 'file-row';
-        const icon = name.endsWith('.json') ? '\\ud83d\\udcc4' : '\\ud83d\\uddbc';
-        row.innerHTML = '<span class="file-name"><span class="file-icon">' + icon +
-          '</span>' + name + '</span>' +
-          '<button class="dl-btn" onclick="triggerDownload(\\'' +
-          name.replace(/'/g, "\\\\'") + '\\')">Download</button>';
-        filesDiv.appendChild(row);
-      });
-
-      // Thumbnails
-      const thumbDiv = document.getElementById('result-thumbs');
-      thumbDiv.innerHTML = '';
-      data.files.forEach(name => {
-        if (!name.endsWith('.png')) return;
-        const thumb = document.createElement('div');
-        thumb.className = 'thumb';
-        thumb.title = name;
-        thumb.onclick = () => window.open('/calibration/preview/' + encodeURIComponent(name), '_blank');
-        thumb.innerHTML = '<img src="/calibration/preview/' +
-          encodeURIComponent(name) + '?t=' + Date.now() + '" />';
-        thumbDiv.appendChild(thumb);
-      });
-    }
-  } else {
-    resultsCard.classList.add('hidden');
-  }
-}
-
-async function pollCalibration() {
-  try {
-    const r = await fetch('/calibration/status');
-    const data = await r.json();
-    updateCalibrationUI(data);
-  } catch {}
-}
-
-// Adaptive polling: 1s during calibration, 3s otherwise
-let calibActive = false;
-async function calibPoll() {
-  await pollCalibration();
-  setTimeout(calibPoll, calibActive ? 1000 : 3000);
-}
-
-// Override to track active state
-const origUpdate = updateCalibrationUI;
-updateCalibrationUI = function(data) {
-  calibActive = data.active && !data.complete;
-  origUpdate(data);
-};
-
-calibPoll();
-
-// -- Custom depth/mask upload --
-async function uploadCustom() {
-  const fileInput = document.getElementById('upload-file');
-  const stage = document.getElementById('upload-stage').value;
-  const type = document.getElementById('upload-type').value;
-  const statusEl = document.getElementById('upload-status');
-  const previewEl = document.getElementById('upload-preview');
-  const thumbEl = document.getElementById('upload-thumb');
-
-  if (!fileInput.files || !fileInput.files[0]) {
-    statusEl.textContent = 'No file selected';
-    statusEl.style.color = '#e94560';
-    return;
-  }
-
-  statusEl.textContent = 'Uploading...';
-  statusEl.style.color = '#aaa';
-
-  try {
-    const file = fileInput.files[0];
-    const arrayBuf = await file.arrayBuffer();
-    const resp = await fetch('/upload?stage=' + stage + '&type=' + type, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: arrayBuf
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      statusEl.textContent = 'Uploaded: ' + data.filename + ' (stage: ' + data.stage + '). Set depth_mode to "custom" in Scope.';
-      statusEl.style.color = '#4ecca3';
-      // Show preview
-      thumbEl.src = URL.createObjectURL(file);
-      previewEl.style.display = 'block';
-    } else {
-      statusEl.textContent = 'Upload failed: ' + (data.error || 'unknown');
-      statusEl.style.color = '#e94560';
-    }
-  } catch (err) {
-    statusEl.textContent = 'Upload error: ' + err.message;
-    statusEl.style.color = '#e94560';
-  }
-}
-
-// -- Standalone calibration (browser webcam) --
-let scStream = null;       // MediaStream from getUserMedia
-let scRunning = false;     // capture loop active
-let scWebcamOn = false;
-
-async function scToggleWebcam() {
-  const video = document.getElementById('sc-video');
-  const wrap = document.getElementById('sc-video-wrap');
-  const btn = document.getElementById('sc-webcam-btn');
-  const startBtn = document.getElementById('sc-start-btn');
-  const statusEl = document.getElementById('sc-status');
-
-  if (scWebcamOn) {
-    // Turn off
-    if (scStream) { scStream.getTracks().forEach(t => t.stop()); scStream = null; }
-    video.srcObject = null;
-    wrap.style.display = 'none';
-    btn.textContent = 'Enable Webcam';
-    startBtn.disabled = true;
-    scWebcamOn = false;
-    statusEl.textContent = 'Webcam disabled';
-    statusEl.className = 'sc-status';
-    return;
-  }
-
-  try {
-    statusEl.textContent = 'Requesting camera access...';
-    scStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 } }
-    });
-    video.srcObject = scStream;
-    wrap.style.display = 'block';
-    btn.textContent = 'Disable Webcam';
-    startBtn.disabled = false;
-    scWebcamOn = true;
-    statusEl.textContent = 'Webcam ready. Open Projector Window, position it on the projector, then click Start Calibration.';
-    statusEl.className = 'sc-status';
-
-    // Auto-fill projector resolution from /config if available
-    try {
-      const cfg = await (await fetch('/config')).json();
-      if (cfg && cfg.width) {
-        document.getElementById('sc-proj-w').value = cfg.width;
-        document.getElementById('sc-proj-h').value = cfg.height;
-      }
-    } catch {}
-  } catch (err) {
-    statusEl.textContent = 'Camera error: ' + err.message;
-    statusEl.className = 'sc-status error';
-  }
-}
-
-async function scStartCalibration() {
-  if (!scWebcamOn || scRunning) return;
-  const statusEl = document.getElementById('sc-status');
-  const startBtn = document.getElementById('sc-start-btn');
-  const stopBtn = document.getElementById('sc-stop-btn');
-
-  const config = {
-    proj_w: parseInt(document.getElementById('sc-proj-w').value) || 1920,
-    proj_h: parseInt(document.getElementById('sc-proj-h').value) || 1080,
-    max_brightness: parseInt(document.getElementById('sc-brightness').value) || 128,
-  };
-
-  statusEl.textContent = 'Starting calibration...';
-  statusEl.className = 'sc-status';
-
-  try {
-    const resp = await fetch('/calibrate/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
-    });
-    const data = await resp.json();
-    if (!data.ok) {
-      statusEl.textContent = 'Start failed: ' + (data.error || 'unknown');
-      statusEl.className = 'sc-status error';
-      return;
-    }
-
-    // Open projector pop-out
-    openProjector();
-
-    scRunning = true;
-    startBtn.disabled = true;
-    stopBtn.style.display = '';
-    statusEl.textContent = 'Calibrating... ' + data.total_patterns + ' patterns';
-    statusEl.className = 'sc-status';
-
-    // Start capture loop
-    scCaptureLoop();
-  } catch (err) {
-    statusEl.textContent = 'Start error: ' + err.message;
-    statusEl.className = 'sc-status error';
-  }
-}
-
-async function scCaptureLoop() {
-  if (!scRunning) return;
-  const video = document.getElementById('sc-video');
-  const canvas = document.getElementById('sc-canvas');
-  const statusEl = document.getElementById('sc-status');
-
-  canvas.width = video.videoWidth || 1280;
-  canvas.height = video.videoHeight || 720;
-  const ctx = canvas.getContext('2d');
-
-  while (scRunning) {
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    try {
-      const blob = await new Promise(resolve =>
-        canvas.toBlob(resolve, 'image/jpeg', 0.85)
-      );
-      if (!blob || !scRunning) break;
-
-      const resp = await fetch('/calibrate/frame', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: blob,
-      });
-      const data = await resp.json();
-
-      if (data.error) {
-        statusEl.textContent = 'Error: ' + data.error;
-        statusEl.className = 'sc-status error';
-      } else if (data.done) {
-        scRunning = false;
-        const cov = data.coverage_pct ? ' (coverage: ' + data.coverage_pct.toFixed(1) + '%)' : '';
-        statusEl.textContent = 'Calibration complete!' + cov + ' Check results below.';
-        statusEl.className = 'sc-status success';
-        document.getElementById('sc-start-btn').disabled = false;
-        document.getElementById('sc-stop-btn').style.display = 'none';
-        break;
-      } else {
-        let msg = data.phase + ' — ' + (data.pattern_info || '') +
-          ' (' + Math.round((data.progress || 0) * 100) + '%)';
-        if (data.settling) msg += ' [settling]';
-        statusEl.textContent = msg;
-        statusEl.className = 'sc-status';
-      }
-    } catch (err) {
-      statusEl.textContent = 'Frame error: ' + err.message;
-      statusEl.className = 'sc-status error';
-    }
-
-    // Throttle to ~12fps (80ms between frames)
-    await new Promise(r => setTimeout(r, 80));
-  }
-}
-
-async function scStopCalibration() {
-  scRunning = false;
-  const statusEl = document.getElementById('sc-status');
-  try {
-    await fetch('/calibrate/stop', { method: 'POST' });
-    statusEl.textContent = 'Calibration cancelled.';
-    statusEl.className = 'sc-status';
-  } catch {}
-  document.getElementById('sc-start-btn').disabled = !scWebcamOn;
-  document.getElementById('sc-stop-btn').style.display = 'none';
-}
-
-// -- Calibration export/import --
-function exportCalibration() {
-  const statusEl = document.getElementById('transfer-status');
-  statusEl.textContent = 'Exporting...';
-  statusEl.style.color = '#aaa';
-  fetch('/calibration/export')
-    .then(r => {
-      if (!r.ok) throw new Error('No calibration found');
-      return r.blob();
-    })
-    .then(blob => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'projectionmapanything_calibration.zip';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(a.href);
-      statusEl.textContent = 'Calibration exported successfully';
-      statusEl.style.color = '#4ecca3';
-    })
-    .catch(err => {
-      statusEl.textContent = 'Export failed: ' + err.message;
-      statusEl.style.color = '#e94560';
-    });
-}
-
-async function importCalibration() {
-  const fileInput = document.getElementById('import-file');
-  const statusEl = document.getElementById('transfer-status');
-  if (!fileInput.files || !fileInput.files[0]) return;
-
-  statusEl.textContent = 'Importing...';
-  statusEl.style.color = '#aaa';
-
-  try {
-    const file = fileInput.files[0];
-    const arrayBuf = await file.arrayBuffer();
-    const resp = await fetch('/calibration/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/zip' },
-      body: arrayBuf
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      statusEl.textContent = 'Imported ' + data.files + ' files. Reload the depth preprocessor in Scope to use the new calibration.';
-      statusEl.style.color = '#4ecca3';
-    } else {
-      statusEl.textContent = 'Import failed: ' + (data.error || 'unknown');
-      statusEl.style.color = '#e94560';
-    }
-  } catch (err) {
-    statusEl.textContent = 'Import error: ' + err.message;
-    statusEl.style.color = '#e94560';
-  }
-  fileInput.value = '';
-}
-</script>
-</body></html>
-"""
+_CONTROL_PANEL_HTML = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
 
 
 class FrameStreamer:
@@ -964,6 +198,16 @@ class FrameStreamer:
         self._standalone_proj_w: int = 1920
         self._standalone_proj_h: int = 1080
         self._standalone_ambient: np.ndarray | None = None
+
+        # Dashboard parameter overrides — set via POST /api/params,
+        # read by pipelines as kwargs overrides.
+        self._param_overrides: dict = {}
+
+        # Track active MJPEG stream clients (projector pages).
+        # When zero AND dashboard preview is disabled, submit_frame()
+        # skips JPEG encoding entirely to save CPU.
+        self._stream_client_count = 0
+        self._stream_client_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -1461,6 +705,8 @@ class FrameStreamer:
                     self_handler._handle_upload_status()
                 elif path == "/calibration/export":
                     self_handler._handle_calibration_export()
+                elif path == "/api/params":
+                    self_handler._handle_get_params()
                 else:
                     self_handler._handle_control_panel()
 
@@ -1478,6 +724,8 @@ class FrameStreamer:
                     self_handler._handle_calibrate_frame()
                 elif path == "/calibrate/stop":
                     self_handler._handle_calibrate_stop()
+                elif path == "/api/params":
+                    self_handler._handle_post_params()
                 else:
                     self_handler.send_response(404)
                     self_handler.end_headers()
@@ -1491,6 +739,8 @@ class FrameStreamer:
 
             def _handle_stream(self_handler) -> None:  # noqa: N805
                 """MJPEG multipart stream."""
+                with streamer._stream_client_lock:
+                    streamer._stream_client_count += 1
                 self_handler.send_response(200)
                 self_handler.send_header(
                     "Content-Type",
@@ -1518,6 +768,9 @@ class FrameStreamer:
                         self_handler.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
+                finally:
+                    with streamer._stream_client_lock:
+                        streamer._stream_client_count = max(0, streamer._stream_client_count - 1)
 
             def _handle_frame(self_handler) -> None:  # noqa: N805
                 """Single JPEG snapshot."""
@@ -1553,6 +806,38 @@ class FrameStreamer:
                 self_handler.send_response(200)
                 self_handler.send_header("Content-Type", "text/html")
                 self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_get_params(self_handler) -> None:  # noqa: N805
+                """Return current dashboard parameter overrides."""
+                body = json.dumps(streamer._param_overrides).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_post_params(self_handler) -> None:  # noqa: N805
+                """Set dashboard parameter overrides."""
+                length = int(self_handler.headers.get("Content-Length", 0))
+                raw = self_handler.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    params = json.loads(raw)
+                except Exception:
+                    params = {}
+                # Merge into overrides (None values delete keys)
+                for k, v in params.items():
+                    if v is None:
+                        streamer._param_overrides.pop(k, None)
+                    else:
+                        streamer._param_overrides[k] = v
+                body = json.dumps({"ok": True, "params": streamer._param_overrides}).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
                 self_handler.end_headers()
                 self_handler.wfile.write(body)
 
@@ -1893,6 +1178,13 @@ class FrameStreamer:
         """
         if not self._running or self._calibration_active:
             return
+        # Skip encoding entirely when no one needs the frames:
+        # no MJPEG stream clients AND dashboard preview is off.
+        if (
+            self._stream_client_count == 0
+            and not self._param_overrides.get("preview_enabled", True)
+        ):
+            return
         # Try-lock: skip this frame if we're already encoding one
         if not self._encoding.acquire(blocking=False):
             return
@@ -1931,10 +1223,13 @@ class FrameStreamer:
 
         Encodes synchronously.  Does not block the pipeline thread if the
         input lock is already held (frame is dropped instead).
+        Skipped when dashboard input preview is disabled.
 
         Thread-safe — may be called from any thread.
         """
         if not self._running:
+            return
+        if not self._param_overrides.get("input_preview_enabled", True):
             return
         jpeg = self._encode_jpeg(rgb)
         if jpeg is not None:
