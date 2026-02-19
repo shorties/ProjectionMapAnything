@@ -85,7 +85,7 @@ The preprocessor handles **everything** — calibration, depth conditioning, and
 - Loads calibration automatically from `~/.projectionmapanything_calibration.json`
 - Uses Depth Anything V2 (tries Scope built-in first, falls back to transformers)
 - Warps depth from camera→projector perspective using calibration maps
-- Output: grayscale RGB (near=dark, far=bright) matching VACE training data
+- Output: grayscale RGB (near=bright, far=dark) — inverse depth / disparity, matching VACE / Depth Anything V2 / ControlNet convention
 - Temporal smoothing + Gaussian blur for flicker/noise reduction
 - Edge blend: Sobel/Canny edge detection blended into depth
 - Depth effects: Surface-masked animated effects (noise, flow, pulse, wave, kaleido, etc.)

@@ -32,6 +32,7 @@ import io
 import json
 import logging
 import threading
+import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -69,51 +70,173 @@ _PROJECTOR_HTML = """\
          display:flex; justify-content:center;
          align-items:center; }
   body.fs { cursor:none; }
-  img#view { width:100vw; height:100vh;
-        object-fit:contain; display:block; }
+  video#rtc { width:100vw; height:100vh;
+              object-fit:contain; display:block; }
+  img#mjpeg { width:100vw; height:100vh;
+              object-fit:contain; display:none;
+              position:absolute; top:0; left:0; }
   #hint { position:fixed; bottom:30px;
-          left:50%; transform:translateX(-50%);
+          left:50%%; transform:translateX(-50%%);
           color:#444; font:14px sans-serif;
           pointer-events:none;
           transition:opacity 0.5s; }
   body.fs #hint { opacity:0; }
   #status { position:fixed; top:10px; right:10px;
-            color:#333; font:11px monospace;
+            color:#555; font:11px monospace;
             pointer-events:none; }
   body.fs #status { opacity:0; }
 </style>
 </head><body>
-<img id="view" />
+<video id="rtc" autoplay playsinline muted></video>
+<img id="mjpeg" />
 <div id="hint">Click to go fullscreen &mdash; drag this window to your projector first</div>
 <div id="status"></div>
 <script>
-const img = document.getElementById('view');
+const rtcVideo = document.getElementById('rtc');
+const mjpegImg = document.getElementById('mjpeg');
 const statusEl = document.getElementById('status');
+let pc = null;
+let sessionId = null;
+let calibrating = false;
+let rtcConnected = false;
 
-// MJPEG stream with auto-reconnect on failure
-function startStream() {
-  img.src = '/stream?t=' + Date.now();
-  statusEl.textContent = '';
+// ---- Mode switching: WebRTC (AI output) vs MJPEG (calibration) ----
+function showWebRTC() {
+  rtcVideo.style.display = 'block';
+  mjpegImg.style.display = 'none';
+  mjpegImg.src = '';
+}
+function showMJPEG() {
+  mjpegImg.style.display = 'block';
+  rtcVideo.style.display = 'none';
+  mjpegImg.src = '/stream?t=' + Date.now();
+}
+mjpegImg.onerror = () => { setTimeout(() => { if (calibrating) showMJPEG(); }, 1000); };
+
+// ---- Poll calibration status to switch modes ----
+async function pollCalibration() {
+  try {
+    const r = await fetch('/calibration/status');
+    const d = await r.json();
+    const wasCalibrating = calibrating;
+    calibrating = d.active;
+    if (calibrating && !wasCalibrating) {
+      statusEl.textContent = 'CALIBRATING';
+      showMJPEG();
+    } else if (!calibrating && wasCalibrating) {
+      statusEl.textContent = 'AI Output';
+      showWebRTC();
+    }
+  } catch(e) {}
+}
+setInterval(pollCalibration, 1000);
+
+// ---- WebRTC connection to Scope ----
+async function connectWebRTC() {
+  statusEl.textContent = 'Connecting WebRTC...';
+  try {
+    // 1. Get ICE servers via our proxy
+    const iceResp = await fetch('/scope/ice-servers');
+    if (!iceResp.ok) throw new Error('ICE servers: ' + iceResp.status);
+    const iceData = await iceResp.json();
+    const iceServers = iceData.iceServers || [{ urls: ['stun:stun.l.google.com:19302'] }];
+
+    // 2. Create peer connection
+    pc = new RTCPeerConnection({ iceServers });
+
+    // 3. Create data channel (Scope expects this)
+    const dc = pc.createDataChannel('parameters', { ordered: true });
+
+    // 4. Send a black video track (Scope expects sendrecv)
+    const canvas = document.createElement('canvas');
+    canvas.width = 512; canvas.height = 512;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, 512, 512);
+    const blackStream = canvas.captureStream(1);
+    const blackTrack = blackStream.getVideoTracks()[0];
+    const sender = pc.addTrack(blackTrack, blackStream);
+
+    // 5. Force VP8 codec (Scope's aiortc requires VP8)
+    const transceiver = pc.getTransceivers().find(t => t.sender === sender);
+    if (transceiver) {
+      const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || [];
+      const vp8 = codecs.filter(c => c.mimeType.toLowerCase() === 'video/vp8');
+      if (vp8.length > 0) transceiver.setCodecPreferences(vp8);
+    }
+
+    // 6. Handle incoming AI output video
+    pc.ontrack = (e) => {
+      if (e.track.kind === 'video') {
+        rtcVideo.srcObject = e.streams[0] || new MediaStream([e.track]);
+        rtcVideo.play().catch(() => {});
+        rtcConnected = true;
+        if (!calibrating) {
+          statusEl.textContent = 'AI Output';
+          showWebRTC();
+        }
+      }
+    };
+
+    // 7. Trickle ICE
+    pc.onicecandidate = async (e) => {
+      if (e.candidate && sessionId) {
+        await fetch('/scope/ice/' + sessionId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            candidates: [{
+              candidate: e.candidate.candidate,
+              sdpMid: e.candidate.sdpMid,
+              sdpMLineIndex: e.candidate.sdpMLineIndex
+            }]
+          })
+        }).catch(() => {});
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        statusEl.textContent = 'WebRTC lost, reconnecting...';
+        rtcConnected = false;
+        setTimeout(connectWebRTC, 3000);
+      }
+    };
+
+    // 8. Create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // 9. Send offer via our proxy
+    const answerResp = await fetch('/scope/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp,
+        type: 'offer',
+        initialParameters: { input_mode: 'video' }
+      })
+    });
+    if (!answerResp.ok) throw new Error('Offer: ' + answerResp.status);
+    const answer = await answerResp.json();
+    sessionId = answer.sessionId;
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+
+    statusEl.textContent = 'WebRTC connected';
+  } catch(err) {
+    console.warn('WebRTC failed, falling back to MJPEG:', err);
+    statusEl.textContent = 'MJPEG mode (WebRTC unavailable)';
+    rtcConnected = false;
+    showMJPEG();
+    // Retry WebRTC after delay
+    setTimeout(connectWebRTC, 10000);
+  }
 }
 
-img.onerror = () => {
-  statusEl.textContent = 'Reconnecting...';
-  setTimeout(startStream, 1000);
-};
+// ---- Start ----
+connectWebRTC();
 
-// Detect stalled stream (no new frame for 5s)
-let lastCheck = 0;
-setInterval(() => {
-  // img.complete && img.naturalHeight > 0 means it has decoded at least one frame
-  if (img.src.includes('/stream') && img.naturalHeight === 0) {
-    // Stream never started — reconnect
-    statusEl.textContent = 'Reconnecting...';
-    startStream();
-  }
-}, 3000);
-
-startStream();
-
+// ---- Fullscreen ----
 document.body.addEventListener('click', () => {
   if (!document.fullscreenElement) {
     document.documentElement.requestFullscreen().catch(() => {});
@@ -122,6 +245,8 @@ document.body.addEventListener('click', () => {
 document.addEventListener('fullscreenchange', () => {
   document.body.classList.toggle('fs', !!document.fullscreenElement);
 });
+
+// ---- Report screen resolution ----
 function postConfig() {
   const s = window.screen;
   fetch('/config', {
@@ -707,6 +832,8 @@ class FrameStreamer:
                     self_handler._handle_calibration_export()
                 elif path == "/api/params":
                     self_handler._handle_get_params()
+                elif path == "/scope/ice-servers":
+                    self_handler._handle_scope_proxy("GET", "/api/v1/webrtc/ice-servers")
                 else:
                     self_handler._handle_control_panel()
 
@@ -726,6 +853,20 @@ class FrameStreamer:
                     self_handler._handle_calibrate_stop()
                 elif path == "/api/params":
                     self_handler._handle_post_params()
+                elif path == "/scope/offer":
+                    self_handler._handle_scope_proxy_post("/api/v1/webrtc/offer")
+                else:
+                    self_handler.send_response(404)
+                    self_handler.end_headers()
+
+            def do_PATCH(self_handler) -> None:  # noqa: N805
+                path = self_handler.path.split("?")[0]
+                if path.startswith("/scope/ice/"):
+                    scope_session = path[len("/scope/ice/"):]
+                    self_handler._handle_scope_proxy_post(
+                        f"/api/v1/webrtc/offer/{scope_session}",
+                        method="PATCH",
+                    )
                 else:
                     self_handler.send_response(404)
                     self_handler.end_headers()
@@ -733,7 +874,7 @@ class FrameStreamer:
             def do_OPTIONS(self_handler) -> None:  # noqa: N805
                 self_handler.send_response(204)
                 self_handler.send_header("Access-Control-Allow-Origin", "*")
-                self_handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self_handler.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
                 self_handler.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self_handler.end_headers()
 
@@ -840,6 +981,74 @@ class FrameStreamer:
                 self_handler.send_header("Access-Control-Allow-Origin", "*")
                 self_handler.end_headers()
                 self_handler.wfile.write(body)
+
+            # -- Scope WebRTC proxy endpoints ------------------------------------
+
+            def _handle_scope_proxy(self_handler, method: str, scope_path: str) -> None:  # noqa: N805
+                """Proxy a GET request to Scope's API (localhost:8000)."""
+                import os
+                scope_base = "http://localhost:8000"
+                url = scope_base + scope_path
+                try:
+                    req = urllib.request.Request(url, method=method)
+                    req.add_header("Accept", "application/json")
+                    # Add RunPod headers if needed
+                    pod_id = os.environ.get("RUNPOD_POD_ID", "")
+                    if pod_id:
+                        origin = f"https://{pod_id}-8000.proxy.runpod.net"
+                        req.add_header("Referer", origin + "/")
+                        req.add_header("Origin", origin)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = resp.read()
+                        self_handler.send_response(resp.status)
+                        self_handler.send_header("Content-Type", "application/json")
+                        self_handler.send_header("Content-Length", str(len(data)))
+                        self_handler.send_header("Access-Control-Allow-Origin", "*")
+                        self_handler.end_headers()
+                        self_handler.wfile.write(data)
+                except Exception as exc:
+                    logger.warning("Scope proxy GET %s failed: %s", scope_path, exc)
+                    body = json.dumps({"error": str(exc)}).encode()
+                    self_handler.send_response(502)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(body)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(body)
+
+            def _handle_scope_proxy_post(self_handler, scope_path: str, method: str = "POST") -> None:  # noqa: N805
+                """Proxy a POST/PATCH request to Scope's API."""
+                import os
+                scope_base = "http://localhost:8000"
+                url = scope_base + scope_path
+                length = int(self_handler.headers.get("Content-Length", 0))
+                raw = self_handler.rfile.read(length) if length > 0 else b""
+                try:
+                    req = urllib.request.Request(url, data=raw, method=method)
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("Accept", "application/json")
+                    pod_id = os.environ.get("RUNPOD_POD_ID", "")
+                    if pod_id:
+                        origin = f"https://{pod_id}-8000.proxy.runpod.net"
+                        req.add_header("Referer", origin + "/")
+                        req.add_header("Origin", origin)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = resp.read()
+                        self_handler.send_response(resp.status)
+                        self_handler.send_header("Content-Type", "application/json")
+                        self_handler.send_header("Content-Length", str(len(data)))
+                        self_handler.send_header("Access-Control-Allow-Origin", "*")
+                        self_handler.end_headers()
+                        self_handler.wfile.write(data)
+                except Exception as exc:
+                    logger.warning("Scope proxy %s %s failed: %s", method, scope_path, exc)
+                    body = json.dumps({"error": str(exc)}).encode()
+                    self_handler.send_response(502)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(body)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(body)
 
             def _handle_get_config(self_handler) -> None:  # noqa: N805
                 """Return current projector config as JSON."""
