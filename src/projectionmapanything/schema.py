@@ -211,7 +211,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
     only essential controls appear here.
     """
 
-    pipeline_id = "projectionmapanything-depth"
+    pipeline_id = "projectionmapanything"
     pipeline_name = "Projection-Map-Anything (VJ.Tools)"
     pipeline_description = (
         "Projection mapping preprocessor — calibration + depth conditioning. "

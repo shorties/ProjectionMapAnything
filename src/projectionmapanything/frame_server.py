@@ -65,63 +65,12 @@ _PROJECTOR_HTML = """\
 <title>Projection-Map-Anything Projector</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #000; overflow: hidden; width: 100vw; height: 100vh;
-         font-family: system-ui, -apple-system, sans-serif; color: #fff; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; cursor: pointer; }
   body.fs { cursor: none; }
-  #video, #mjpeg {
+  #mjpeg {
     position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-    object-fit: contain; display: none; background: #000;
+    object-fit: contain; background: #000;
   }
-  #video.active, #mjpeg.active { display: block; }
-  #setup {
-    position: fixed; inset: 0; display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    background: rgba(0,0,0,0.97); z-index: 100;
-  }
-  #setup.hidden { display: none; }
-  #setup h2 { margin-bottom: 20px; font-weight: 300; letter-spacing: 1px; font-size: 20px; }
-  .field { margin: 5px 0; width: 340px; }
-  .field label { display: block; margin-bottom: 3px; font-size: 11px; color: #666;
-                 text-transform: uppercase; letter-spacing: 0.5px; }
-  .field select, .field input {
-    width: 100%%; padding: 8px 12px; background: #111; border: 1px solid #333;
-    color: #fff; border-radius: 5px; font-size: 14px; outline: none;
-  }
-  .field select:focus, .field input:focus { border-color: #555; }
-  .section-label { margin: 14px 0 6px; font-size: 10px; color: #444;
-                   text-transform: uppercase; letter-spacing: 1px; width: 340px; }
-  .btn-row { display: flex; gap: 8px; width: 340px; margin-top: 10px; }
-  .btn-row button { flex: 1; padding: 10px 0; border: none; border-radius: 5px;
-                    font-size: 13px; cursor: pointer; }
-  #cal-btn { background: #16a34a; color: #fff; }
-  #cal-btn:hover { background: #15803d; }
-  #refine-btn { background: #222; color: #aaa; border: 1px solid #333; }
-  #refine-btn:hover { background: #333; }
-  #cal-btn:disabled, #refine-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  #cal-status { width: 340px; margin-top: 6px; font-size: 12px; color: #888;
-                text-align: center; min-height: 16px; }
-  #connect-btn {
-    margin-top: 10px; padding: 11px 48px; background: #2563eb; color: #fff;
-    border: none; border-radius: 5px; font-size: 14px; cursor: pointer;
-  }
-  #connect-btn:hover { background: #1d4ed8; }
-  #connect-btn:disabled { background: #333; cursor: not-allowed; color: #888; }
-  .setup-hint { margin-top: 12px; font-size: 11px; color: #444; }
-  .setup-err { margin-top: 8px; font-size: 12px; color: #ef4444;
-               max-width: 340px; text-align: center; }
-  #status {
-    position: fixed; top: 10px; right: 10px; padding: 3px 8px;
-    background: rgba(0,0,0,0.5); border-radius: 3px;
-    font: 11px/1.4 monospace; color: #666; z-index: 50;
-    pointer-events: none; transition: opacity 0.5s;
-  }
-  body.fs #status { opacity: 0; }
-  #fs-hint {
-    position: fixed; top: 50%%; left: 50%%; transform: translate(-50%%,-50%%);
-    color: #555; font: 15px sans-serif; pointer-events: none;
-    opacity: 0; transition: opacity 0.5s; text-align: center; z-index: 50;
-  }
-  body:not(.fs) #fs-hint.show { opacity: 1; }
   #calib-badge {
     position: fixed; top: 10px; left: 10px; padding: 5px 12px;
     background: rgba(234,179,8,0.85); color: #000; font-size: 11px;
@@ -129,436 +78,47 @@ _PROJECTOR_HTML = """\
   }
 </style>
 </head><body>
-<video id="video" autoplay playsinline></video>
-<img id="mjpeg" />
-
-<div id="setup">
-  <h2>Projector Output</h2>
-  <div class="field">
-    <label>Camera</label>
-    <select id="cam-sel"><option value="">Loading cameras...</option></select>
-  </div>
-
-  <div class="section-label">Calibration</div>
-  <input type="hidden" id="cal-method" value="gray_code" />
-  <div class="btn-row">
-    <button id="cal-btn" disabled>Calibrate</button>
-    <button id="refine-btn" disabled>Refine</button>
-  </div>
-  <div id="cal-status"></div>
-
-  <div class="section-label">Scope Connection</div>
-  <div class="field">
-    <label>Scope URL</label>
-    <input id="scope-url" type="text" />
-  </div>
-  <button id="connect-btn" disabled>Connect</button>
-  <div class="setup-hint">Drag this window to your projector, then calibrate or connect</div>
-  <div id="err-msg" class="setup-err"></div>
-</div>
-
-<div id="status"></div>
-<div id="fs-hint">Click to re-enter fullscreen</div>
+<img id="mjpeg" src="/stream" />
 <div id="calib-badge">CALIBRATING</div>
 
 <script>
-const video = document.getElementById('video');
 const mjpeg = document.getElementById('mjpeg');
-const setupEl = document.getElementById('setup');
-const camSel = document.getElementById('cam-sel');
-const calMethod = document.getElementById('cal-method');
-const calBtn = document.getElementById('cal-btn');
-const refineBtn = document.getElementById('refine-btn');
-const calStatus = document.getElementById('cal-status');
-const urlIn = document.getElementById('scope-url');
-const connectBtn = document.getElementById('connect-btn');
-const errEl = document.getElementById('err-msg');
-const statusEl = document.getElementById('status');
-const fsHint = document.getElementById('fs-hint');
 const calibBadge = document.getElementById('calib-badge');
 
-let pc = null, sessionId = null, candidateQ = [];
-let camStream = null, isConnected = false, calibActive = false;
-let reconTimer = null, reconN = 0;
-let calibRunning = false;
-
-// ---- Persistence ----
-function loadSettings() {
-  try { return JSON.parse(localStorage.getItem('pma-projector')) || {}; }
-  catch(e) { return {}; }
-}
-function saveSettings(o) { localStorage.setItem('pma-projector', JSON.stringify(o)); }
-
-// ---- Default Scope URL ----
-function defaultScopeUrl() {
-  const h = location.hostname;
-  const m = h.match(/^(.+)-\\d+\\.proxy\\.runpod\\.net$/);
-  if (m) return location.protocol + '//' + m[1] + '-8000.proxy.runpod.net';
-  return location.protocol + '//' + h + ':8000';
-}
-
-// ---- Camera acquisition (kept alive to avoid fullscreen exit) ----
-async function acquireCamera() {
-  if (camStream && camStream.active) return camStream;
-  camStream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
-    audio: false
-  });
-  return camStream;
-}
-
-// ---- Camera enumeration ----
-async function enumCameras() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    camSel.innerHTML = '<option>Camera API unavailable (HTTPS required)</option>';
-    return;
-  }
-  try {
-    // Acquire camera and keep it — avoids getUserMedia later during fullscreen
-    await acquireCamera();
-    const devs = await navigator.mediaDevices.enumerateDevices();
-    const cams = devs.filter(d => d.kind === 'videoinput');
-    camSel.innerHTML = '';
-    cams.forEach((c, i) => {
-      const o = document.createElement('option');
-      o.value = c.deviceId;
-      o.textContent = c.label || 'Camera ' + (i + 1);
-      camSel.appendChild(o);
-    });
-    // Select active camera by default
-    const activeId = camStream.getVideoTracks()[0]?.getSettings()?.deviceId;
-    if (activeId) camSel.value = activeId;
-    // Restore saved preference
-    const s = loadSettings();
-    if (s.camId && cams.find(c => c.deviceId === s.camId)) camSel.value = s.camId;
-    connectBtn.disabled = cams.length === 0;
-    calBtn.disabled = cams.length === 0;
-    if (!cams.length) camSel.innerHTML = '<option>No cameras found</option>';
-  } catch(e) {
-    camSel.innerHTML = '<option>Camera access denied</option>';
-  }
-}
-
-// Switch camera when dropdown changes (before fullscreen, so getUserMedia is safe)
-camSel.onchange = async () => {
-  const id = camSel.value;
-  if (!id) return;
-  const currentId = camStream?.getVideoTracks()[0]?.getSettings()?.deviceId;
-  if (id === currentId) return;
-  // Stop old stream and acquire new device
-  if (camStream) camStream.getTracks().forEach(t => t.stop());
-  camStream = null;
-  try {
-    camStream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: { exact: id }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false
-    });
-  } catch(e) {
-    errEl.textContent = 'Could not switch camera: ' + e.message;
-  }
-};
-
-// ---- Init ----
-const saved = loadSettings();
-urlIn.value = saved.scopeUrl || defaultScopeUrl();
-if (saved.calMethod) calMethod.value = saved.calMethod;
-enumCameras();
-// Check if calibration already exists (enable Refine)
-fetch('/calibration/status').then(r => r.json()).then(d => {
-  if (d.complete) { refineBtn.disabled = false; calStatus.textContent = 'Calibration loaded'; }
-}).catch(() => {});
-
-// ---- Standalone Calibration (browser webcam) ----
-calBtn.onclick = () => startCalibration(false);
-refineBtn.onclick = () => startCalibration(true);
-
-async function startCalibration(refine) {
-  calBtn.disabled = true;
-  refineBtn.disabled = true;
-  calStatus.textContent = refine ? 'Starting refinement...' : 'Starting calibration...';
-  saveSettings({ scopeUrl: urlIn.value, camId: camSel.value, calMethod: calMethod.value });
-
-  try {
-    if (!camStream || !camStream.active) await acquireCamera();
-
-    const resp = await fetch('/calibrate/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        method: calMethod.value,
-        proj_w: window.screen.width,
-        proj_h: window.screen.height,
-        refine: refine
-      })
-    });
-    const data = await resp.json();
-    if (!data.ok) {
-      calStatus.textContent = 'Error: ' + (data.error || 'failed');
-      calBtn.disabled = false;
-      refineBtn.disabled = false;
-      return;
-    }
-
-    calibRunning = true;
-    calibActive = true;
-
-    // Switch to MJPEG to show calibration patterns
-    video.classList.remove('active');
-    mjpeg.src = '/stream?t=' + Date.now();
-    mjpeg.classList.add('active');
-    calibBadge.style.display = 'block';
-    setupEl.classList.add('hidden');
-
-    // Create hidden video element for webcam capture
-    const capVideo = document.createElement('video');
-    capVideo.srcObject = camStream;
-    capVideo.setAttribute('playsinline', '');
-    await capVideo.play();
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-
-    // Frame capture loop
-    while (calibRunning) {
-      await new Promise(r => setTimeout(r, 80));
-      canvas.width = capVideo.videoWidth;
-      canvas.height = capVideo.videoHeight;
-      ctx.drawImage(capVideo, 0, 0);
-      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
-
-      const fResp = await fetch('/calibrate/frame', { method: 'POST', body: blob });
-      const result = await fResp.json();
-
-      statusEl.textContent = result.pattern_info || result.phase || '';
-
-      if (result.done) {
-        calibRunning = false;
-        const cov = (result.coverage_pct || 0).toFixed(1);
-        calStatus.textContent = (refine ? 'Refined' : 'Complete') + ' — coverage: ' + cov + '%%';
-        refineBtn.disabled = false;
-        break;
-      }
-      if (result.error) {
-        calibRunning = false;
-        calStatus.textContent = 'Error: ' + result.error;
-        break;
-      }
-    }
-
-    // Restore UI
-    capVideo.pause();
-    calibActive = false;
-    mjpeg.classList.remove('active');
-    mjpeg.src = '';
-    calibBadge.style.display = 'none';
-    setupEl.classList.remove('hidden');
-    statusEl.textContent = '';
-    calBtn.disabled = false;
-    if (isConnected) video.classList.add('active');
-
-  } catch(e) {
-    calStatus.textContent = 'Error: ' + (e.message || 'failed');
-    calibRunning = false;
-    calibActive = false;
-    mjpeg.classList.remove('active');
-    calibBadge.style.display = 'none';
-    setupEl.classList.remove('hidden');
-    calBtn.disabled = false;
-  }
-}
-
-// ---- WebRTC Connect ----
-connectBtn.onclick = doConnect;
-
-async function doConnect() {
-  connectBtn.disabled = true;
-  connectBtn.textContent = 'Connecting...';
-  errEl.textContent = '';
-  statusEl.textContent = 'Connecting...';
-  saveSettings({ scopeUrl: urlIn.value, camId: camSel.value, calMethod: calMethod.value });
-
-  try {
-    // 1. ICE servers (via proxy to Scope)
-    let iceServers = [];
-    try {
-      const r = await fetch('/scope/ice-servers');
-      if (r.ok) {
-        const d = await r.json();
-        iceServers = d.iceServers || d.ice_servers || [];
-      }
-    } catch(e) { /* use empty iceServers */ }
-
-    // 2. Reuse camera stream (acquired during enumeration — no fullscreen exit)
-    if (!camStream || !camStream.active) await acquireCamera();
-
-    // 3. Create peer connection
-    pc = new RTCPeerConnection({ iceServers });
-    camStream.getVideoTracks().forEach(t => pc.addTrack(t, camStream));
-
-    // Prefer VP8 (Scope's aiortc default codec)
-    for (const tr of pc.getTransceivers()) {
-      if (tr.sender.track && tr.sender.track.kind === 'video') {
-        const caps = RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities('video');
-        if (caps && caps.codecs) {
-          const vp8 = caps.codecs.filter(c => c.mimeType === 'video/VP8');
-          const rest = caps.codecs.filter(c => c.mimeType !== 'video/VP8');
-          if (vp8.length) try { tr.setCodecPreferences(vp8.concat(rest)); } catch(e) {}
-        }
-      }
-    }
-
-    // 4. Data channel for parameters
-    pc.createDataChannel('parameters');
-
-    // 5. Handle remote track (AI output from Scope)
-    pc.ontrack = (e) => {
-      video.srcObject = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
-      setupEl.classList.add('hidden');
-      if (!calibActive) video.classList.add('active');
-      isConnected = true;
-      statusEl.textContent = 'Connected';
-      reconN = 0;
-    };
-
-    // 6. Trickle ICE
-    pc.onicecandidate = (e) => {
-      if (!e.candidate) return;
-      if (sessionId) {
-        fetch('/scope/ice/' + sessionId, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ candidate: e.candidate.toJSON() })
-        }).catch(() => {});
-      } else {
-        candidateQ.push(e.candidate);
-      }
-    };
-
-    // 7. Connection state monitoring
-    pc.onconnectionstatechange = () => {
-      const s = pc.connectionState;
-      statusEl.textContent = s;
-      if (s === 'disconnected' || s === 'failed') scheduleReconnect();
-    };
-
-    // 8. Fetch current pipeline config for initialParameters
-    let initParams = {};
-    try {
-      const r = await fetch('/scope/pipeline/status');
-      if (r.ok) initParams = await r.json();
-    } catch(e) {}
-
-    // 9. Create and send offer
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    const resp = await fetch('/scope/offer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sdp: offer.sdp, type: offer.type, initialParameters: initParams })
-    });
-    if (!resp.ok) throw new Error('Scope rejected offer (' + resp.status + ')');
-
-    const ans = await resp.json();
-    sessionId = ans.sessionId || ans.session_id;
-
-    // 10. Set remote description
-    await pc.setRemoteDescription({ sdp: ans.sdp, type: ans.type });
-
-    // 11. Flush queued ICE candidates
-    for (const c of candidateQ) {
-      fetch('/scope/ice/' + sessionId, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ candidate: c.toJSON() })
-      }).catch(() => {});
-    }
-    candidateQ = [];
-
-  } catch(e) {
-    errEl.textContent = e.message || 'Connection failed';
-    statusEl.textContent = 'Error';
-    connectBtn.textContent = 'Connect';
-    connectBtn.disabled = false;
-    doCleanup();
-  }
-}
-
-function doCleanup() {
-  if (pc) { pc.close(); pc = null; }
-  // Keep camStream alive — reused on reconnect so getUserMedia doesn't exit fullscreen
-  sessionId = null;
-  candidateQ = [];
-  video.srcObject = null;
-  video.classList.remove('active');
-  isConnected = false;
-}
-
-// ---- Reconnection with exponential backoff ----
-function scheduleReconnect() {
-  if (reconTimer) return;
-  const delay = Math.min(1000 * Math.pow(2, reconN), 8000);
-  reconN++;
-  statusEl.textContent = 'Reconnecting in ' + (delay / 1000) + 's...';
-  reconTimer = setTimeout(() => {
-    reconTimer = null;
-    doCleanup();
-    doConnect();
-  }, delay);
-}
-
-// ---- Calibration mode: switch to MJPEG during external calibration ----
-setInterval(() => {
-  if (calibRunning) return; // local calibration handles its own UI
-  fetch('/calibration/status').then(r => {
-    if (!r.ok) return null;
-    return r.json();
-  }).then(d => {
-    if (!d) return;
-    if (d.active && !calibActive) {
-      calibActive = true;
-      video.classList.remove('active');
-      mjpeg.src = '/stream?t=' + Date.now();
-      mjpeg.classList.add('active');
-      calibBadge.style.display = 'block';
-    } else if (!d.active && calibActive) {
-      calibActive = false;
-      mjpeg.classList.remove('active');
-      mjpeg.src = '';
-      calibBadge.style.display = 'none';
-      if (isConnected) video.classList.add('active');
-    }
-  }).catch(() => {});
-}, 2000);
-
-mjpeg.onerror = () => {
-  if (calibActive) setTimeout(() => { mjpeg.src = '/stream?t=' + Date.now(); }, 1000);
-};
-
-// ---- Fullscreen ----
-let wasFullscreen = false;
-document.body.addEventListener('click', (e) => {
-  if (e.target.closest('#setup')) return;
+// ---- Fullscreen on click ----
+document.body.addEventListener('click', () => {
   if (!document.fullscreenElement) {
     document.documentElement.requestFullscreen().catch(() => {});
   }
 });
+
+let wasFullscreen = false;
 document.addEventListener('fullscreenchange', () => {
   const isFS = !!document.fullscreenElement;
   document.body.classList.toggle('fs', isFS);
-  if (wasFullscreen && !isFS) {
-    fsHint.classList.add('show');
-    setTimeout(() => fsHint.classList.remove('show'), 5000);
-  }
   wasFullscreen = isFS;
   setTimeout(postConfig, 300);
 });
-// Auto-re-enter fullscreen when window regains focus (e.g. after clicking Scope UI)
+
+// Auto-re-enter fullscreen when window regains focus
 window.addEventListener('focus', () => {
   if (wasFullscreen && !document.fullscreenElement) {
     document.documentElement.requestFullscreen().catch(() => {});
   }
 });
+
+// ---- MJPEG reconnect on error ----
+mjpeg.onerror = () => {
+  setTimeout(() => { mjpeg.src = '/stream?t=' + Date.now(); }, 1000);
+};
+
+// ---- Calibration badge (poll status) ----
+setInterval(() => {
+  fetch('/calibration/status').then(r => r.ok ? r.json() : null).then(d => {
+    if (!d) return;
+    calibBadge.style.display = d.active ? 'block' : 'none';
+  }).catch(() => {});
+}, 2000);
 
 // ---- Report projector resolution ----
 function postConfig() {
