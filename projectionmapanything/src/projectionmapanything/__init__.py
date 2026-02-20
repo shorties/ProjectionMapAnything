@@ -27,18 +27,11 @@ def _precache_depth_model():
 
 @hookimpl
 def register_pipelines(register):
-    from .pipeline import (
-        ProMapAnythingCalibratePipeline,
-        ProMapAnythingPipeline,
-        ProMapAnythingProjectorPipeline,
-    )
+    from .pipeline import ProMapAnythingPipeline
 
-    # Primary pipeline — handles calibration + depth conditioning
+    # Primary pipeline — handles calibration + depth conditioning.
+    # WebRTC projector page (/projector) replaces the old MJPEG postprocessor.
     register(ProMapAnythingPipeline)
-    # Calibration visualization (main pipeline slot)
-    register(ProMapAnythingCalibratePipeline)
-    # Postprocessor: relays AI output to projector via MJPEG
-    register(ProMapAnythingProjectorPipeline)
 
     # Start pre-cache AFTER registration completes
     threading.Thread(target=_precache_depth_model, daemon=True, name="depth-precache").start()

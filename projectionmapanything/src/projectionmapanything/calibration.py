@@ -1,18 +1,18 @@
-"""Gray code structured light calibration for projector-camera systems.
+"""Structured light calibration for projector-camera systems.
 
-Projects binary stripe patterns (Gray codes) and decodes camera captures to
-build a dense pixel mapping from camera space to projector space.  The mapping
-is stored as two float32 arrays (map_x, map_y) that can be used with
-``cv2.remap`` to warp images from camera perspective to projector perspective.
+Supports two calibration methods:
 
-Ported from the standalone app with improvements:
-- Multi-frame averaging per pattern for noise rejection
-- Per-bit reliability threshold (rejects bit-boundary pixels)
-- Configurable decode threshold
-- Vectorized Gray-to-binary decode
-- Gaussian splat fill (blur sum/count) for dense correspondence
-- Morphological cleanup + spatial consistency filtering
-- Change-detection settle (captures as soon as camera shows new pattern)
+**Multi-Frequency Phase Shifting (MPS)** — default
+  Projects smooth sinusoidal patterns at multiple spatial frequencies.
+  Survives JPEG compression (MJPEG stream), needs fewer patterns (~32 vs ~46),
+  gives sub-pixel precision, and is robust to ambient light and defocus.
+
+**Gray Code** — legacy fallback
+  Projects binary stripe patterns.  Requires lossless or high-quality capture
+  because JPEG compression destroys the sharp black/white edges.
+
+Both methods produce a dense pixel mapping (map_x, map_y) from camera space
+to projector space, usable with ``cv2.remap``.
 """
 
 from __future__ import annotations
@@ -98,8 +98,16 @@ class CalibrationPhase(Enum):
     DONE = auto()
 
 
+class CalibrationMethod(str, Enum):
+    """Structured light calibration method."""
+    PHASE_SHIFT = "phase_shift"
+    GRAY_CODE = "gray_code"
+
+
 class CalibrationState:
-    """Manages the multi-frame Gray code calibration sequence.
+    """Manages the multi-frame structured light calibration sequence.
+
+    Supports both Multi-Frequency Phase Shifting (MPS) and Gray code methods.
 
     Usage
     -----
@@ -113,9 +121,13 @@ class CalibrationState:
         self,
         proj_w: int,
         proj_h: int,
+        method: CalibrationMethod | str = CalibrationMethod.PHASE_SHIFT,
+        num_frequencies: int = 5,
+        frequency_ratio: float = 3.0,
+        pattern_amplitude: float = 1.0,
         settle_frames: int = 30,
         capture_frames: int = 3,
-        decode_threshold: float = 20.0,
+        decode_threshold: float = 10.0,
         bit_threshold: float = 3.0,
         morph_cleanup: bool = True,
         morph_kernel_size: int = 5,
@@ -141,18 +153,41 @@ class CalibrationState:
         self.consistency_max_diff = consistency_max_diff
         self.fill_kernel_size = fill_kernel_size | 1  # ensure odd
         # Change-detection settle thresholds (mean abs pixel diff, uint8 scale)
-        # change_threshold: baseline→current diff to detect new pattern arrival
-        #   Gray codes cause 20-100+ diff, noise is typically < 3
         self.change_threshold = change_threshold
-        # stability_threshold: frame-to-frame diff to confirm pattern is stable
-        #   Sensor noise is typically 0.5-2.0, so 3.0 is robust
         self.stability_threshold = stability_threshold
 
+        # Method selection
+        if isinstance(method, str):
+            self.method = CalibrationMethod(method)
+        else:
+            self.method = method
+
+        # Gray code params (used by both methods for bits_x/bits_y reference)
         self.bits_x = _num_bits(proj_w)
         self.bits_y = _num_bits(proj_h)
 
-        # Total patterns: white + black + 2*(bits_x + bits_y) pos/neg pairs
-        self.total_patterns = 2 + 2 * (self.bits_x + self.bits_y)
+        # MPS params
+        self.num_frequencies = num_frequencies
+        self.frequency_ratio = frequency_ratio
+        self.amplitude = pattern_amplitude
+
+        if self.method == CalibrationMethod.PHASE_SHIFT:
+            self._frequencies_x = self._compute_wavelengths(
+                proj_w, num_frequencies, frequency_ratio,
+            )
+            self._frequencies_y = self._compute_wavelengths(
+                proj_h, num_frequencies, frequency_ratio,
+            )
+            # 3 phase shifts per frequency, 2 axes
+            self._num_pattern_steps = num_frequencies * 3 * 2
+        else:
+            self._frequencies_x = []
+            self._frequencies_y = []
+            # pos/neg pairs for each bit, 2 axes
+            self._num_pattern_steps = 2 * (self.bits_x + self.bits_y)
+
+        # Total patterns: white + black + all pattern steps
+        self.total_patterns = 2 + self._num_pattern_steps
 
         self.phase = CalibrationPhase.IDLE
         self._pattern_index = 0
@@ -177,6 +212,34 @@ class CalibrationState:
         self.map_x: np.ndarray | None = None
         self.map_y: np.ndarray | None = None
         self.proj_valid_mask: np.ndarray | None = None  # bool, valid before inpainting
+
+        logger.info(
+            "CalibrationState: method=%s, %dx%d, %d patterns "
+            "(%d freqs, ratio=%.1f)" if self.method == CalibrationMethod.PHASE_SHIFT
+            else "CalibrationState: method=%s, %dx%d, %d patterns "
+            "(%d bits_x, %d bits_y)",
+            self.method.value, proj_w, proj_h, self.total_patterns,
+            *(
+                (num_frequencies, frequency_ratio)
+                if self.method == CalibrationMethod.PHASE_SHIFT
+                else (self.bits_x, self.bits_y)
+            ),
+        )
+
+    @staticmethod
+    def _compute_wavelengths(
+        dim: int, num_freq: int, ratio: float,
+    ) -> list[float]:
+        """Compute hierarchical wavelengths for phase shifting.
+
+        Starting from the full dimension (1 period), each step divides by ratio.
+        """
+        wavelengths: list[float] = []
+        wl = float(dim)
+        for _ in range(num_freq):
+            wavelengths.append(wl)
+            wl = max(2.0, wl / ratio)
+        return wavelengths
 
     def start(self) -> None:
         self.phase = CalibrationPhase.WHITE
@@ -233,6 +296,49 @@ class CalibrationState:
         else:
             return 2 + self._pattern_index
 
+    def get_pattern_info(self) -> str:
+        """Human-readable description of the current calibration pattern."""
+        if self.phase == CalibrationPhase.WHITE:
+            return "Capturing white reference"
+        elif self.phase == CalibrationPhase.BLACK:
+            return "Capturing black reference"
+        elif self.phase == CalibrationPhase.DECODING:
+            return "Decoding patterns..."
+        elif self.phase != CalibrationPhase.PATTERNS:
+            return ""
+
+        captured = sum(len(s) for s in self._captures)
+        total_cap = self.total_patterns * self.capture_frames
+
+        if self.method == CalibrationMethod.PHASE_SHIFT:
+            idx = self._pattern_index
+            ppa = self.num_frequencies * 3
+            if idx < ppa:
+                freq = idx // 3 + 1
+                shift = idx % 3 + 1
+                return (
+                    f"X freq {freq}/{self.num_frequencies} shift {shift}/3"
+                    f" ({captured}/{total_cap} captures)"
+                )
+            else:
+                y_idx = idx - ppa
+                freq = y_idx // 3 + 1
+                shift = y_idx % 3 + 1
+                return (
+                    f"Y freq {freq}/{self.num_frequencies} shift {shift}/3"
+                    f" ({captured}/{total_cap} captures)"
+                )
+        else:
+            idx = self._pattern_index
+            total_x = 2 * self.bits_x
+            if idx < total_x:
+                bit = idx // 2 + 1
+                return f"bit {bit}/{self.bits_x} X-axis ({captured}/{total_cap} captures)"
+            else:
+                y_idx = idx - total_x
+                bit = y_idx // 2 + 1
+                return f"bit {bit}/{self.bits_y} Y-axis ({captured}/{total_cap} captures)"
+
     def step(
         self,
         camera_frame: torch.Tensor,
@@ -246,7 +352,11 @@ class CalibrationState:
         # Run decode on a separate frame so the pipeline can push progress
         # updates ("Decoding...") to the dashboard before we block.
         if self.phase == CalibrationPhase.DECODING:
-            logger.info("Running Gray code decode ...")
+            method_name = (
+                "phase shift" if self.method == CalibrationMethod.PHASE_SHIFT
+                else "Gray code"
+            )
+            logger.info("Running %s decode ...", method_name)
             self._decode()
             self.phase = CalibrationPhase.DONE
             return None
@@ -256,19 +366,6 @@ class CalibrationState:
 
         # Change-detection settle: wait for the camera to actually show the
         # new pattern, then capture as soon as it stabilises.
-        #
-        # Phase 1 — WAITING FOR CHANGE:
-        #   Compare each frame to baseline (captured at settle start, still
-        #   showing the old pattern).  Stale repeated frames have zero diff
-        #   and are naturally ignored, so this works regardless of how fast
-        #   the pipeline runs relative to the camera.
-        #
-        # Phase 2 — WAITING FOR STABILITY:
-        #   Once the structural diff exceeds the change threshold (pattern
-        #   arrived), wait for 1 frame where the frame-to-frame diff is low
-        #   (projector has fully displayed the new pattern).
-        #
-        # Timeout: if no change after settle_frames, capture anyway (safety).
         if self._waiting_for_settle:
             self._settle_counter += 1
             gray = self._camera_to_gray(camera_frame)
@@ -375,7 +472,7 @@ class CalibrationState:
 
         if self.phase == CalibrationPhase.PATTERNS:
             self._pattern_index += 1
-            if self._pattern_index >= 2 * (self.bits_x + self.bits_y):
+            if self._pattern_index >= self._num_pattern_steps:
                 # Enter DECODING phase — actual decode runs on the NEXT
                 # step() call so the pipeline can push a progress update first.
                 self.phase = CalibrationPhase.DECODING
@@ -397,19 +494,10 @@ class CalibrationState:
         elif self.phase == CalibrationPhase.BLACK:
             pattern = np.zeros((self.proj_h, self.proj_w), dtype=np.uint8)
         elif self.phase == CalibrationPhase.PATTERNS:
-            idx = self._pattern_index
-            total_x = 2 * self.bits_x
-            if idx < total_x:
-                bit = idx // 2
-                inverted = idx % 2 == 1
-                pattern = generate_pattern(bit, axis=0, inverted=inverted,
-                                           proj_w=self.proj_w, proj_h=self.proj_h)
+            if self.method == CalibrationMethod.PHASE_SHIFT:
+                pattern = self._mps_pattern_for_index(self._pattern_index)
             else:
-                y_idx = idx - total_x
-                bit = y_idx // 2
-                inverted = y_idx % 2 == 1
-                pattern = generate_pattern(bit, axis=1, inverted=inverted,
-                                           proj_w=self.proj_w, proj_h=self.proj_h)
+                pattern = self._graycode_pattern_for_index(self._pattern_index)
         else:
             pattern = np.zeros((self.proj_h, self.proj_w), dtype=np.uint8)
 
@@ -417,6 +505,90 @@ class CalibrationState:
         self._cached_pattern = tensor
         self._cached_pattern_key = key
         return tensor
+
+    # -- MPS pattern generation -----------------------------------------------
+
+    def _mps_pattern_for_index(self, idx: int) -> np.ndarray:
+        """Generate an MPS sinusoidal pattern for the given flat index.
+
+        Pattern index mapping:
+          idx < patterns_per_axis  ->  X-axis
+          idx >= patterns_per_axis ->  Y-axis
+        Within each axis: freq_idx = idx // 3, shift_idx = idx % 3
+        """
+        patterns_per_axis = self.num_frequencies * 3
+
+        if idx < patterns_per_axis:
+            axis = 0
+            freq_idx = idx // 3
+            shift_idx = idx % 3
+        else:
+            axis = 1
+            y_idx = idx - patterns_per_axis
+            freq_idx = y_idx // 3
+            shift_idx = y_idx % 3
+
+        return self._generate_sinusoidal_pattern(freq_idx, shift_idx, axis)
+
+    def _generate_sinusoidal_pattern(
+        self, freq_idx: int, shift_idx: int, axis: int,
+    ) -> np.ndarray:
+        """Generate a single sinusoidal pattern for phase shifting.
+
+        Parameters
+        ----------
+        freq_idx : int
+            Index into the frequency list (0 = coarsest).
+        shift_idx : int
+            Phase shift index: 0 = 0deg, 1 = 120deg, 2 = 240deg.
+        axis : int
+            0 = X (horizontal stripes vary across columns),
+            1 = Y (vertical stripes vary across rows).
+
+        Returns
+        -------
+        np.ndarray
+            (proj_h, proj_w) uint8 pattern.
+        """
+        if axis == 0:
+            wavelength = self._frequencies_x[freq_idx]
+            coords = np.arange(self.proj_w, dtype=np.float64).reshape(1, -1)
+        else:
+            wavelength = self._frequencies_y[freq_idx]
+            coords = np.arange(self.proj_h, dtype=np.float64).reshape(-1, 1)
+
+        phase_shift = shift_idx * 2.0 * np.pi / 3.0
+        sinusoid = 0.5 + self.amplitude * 0.5 * np.cos(
+            2.0 * np.pi * coords / wavelength + phase_shift
+        )
+        pattern = (sinusoid * self.max_brightness).clip(0, 255).astype(np.uint8)
+
+        # Broadcast to full projector resolution
+        pattern = np.broadcast_to(pattern, (self.proj_h, self.proj_w)).copy()
+        return pattern
+
+    # -- Gray code pattern generation -----------------------------------------
+
+    def _graycode_pattern_for_index(self, idx: int) -> np.ndarray:
+        """Generate a Gray code pattern for the given flat index."""
+        total_x = 2 * self.bits_x
+        if idx < total_x:
+            bit = idx // 2
+            inverted = idx % 2 == 1
+            return generate_pattern(
+                bit, axis=0, inverted=inverted,
+                proj_w=self.proj_w, proj_h=self.proj_h,
+            )
+        else:
+            y_idx = idx - total_x
+            bit = y_idx // 2
+            inverted = y_idx % 2 == 1
+            return generate_pattern(
+                bit, axis=1, inverted=inverted,
+                proj_w=self.proj_w, proj_h=self.proj_h,
+            )
+
+    # -- Capture averaging ----------------------------------------------------
 
     def _get_averaged(
         self, index: int, target_shape: tuple[int, int] | None = None,
@@ -443,7 +615,240 @@ class CalibrationState:
             return frames[0]
         return np.mean(frames, axis=0).astype(np.float32)
 
+    # -- Decode dispatch ------------------------------------------------------
+
     def _decode(self) -> None:
+        """Decode captured patterns into a camera->projector mapping."""
+        if self.method == CalibrationMethod.PHASE_SHIFT:
+            self._decode_mps()
+        else:
+            self._decode_graycode()
+
+    # -- MPS phase utilities --------------------------------------------------
+
+    @staticmethod
+    def _phase_to_position(phase: np.ndarray, wavelength: float) -> np.ndarray:
+        """Convert wrapped phase (atan2 output, [-pi, pi]) to position [0, wavelength).
+
+        Uses modular arithmetic to map phase to pixel coordinates.  Handles
+        the floating-point edge case where ``-epsilon % (2*pi)`` evaluates to
+        ``≈ 2*pi`` instead of ``0``, which would otherwise produce a 1-pixel
+        error of one full wavelength at position 0.
+        """
+        TWO_PI = 2.0 * np.pi
+        wrapped = phase % TWO_PI  # map [-pi,pi] -> [0, 2pi)
+        # Fix edge case: values very close to 2pi should be 0
+        wrapped = np.where(wrapped >= TWO_PI - 1e-10, 0.0, wrapped)
+        return wrapped / TWO_PI * wavelength
+
+    # -- MPS decode -----------------------------------------------------------
+
+    def _decode_mps(self) -> None:
+        """Decode captured phase-shift patterns into a camera->projector mapping.
+
+        Algorithm:
+        1. Compute per-pixel wrapped phase at each frequency (3-step formula)
+        2. Build valid mask from modulation amplitude
+        3. Hierarchical phase unwrapping (coarse -> fine)
+        4. Median filter + clamp
+        5. Build remap tables (shared with Gray code path)
+        """
+        white_f = self._get_averaged(0)
+        ref_shape = white_f.shape[:2]
+        black_f = self._get_averaged(1, target_shape=ref_shape)
+
+        h, w = ref_shape
+        diff = white_f - black_f
+
+        logger.info(
+            "MPS Decode: camera %dx%d, projector %dx%d, %d frequencies",
+            w, h, self.proj_w, self.proj_h, self.num_frequencies,
+        )
+        logger.info(
+            "  WHITE ref: min=%.1f max=%.1f mean=%.1f",
+            white_f.min(), white_f.max(), white_f.mean(),
+        )
+        logger.info(
+            "  BLACK ref: min=%.1f max=%.1f mean=%.1f",
+            black_f.min(), black_f.max(), black_f.mean(),
+        )
+        logger.info(
+            "  DIFF (white-black): min=%.1f max=%.1f mean=%.1f",
+            diff.min(), diff.max(), diff.mean(),
+        )
+        logger.info(
+            "  X wavelengths: %s",
+            [f"{wl:.0f}" for wl in self._frequencies_x],
+        )
+        logger.info(
+            "  Y wavelengths: %s",
+            [f"{wl:.0f}" for wl in self._frequencies_y],
+        )
+
+        base = 2  # skip white + black
+        patterns_per_axis = self.num_frequencies * 3
+        TWO_PI = 2.0 * np.pi
+
+        # -- Decode X axis: compute phase and amplitude at each frequency -----
+        phases_x = np.zeros((self.num_frequencies, h, w), dtype=np.float64)
+        amplitudes_x = np.zeros((self.num_frequencies, h, w), dtype=np.float64)
+
+        for freq_idx in range(self.num_frequencies):
+            # Captures at phase shifts 0deg, 120deg, 240deg
+            i0 = self._get_averaged(
+                base + freq_idx * 3 + 0, target_shape=ref_shape,
+            ).astype(np.float64)
+            i1 = self._get_averaged(
+                base + freq_idx * 3 + 1, target_shape=ref_shape,
+            ).astype(np.float64)
+            i2 = self._get_averaged(
+                base + freq_idx * 3 + 2, target_shape=ref_shape,
+            ).astype(np.float64)
+
+            # Standard 3-step formula (shifts at 0, 2pi/3, 4pi/3):
+            #   phase = atan2(sqrt(3)*(I2-I1), 2*I0-I1-I2)
+            # This correctly recovers the spatial phase theta = 2*pi*x/lambda
+            num = np.sqrt(3.0) * (i2 - i1)
+            den = 2.0 * i0 - i1 - i2
+            phases_x[freq_idx] = np.arctan2(num, den)
+            amplitudes_x[freq_idx] = np.sqrt(num**2 + den**2) / 3.0
+
+            if freq_idx < 3:
+                logger.info(
+                    "  X freq %d (wl=%.0f): phase [%.2f, %.2f], "
+                    "amp [%.1f, %.1f] mean=%.1f",
+                    freq_idx, self._frequencies_x[freq_idx],
+                    phases_x[freq_idx].min(), phases_x[freq_idx].max(),
+                    amplitudes_x[freq_idx].min(), amplitudes_x[freq_idx].max(),
+                    amplitudes_x[freq_idx].mean(),
+                )
+
+        # -- Decode Y axis ----------------------------------------------------
+        phases_y = np.zeros((self.num_frequencies, h, w), dtype=np.float64)
+        amplitudes_y = np.zeros((self.num_frequencies, h, w), dtype=np.float64)
+
+        for freq_idx in range(self.num_frequencies):
+            i0 = self._get_averaged(
+                base + patterns_per_axis + freq_idx * 3 + 0,
+                target_shape=ref_shape,
+            ).astype(np.float64)
+            i1 = self._get_averaged(
+                base + patterns_per_axis + freq_idx * 3 + 1,
+                target_shape=ref_shape,
+            ).astype(np.float64)
+            i2 = self._get_averaged(
+                base + patterns_per_axis + freq_idx * 3 + 2,
+                target_shape=ref_shape,
+            ).astype(np.float64)
+
+            num = np.sqrt(3.0) * (i2 - i1)
+            den = 2.0 * i0 - i1 - i2
+            phases_y[freq_idx] = np.arctan2(num, den)
+            amplitudes_y[freq_idx] = np.sqrt(num**2 + den**2) / 3.0
+
+            if freq_idx < 3:
+                logger.info(
+                    "  Y freq %d (wl=%.0f): phase [%.2f, %.2f], "
+                    "amp [%.1f, %.1f] mean=%.1f",
+                    freq_idx, self._frequencies_y[freq_idx],
+                    phases_y[freq_idx].min(), phases_y[freq_idx].max(),
+                    amplitudes_y[freq_idx].min(), amplitudes_y[freq_idx].max(),
+                    amplitudes_y[freq_idx].mean(),
+                )
+
+        # -- Valid mask from modulation amplitude -----------------------------
+        # Pixels with low amplitude didn't receive projector light.
+        # Use Otsu thresholding on the coarsest frequency amplitude.
+        amp_combined = (amplitudes_x[0] + amplitudes_y[0]) / 2.0
+        amp_max = max(float(amp_combined.max()), 1.0)
+        amp_u8 = (amp_combined / amp_max * 255).clip(0, 255).astype(np.uint8)
+        otsu_thresh, _ = cv2.threshold(
+            amp_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        # Use half-Otsu as the cutoff — Otsu can be too aggressive
+        effective_amp_thresh = max(int(otsu_thresh * 0.5), 5)
+        valid_mask = amp_u8 > effective_amp_thresh
+
+        logger.info(
+            "  Amplitude: max=%.1f, Otsu=%d/255, effective thresh=%d/255",
+            amp_max, int(otsu_thresh), effective_amp_thresh,
+        )
+
+        # Supplement with white-black diff if it shows meaningful contrast
+        diff_max = float(diff.max())
+        if diff_max > self.decode_threshold:
+            # Adaptive: use Otsu on the diff to find the illuminated region
+            diff_u8 = np.clip(diff, 0, 255).astype(np.uint8)
+            wb_otsu, _ = cv2.threshold(
+                diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )
+            wb_mask = diff > max(float(wb_otsu) * 0.3, self.decode_threshold * 0.5)
+            valid_mask = valid_mask & wb_mask
+            logger.info(
+                "  White-black diff Otsu=%d, wb_mask pixels=%d",
+                int(wb_otsu), int(np.count_nonzero(wb_mask)),
+            )
+        else:
+            logger.warning(
+                "  White-black diff too low (max=%.1f) — using amplitude only",
+                diff_max,
+            )
+
+        n_valid = int(np.count_nonzero(valid_mask))
+        logger.info(
+            "  Valid pixels (Otsu on amplitude): %d/%d (%.1f%%), "
+            "Otsu threshold=%d/255",
+            n_valid, h * w, 100.0 * n_valid / max(h * w, 1),
+            int(otsu_thresh),
+        )
+
+        # -- Hierarchical phase unwrapping: X axis ----------------------------
+        # Coarsest frequency: 1 period across full width, unambiguous.
+        # Convert wrapped phase to position using _phase_to_position which
+        # handles the floating-point edge case at phase ≈ 0.
+        absolute_x = self._phase_to_position(phases_x[0], self._frequencies_x[0])
+
+        for i in range(1, self.num_frequencies):
+            # Position within one period of the finer frequency
+            fine_px = self._phase_to_position(phases_x[i], self._frequencies_x[i])
+            # Number of whole wavelengths offset (from coarser estimate)
+            k = np.round((absolute_x - fine_px) / self._frequencies_x[i])
+            # Unwrapped fine-resolution estimate
+            absolute_x = fine_px + k * self._frequencies_x[i]
+
+        # -- Hierarchical phase unwrapping: Y axis ----------------------------
+        absolute_y = self._phase_to_position(phases_y[0], self._frequencies_y[0])
+
+        for i in range(1, self.num_frequencies):
+            fine_px = self._phase_to_position(phases_y[i], self._frequencies_y[i])
+            k = np.round((absolute_y - fine_px) / self._frequencies_y[i])
+            absolute_y = fine_px + k * self._frequencies_y[i]
+
+        # -- Median filter for noise reduction + clamp to valid range ---------
+        decoded_x = cv2.medianBlur(absolute_x.astype(np.float32), 5)
+        decoded_y = cv2.medianBlur(absolute_y.astype(np.float32), 5)
+        decoded_x = np.clip(decoded_x, 0, self.proj_w - 1)
+        decoded_y = np.clip(decoded_y, 0, self.proj_h - 1)
+
+        if n_valid > 0:
+            logger.info(
+                "  Decoded X range: [%.1f, %.1f], Y range: [%.1f, %.1f]",
+                float(decoded_x[valid_mask].min()),
+                float(decoded_x[valid_mask].max()),
+                float(decoded_y[valid_mask].min()),
+                float(decoded_y[valid_mask].max()),
+            )
+
+        # Build remap tables (shared pipeline with Gray code)
+        self._build_remap_from_correspondences(
+            decoded_x.astype(np.float32),
+            decoded_y.astype(np.float32),
+            valid_mask, h, w,
+        )
+
+    # -- Gray code decode -----------------------------------------------------
+
+    def _decode_graycode(self) -> None:
         """Decode captured Gray code patterns into a camera->projector mapping.
 
         Uses the same proven methodology as the standalone app:
@@ -455,14 +860,14 @@ class CalibrationState:
         6. Inpainting remaining holes
         """
         white_f = self._get_averaged(0)
-        ref_shape = white_f.shape[:2]  # canonical resolution
+        ref_shape = white_f.shape[:2]
         black_f = self._get_averaged(1, target_shape=ref_shape)
 
         h, w = ref_shape
         diff = white_f - black_f
 
         logger.info(
-            "Decode: camera resolution %dx%d, projector %dx%d",
+            "Gray code Decode: camera resolution %dx%d, projector %dx%d",
             w, h, self.proj_w, self.proj_h,
         )
         logger.info(
@@ -473,12 +878,21 @@ class CalibrationState:
             "  BLACK ref: min=%.1f max=%.1f mean=%.1f",
             black_f.min(), black_f.max(), black_f.mean(),
         )
+        # Adaptive threshold: use Otsu on the diff if it has enough dynamic
+        # range, otherwise fall back to the configured threshold.
+        diff_clipped = np.clip(diff, 0, 255).astype(np.uint8)
+        otsu_val, _ = cv2.threshold(
+            diff_clipped, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        effective_threshold = max(float(otsu_val) * 0.5, self.decode_threshold)
         logger.info(
-            "  DIFF (white-black): min=%.1f max=%.1f mean=%.1f, threshold=%.1f",
-            diff.min(), diff.max(), diff.mean(), self.decode_threshold,
+            "  DIFF (white-black): min=%.1f max=%.1f mean=%.1f, "
+            "Otsu=%.0f, effective threshold=%.1f",
+            diff.min(), diff.max(), diff.mean(),
+            float(otsu_val), effective_threshold,
         )
 
-        valid_mask = diff > self.decode_threshold
+        valid_mask = diff > effective_threshold
         n_valid_diff = int(np.count_nonzero(valid_mask))
         logger.info(
             "  Pixels passing white-black threshold: %d/%d (%.1f%%)",
@@ -486,7 +900,6 @@ class CalibrationState:
         )
 
         # Track per-bit contrast for fallback valid mask
-        # (handles case where WHITE/BLACK refs are bad but patterns are good)
         any_bit_contrast = np.zeros((h, w), dtype=bool)
 
         # Decode X (column) Gray codes with per-bit reliability
@@ -505,7 +918,6 @@ class CalibrationState:
                 any_bit_contrast |= (bit_diff >= self.decode_threshold)
                 if self.bit_threshold > 0:
                     x_reliable &= (bit_diff >= self.bit_threshold)
-                # Log first 3 bits for debugging
                 if bit_idx < 3:
                     logger.info(
                         "  X bit %d: pos_mean=%.1f neg_mean=%.1f "
@@ -543,9 +955,7 @@ class CalibrationState:
                 logger.warning("  Y bit %d: missing captures!", bit_idx)
 
         # Fallback: if WHITE/BLACK refs failed but per-bit contrast is strong,
-        # use per-bit contrast as the valid mask.  This handles cases where
-        # WHITE and BLACK captured the same stale frame (e.g. pipeline ran
-        # faster than camera during reference captures).
+        # use per-bit contrast as the valid mask.
         if n_valid_diff == 0 and np.count_nonzero(any_bit_contrast) > 0:
             n_bit_valid = int(np.count_nonzero(any_bit_contrast))
             logger.warning(
@@ -565,7 +975,7 @@ class CalibrationState:
                 n_before, n_after, n_before - n_after,
             )
 
-        # Vectorized Gray-to-binary decode (much faster than per-pixel loop)
+        # Vectorized Gray-to-binary decode
         binary_x = decoded_x.copy()
         shift = binary_x >> 1
         while np.any(shift):
@@ -584,7 +994,39 @@ class CalibrationState:
         decoded_x = np.clip(decoded_x, 0, self.proj_w - 1)
         decoded_y = np.clip(decoded_y, 0, self.proj_h - 1)
 
-        # -- Post-processing on camera-space decode --
+        # Build remap tables (shared pipeline)
+        self._build_remap_from_correspondences(
+            decoded_x.astype(np.float32),
+            decoded_y.astype(np.float32),
+            valid_mask, h, w,
+        )
+
+    # -- Shared remap building ------------------------------------------------
+
+    def _build_remap_from_correspondences(
+        self,
+        decoded_x: np.ndarray,
+        decoded_y: np.ndarray,
+        valid_mask: np.ndarray,
+        cam_h: int,
+        cam_w: int,
+    ) -> None:
+        """Build projector->camera remap tables from decoded correspondences.
+
+        Shared by both MPS and Gray code decode paths.  Takes decoded
+        projector coordinates (float32) for each camera pixel and builds
+        the dense inverse mapping (projector pixel -> camera pixel).
+
+        Pipeline:
+        1. Morphological cleanup of valid mask
+        2. Spatial consistency filtering
+        3. Gaussian splat fill for dense correspondence
+        4. Outlier rejection (median-based)
+        5. Re-fill after outlier removal
+        6. Final smoothing (median + bilateral)
+        7. Inpainting small holes
+        """
+        # -- Morphological cleanup on camera-space valid mask -----------------
         if self.morph_cleanup:
             n_pre = int(np.count_nonzero(valid_mask))
             k = self.morph_kernel_size
@@ -622,18 +1064,22 @@ class CalibrationState:
                 "  After spatial consistency: %d → %d pixels", n_pre_sc, n_post_sc,
             )
 
-        # -- Build inverse mapping: projector pixel -> camera pixel --
-        # Accumulate weighted sums for Gaussian splat
+        # -- Build inverse mapping: projector pixel -> camera pixel -----------
         sum_cx = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
         sum_cy = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
         count = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
 
         cam_ys, cam_xs = np.where(valid_mask)
-        proj_xs = decoded_x[cam_ys, cam_xs]
-        proj_ys = decoded_y[cam_ys, cam_xs]
+        # Round to integer projector pixel indices for splat accumulation
+        proj_xs = np.round(decoded_x[cam_ys, cam_xs]).astype(np.int32)
+        proj_ys = np.round(decoded_y[cam_ys, cam_xs]).astype(np.int32)
+        proj_xs = np.clip(proj_xs, 0, self.proj_w - 1)
+        proj_ys = np.clip(proj_ys, 0, self.proj_h - 1)
+
         logger.info(
             "  Valid camera pixels for mapping: %d/%d (%.1f%%)",
-            len(cam_ys), h * w, 100.0 * len(cam_ys) / max(h * w, 1),
+            len(cam_ys), cam_h * cam_w,
+            100.0 * len(cam_ys) / max(cam_h * cam_w, 1),
         )
 
         np.add.at(sum_cx, (proj_ys, proj_xs), cam_xs.astype(np.float32))
@@ -641,8 +1087,6 @@ class CalibrationState:
         np.add.at(count, (proj_ys, proj_xs), 1.0)
 
         # Gaussian splat: spread correspondences to fill gaps.
-        # Use a large kernel — coverage can be sparse (15-40%) and we need
-        # to bridge gaps between valid regions.
         fk = max(self.fill_kernel_size, 31)
         fk = fk if fk % 2 == 1 else fk + 1
         sum_cx_s = cv2.GaussianBlur(sum_cx, (fk, fk), 0)
@@ -662,11 +1106,7 @@ class CalibrationState:
             100.0 * n_raw / max(self.proj_h * self.proj_w, 1),
         )
 
-        # -- Outlier rejection: median-based smoothness filter --
-        # A valid mapping should be locally smooth (neighboring projector
-        # pixels map to nearby camera pixels).  Reject pixels where the
-        # map value deviates from the local median by more than a threshold.
-        # NOTE: cv2.medianBlur only supports float32 for ksize <= 5.
+        # -- Outlier rejection: median-based smoothness filter ----------------
         med_k = 5
         for pass_i in range(2):
             med_x = cv2.medianBlur(
@@ -675,8 +1115,7 @@ class CalibrationState:
             med_y = cv2.medianBlur(
                 np.where(valid_proj, map_y, 0).astype(np.float32), med_k,
             )
-            # Expected gradient: camera_res / projector_res ≈ pixels per step
-            expected_grad = max(w, h) / max(self.proj_w, self.proj_h)
+            expected_grad = max(cam_w, cam_h) / max(self.proj_w, self.proj_h)
             outlier_thresh = max(expected_grad * med_k, 8.0)
             diff_x = np.abs(map_x - med_x)
             diff_y = np.abs(map_y - med_y)
@@ -695,8 +1134,7 @@ class CalibrationState:
             else:
                 break
 
-        # -- Re-fill after outlier removal with Gaussian splat --
-        # Rebuild from cleaned valid pixels only
+        # -- Re-fill after outlier removal with Gaussian splat ----------------
         clean_valid = valid_proj & (map_x >= 0) & (map_y >= 0)
         sum_cx2 = np.zeros_like(sum_cx)
         sum_cy2 = np.zeros_like(sum_cy)
@@ -714,13 +1152,11 @@ class CalibrationState:
         map_y[valid_proj2] = sum_cy2[valid_proj2] / count2[valid_proj2]
         valid_proj = valid_proj2
 
-        # -- Final smoothing: median + bilateral filter --
-        # Median removes remaining salt-and-pepper noise
+        # -- Final smoothing: median + bilateral filter -----------------------
         map_x_f = np.where(valid_proj, map_x, 0).astype(np.float32)
         map_y_f = np.where(valid_proj, map_y, 0).astype(np.float32)
         map_x_f = cv2.medianBlur(map_x_f, 5)
         map_y_f = cv2.medianBlur(map_y_f, 5)
-        # Bilateral preserves edges while smoothing — sigma tuned for pixel coords
         map_x_f = cv2.bilateralFilter(map_x_f, 9, 20.0, 20.0)
         map_y_f = cv2.bilateralFilter(map_y_f, 9, 20.0, 20.0)
         map_x[valid_proj] = map_x_f[valid_proj]
@@ -735,7 +1171,7 @@ class CalibrationState:
             n_valid_proj, total_proj, 100.0 * n_valid_proj / max(total_proj, 1),
         )
 
-        # -- Gradient quality check (diagnostic) --
+        # -- Gradient quality check (diagnostic) -----------------------------
         gx = np.abs(np.diff(map_x, axis=1))
         gy = np.abs(np.diff(map_y, axis=0))
         gx_v = gx[valid_proj[:, :-1]]
@@ -809,7 +1245,7 @@ def save_calibration(
     """
     p = Path(path)
 
-    # Fast binary save — instant even for 1920×1080
+    # Fast binary save — instant even for 1920x1080
     npz_path = p.with_suffix(".npz")
     np.savez_compressed(
         npz_path,
