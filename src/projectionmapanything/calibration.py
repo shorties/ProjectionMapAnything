@@ -570,10 +570,16 @@ class CalibrationState:
     # -- Gray code pattern generation -----------------------------------------
 
     def _graycode_pattern_for_index(self, idx: int) -> np.ndarray:
-        """Generate a Gray code pattern for the given flat index."""
+        """Generate a Gray code pattern for the given flat index.
+
+        Patterns are projected MSB-first (coarsest stripes first) for
+        robustness — coarse bits survive JPEG compression and camera noise,
+        while fine bits (LSB) are captured last when they matter least.
+        """
         total_x = 2 * self.bits_x
         if idx < total_x:
-            bit = idx // 2
+            capture_bit = idx // 2
+            bit = (self.bits_x - 1) - capture_bit  # MSB first
             inverted = idx % 2 == 1
             return generate_pattern(
                 bit, axis=0, inverted=inverted,
@@ -581,7 +587,8 @@ class CalibrationState:
             )
         else:
             y_idx = idx - total_x
-            bit = y_idx // 2
+            capture_bit = y_idx // 2
+            bit = (self.bits_y - 1) - capture_bit  # MSB first
             inverted = y_idx % 2 == 1
             return generate_pattern(
                 bit, axis=1, inverted=inverted,
@@ -903,56 +910,59 @@ class CalibrationState:
         any_bit_contrast = np.zeros((h, w), dtype=bool)
 
         # Decode X (column) Gray codes with per-bit reliability
+        # Patterns were captured MSB-first: capture 0 = MSB, capture N-1 = LSB
         base = 2  # skip white + black
         decoded_x = np.zeros((h, w), dtype=np.int32)
         x_reliable = np.ones((h, w), dtype=bool)
-        for bit_idx in range(self.bits_x):
-            pos_idx = base + bit_idx * 2
-            neg_idx = base + bit_idx * 2 + 1
+        for capture_idx in range(self.bits_x):
+            actual_bit = (self.bits_x - 1) - capture_idx  # MSB first
+            pos_idx = base + capture_idx * 2
+            neg_idx = base + capture_idx * 2 + 1
             if self._captures[pos_idx] and self._captures[neg_idx]:
                 pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
                 neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
-                decoded_x |= bit_val << bit_idx
+                decoded_x |= bit_val << actual_bit
                 bit_diff = np.abs(pos_f - neg_f)
                 any_bit_contrast |= (bit_diff >= self.decode_threshold)
                 if self.bit_threshold > 0:
                     x_reliable &= (bit_diff >= self.bit_threshold)
-                if bit_idx < 3:
-                    logger.info(
-                        "  X bit %d: pos_mean=%.1f neg_mean=%.1f "
-                        "abs_diff: min=%.1f max=%.1f mean=%.1f",
-                        bit_idx, pos_f.mean(), neg_f.mean(),
-                        bit_diff.min(), bit_diff.max(), bit_diff.mean(),
-                    )
+                logger.info(
+                    "  X bit %d (capture %d): pos_mean=%.1f neg_mean=%.1f "
+                    "abs_diff: min=%.1f max=%.1f mean=%.1f",
+                    actual_bit, capture_idx, pos_f.mean(), neg_f.mean(),
+                    bit_diff.min(), bit_diff.max(), bit_diff.mean(),
+                )
             else:
-                logger.warning("  X bit %d: missing captures!", bit_idx)
+                logger.warning("  X bit %d (capture %d): missing captures!",
+                               actual_bit, capture_idx)
 
         # Decode Y (row) Gray codes with per-bit reliability
         base_y = base + self.bits_x * 2
         decoded_y = np.zeros((h, w), dtype=np.int32)
         y_reliable = np.ones((h, w), dtype=bool)
-        for bit_idx in range(self.bits_y):
-            pos_idx = base_y + bit_idx * 2
-            neg_idx = base_y + bit_idx * 2 + 1
+        for capture_idx in range(self.bits_y):
+            actual_bit = (self.bits_y - 1) - capture_idx  # MSB first
+            pos_idx = base_y + capture_idx * 2
+            neg_idx = base_y + capture_idx * 2 + 1
             if self._captures[pos_idx] and self._captures[neg_idx]:
                 pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
                 neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
                 bit_val = (pos_f > neg_f).astype(np.int32)
-                decoded_y |= bit_val << bit_idx
+                decoded_y |= bit_val << actual_bit
                 bit_diff = np.abs(pos_f - neg_f)
                 any_bit_contrast |= (bit_diff >= self.decode_threshold)
                 if self.bit_threshold > 0:
                     y_reliable &= (bit_diff >= self.bit_threshold)
-                if bit_idx < 3:
-                    logger.info(
-                        "  Y bit %d: pos_mean=%.1f neg_mean=%.1f "
-                        "abs_diff: min=%.1f max=%.1f mean=%.1f",
-                        bit_idx, pos_f.mean(), neg_f.mean(),
-                        bit_diff.min(), bit_diff.max(), bit_diff.mean(),
-                    )
+                logger.info(
+                    "  Y bit %d (capture %d): pos_mean=%.1f neg_mean=%.1f "
+                    "abs_diff: min=%.1f max=%.1f mean=%.1f",
+                    actual_bit, capture_idx, pos_f.mean(), neg_f.mean(),
+                    bit_diff.min(), bit_diff.max(), bit_diff.mean(),
+                )
             else:
-                logger.warning("  Y bit %d: missing captures!", bit_idx)
+                logger.warning("  Y bit %d (capture %d): missing captures!",
+                               actual_bit, capture_idx)
 
         # Fallback: if WHITE/BLACK refs failed but per-bit contrast is strong,
         # use per-bit contrast as the valid mask.

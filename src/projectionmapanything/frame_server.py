@@ -362,7 +362,7 @@ class FrameStreamer:
         settle_frames: int = 10,
         capture_frames: int = 3,
         max_brightness: int = 128,
-        method: str = "phase_shift",
+        method: str = "gray_code",
         refine: bool = False,
     ) -> dict:
         """Start a standalone calibration session using browser webcam frames.
@@ -396,7 +396,7 @@ class FrameStreamer:
         self._standalone_calib = CalibrationState(
             proj_w, proj_h,
             method=method,
-            settle_frames=max(30, settle_frames),  # timeout only
+            settle_frames=max(60, settle_frames),  # timeout only
             capture_frames=max(2, capture_frames),  # at least 2 for averaging
             max_brightness=max_brightness,
             change_threshold=5.0,
@@ -1288,7 +1288,7 @@ class FrameStreamer:
                         settle_frames=int(cfg.get("settle_frames", 30)),
                         capture_frames=int(cfg.get("capture_frames", 2)),
                         max_brightness=int(cfg.get("max_brightness", 128)),
-                        method=str(cfg.get("method", "phase_shift")),
+                        method=str(cfg.get("method", "gray_code")),
                         refine=bool(cfg.get("refine", False)),
                     )
                     resp = json.dumps(result).encode()
