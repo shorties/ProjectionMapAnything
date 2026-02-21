@@ -1,113 +1,124 @@
 # ProjectionMapAnything
 
-AI-powered projection mapping with structured light calibration, real-time depth estimation, and VJ effects. Built as a [Daydream Scope](https://scope.daydream.live) plugin.
+**Turn any surface into a living AI canvas.**
 
-Inspired by Microsoft's RoomAlive Toolkit / IllumiRoom.
+ProjectionMapAnything is a [Daydream Scope](https://scope.daydream.live) plugin that calibrates a camera-projector pair, maps room geometry, and feeds depth data to AI models so their output wraps onto your physical space in real time. Point a projector at a wall, a stage set, a sculpture — the AI sees the shape and generates visuals that follow every contour.
 
-## What it does
+Inspired by Microsoft's [RoomAlive Toolkit](https://www.microsoft.com/en-us/research/project/roomalive-toolkit/) and [IllumiRoom](https://www.microsoft.com/en-us/research/project/illumiroom/).
 
-1. **Calibrate** your projector-camera setup using Gray code structured light patterns
-2. **Estimate depth** from calibration disparity or AI (Depth Anything V2)
-3. **Warp** depth maps from camera perspective to projector perspective
-4. **Apply effects** — edge blending, animated depth effects, subject isolation
-5. **Condition** the AI model (VACE/ControlNet) so generated visuals match your room geometry
-6. **Project** the AI output onto physical surfaces via MJPEG streaming
+---
 
-## Installation
+## How it works
 
-**In Scope:**
-1. Open Settings > Plugins
-2. Install from Git URL:
 ```
-git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectionmapanything
+Camera ──> Calibration (Gray code) ──> Depth Map ──> AI Model (VACE) ──> Projector
+              one-time setup          every frame     Krea / Longlive     onto walls
 ```
-3. Restart Scope
+
+1. **Calibrate** — Gray code structured light patterns establish a pixel-perfect mapping between your camera and projector
+2. **Depth** — Compute scene depth from calibration disparity or Depth Anything V2
+3. **Condition** — Feed the depth map to a VACE-enabled AI model so it generates geometry-aware visuals
+4. **Project** — Stream the AI output to your projector via the built-in dashboard
+
+Everything runs from a single Scope preprocessor — calibration, depth, effects, isolation, and projector streaming.
+
+---
 
 ## Quick Start
 
-### Setup
+### Install
 
-You need an AI pipeline with an in-context adapter that responds to depth conditioning (the preprocessor feeds depth maps as VACE input). Examples that work:
+In Scope, go to **Settings > Plugins** and install from Git URL:
+
+```
+git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectionmapanything
+```
+
+### Configure
+
+You need a main AI pipeline with VACE (in-context depth adapter) enabled. Pipelines that work:
 
 - **Krea Realtime** with VACE enabled
 - **Longlive** with VACE enabled
 
-1. Select your AI pipeline as main and enable VACE
+1. Select your AI pipeline as main, enable VACE
 2. Select **Projection-Map-Anything (VJ.Tools)** as preprocessor
-3. Open the dashboard (change port 8000 to 8765 in the Scope URL)
+3. Open the dashboard — change port `8000` to `8765` in your Scope URL
 
-### Calibration
+### Calibrate
 
-Calibration runs inline — no need to switch pipelines. Keep your AI running while you calibrate:
+Calibration runs inline while the AI keeps generating — no pipeline switching needed.
 
-1. Click the **Projector** button on the dashboard
-2. Drag the projector window to your projector, click to go fullscreen
-3. Toggle **Start Calibration** in the Scope settings panel
-4. Gray code patterns project automatically — calibration saves when done
-5. When complete, depth conditioning resumes automatically
+1. On the dashboard, click **Projector** and drag the window to your projector
+2. Click to go fullscreen
+3. Toggle **Start Calibration** in Scope settings
+4. Gray code patterns fire automatically — takes about 30 seconds
+5. Done. Depth conditioning kicks in immediately.
 
-### Projection
+### Perform
 
-Once calibrated, depth conditioning feeds the AI model and the generated output streams to the projector. Adjust depth mode, effects, and isolation from the dashboard or Scope settings.
+Once calibrated, the AI sees your room's geometry and generates accordingly. Tweak everything live from the dashboard: depth mode, VJ effects, subject isolation, edge blending.
 
-The preprocessor handles everything — calibration, depth conditioning, effects, isolation, and MJPEG streaming to the projector via the dashboard.
+---
 
 ## Depth Modes
 
-All modes use static calibration data — no live camera processing on the projector output (avoids feedback loops).
+All modes use static calibration data — never the live camera feed (avoids projector-camera feedback loops).
 
 | Mode | Description |
 |------|-------------|
-| **AI Depth** (default) | Depth Anything V2 on raw camera image, warped to projector perspective |
-| **Calibration Disparity** | Horizontal disparity from calibration — simple, fast, no AI needed |
-| **Edge Detection** | Canny edges on warped camera image |
-| **Warped Camera** | RGB camera image warped to projector perspective |
-| **Custom Upload** | Upload your own depth map via the dashboard |
+| **AI Depth** | Depth Anything V2 on the raw camera image, warped to projector space. Best quality. |
+| **Calibration Disparity** | Horizontal disparity computed during calibration. Fast, no AI model needed. |
+| **Edge Detection** | Canny edges on the warped camera image. Great for structural VACE guidance. |
+| **Warped Camera** | The camera image warped to projector perspective. |
+| **Custom Upload** | Your own depth map, uploaded via the dashboard. |
 
-## Depth Effects
+## VJ Effects
 
-Animated effects that modify the depth conditioning signal. All effects are surface-masked — they only animate on projection surfaces, leaving void regions black.
+Animated effects that modulate the depth conditioning signal. All effects are **surface-masked** — they only animate on projection surfaces, void stays black.
 
-| Effect | Description |
-|--------|-------------|
-| `noise_blend` | Animated fractal noise blended into depth |
-| `flow_warp` | Organic morphing distortion via noise field |
-| `pulse` | Rhythmic depth oscillation (breathing) |
-| `wave_warp` | Sinusoidal ripple distortion |
-| `kaleido` | Kaleidoscope symmetry (mandala patterns) |
-| `shockwave` | Radial shockwave from center (depth-aware) |
-| `wobble` | Room jelly wobble (depth-aware) |
-| `geometry_edges` | Glowing outlines on depth edges |
-| `depth_fog` | Animated fog rolling through depth layers |
-| `radial_zoom` | Tunnel zoom burst from center (depth-aware) |
+| | | |
+|---|---|---|
+| **Noise Blend** — fractal noise | **Flow Warp** — organic morphing | **Pulse** — rhythmic breathing |
+| **Wave Warp** — sinusoidal ripples | **Kaleido** — mandala symmetry | **Shockwave** — radial burst |
+| **Wobble** — jelly room distortion | **Geometry Edges** — glowing outlines | **Depth Fog** — rolling fog layers |
+| **Radial Zoom** — tunnel burst | | |
 
 ## Subject Isolation
 
 | Mode | Description |
 |------|-------------|
-| `depth_band` | Auto-detect nearest surfaces via histogram peak |
-| `mask` | Upload a custom mask image via dashboard |
-| `rembg` | AI background removal (requires `rembg` optional dependency) |
+| **Depth Band** | Auto-detect nearest surfaces via histogram peak |
+| **Custom Mask** | Upload a mask image via dashboard |
+| **rembg** | AI background removal (optional `rembg` dependency) |
+
+---
 
 ## Dashboard
 
-Web-based control panel on the stream port (default 8765):
-- Live preview of depth conditioning and projector output
-- Projector pop-out window (fullscreen on your projector)
-- Calibration progress and result downloads
-- Depth mode, effects, isolation controls
-- Custom depth map / mask upload
+Web control panel on port **8765** with:
 
-Access it by changing the port in your Scope URL from 8000 to 8765. On RunPod, replace `-8000.` with `-8765.` in the URL.
+- **Projector window** — pop out to your projector, click for fullscreen
+- **Live preview** — see depth conditioning and projector output side by side
+- **All controls** — depth mode, effects, isolation, edge blend, calibration
+- **Upload** — custom depth maps and isolation masks
+- **Calibration results** — coverage map, warped camera, disparity map downloads
 
-## RunPod Deployment
+Access: change `8000` to `8765` in your Scope URL. On RunPod, replace `-8000.` with `-8765.` in the proxy URL.
 
-- Port 8765 must be explicitly exposed in RunPod settings
-- URL pattern: `https://{pod-id}-8765.proxy.runpod.net/`
-- Install from Git URL in Scope's plugin settings:
+---
+
+## RunPod
+
+Works on RunPod — expose port **8765** in your pod settings.
+
 ```
 git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectionmapanything
 ```
+
+Dashboard URL: `https://{pod-id}-8765.proxy.runpod.net/`
+
+---
 
 ## Requirements
 
