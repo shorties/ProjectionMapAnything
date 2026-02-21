@@ -34,8 +34,7 @@ You need an AI pipeline with an in-context adapter that responds to depth condit
 
 1. Select your AI pipeline as main and enable VACE
 2. Select **Projection-Map-Anything (VJ.Tools)** as preprocessor
-3. Select **ProjectionMapAnything Projector** as postprocessor
-4. Open the dashboard (change port 8000 to 8765 in the Scope URL)
+3. Open the dashboard (change port 8000 to 8765 in the Scope URL)
 
 ### Calibration
 
@@ -51,12 +50,7 @@ Calibration runs inline — no need to switch pipelines. Keep your AI running wh
 
 Once calibrated, depth conditioning feeds the AI model and the generated output streams to the projector. Adjust depth mode, effects, and isolation from the dashboard or Scope settings.
 
-## Pipelines
-
-| Pipeline | Role | Description |
-|----------|------|-------------|
-| **Projection-Map-Anything (VJ.Tools)** | Preprocessor | Calibration + depth conditioning + effects + isolation |
-| **ProjectionMapAnything Projector** | Postprocessor | MJPEG stream to projector with color correction |
+The preprocessor handles everything — calibration, depth conditioning, effects, isolation, and MJPEG streaming to the projector via the dashboard.
 
 ## Depth Modes
 
