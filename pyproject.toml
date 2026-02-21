@@ -1,9 +1,9 @@
 [project]
 name = "projectionmapanything"
-version = "0.7.21"
+version = "0.7.22"
 description = "ProjectionMapAnything (VJ.Tools) Scope Plugin — AI-powered projection mapping with structured light calibration, depth estimation, and real-time VJ effects"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["opencv-python-headless"]
 
 [project.optional-dependencies]
 rembg = ["rembg"]
