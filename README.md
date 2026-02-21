@@ -96,13 +96,9 @@ Animated effects that modulate the depth conditioning signal. All effects are **
 
 ## Dashboard
 
-Web control panel on port **8765** with:
+All calibration and depth controls are available directly in Scope's settings panel. The dashboard is only needed for the **projector output window** — it hosts the MJPEG stream you drag to your projector and fullscreen.
 
-- **Projector window** — pop out to your projector, click for fullscreen
-- **Live preview** — see depth conditioning and projector output side by side
-- **All controls** — depth mode, effects, isolation, edge blend, calibration
-- **Upload** — custom depth maps and isolation masks
-- **Calibration results** — coverage map, warped camera, disparity map downloads
+It also provides some extras: live preview, calibration result downloads, and custom depth/mask uploads.
 
 Access: change `8000` to `8765` in your Scope URL. On RunPod, replace `-8000.` with `-8765.` in the proxy URL.
 
