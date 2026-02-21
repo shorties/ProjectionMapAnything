@@ -1217,6 +1217,15 @@ class ProMapAnythingPipeline(Pipeline):
                     else:
                         ambient_np = (ambient_np * 255).clip(0, 255).astype(np.uint8)
 
+                    # Save raw camera frame for AI depth estimation
+                    _RESULTS_DIR.mkdir(exist_ok=True)
+                    try:
+                        ambient_bgr = cv2.cvtColor(ambient_np, cv2.COLOR_RGB2BGR)
+                        cv2.imwrite(str(_RESULTS_DIR / "ambient_camera.png"), ambient_bgr)
+                        logger.info("Saved ambient camera frame for AI depth")
+                    except Exception:
+                        logger.warning("Could not save ambient_camera.png", exc_info=True)
+
                     _pvm = self._calib.proj_valid_mask
                     _str = self._streamer
 
@@ -1408,28 +1417,61 @@ class ProMapAnythingPipeline(Pipeline):
         return result
 
     def _ai_depth(self) -> torch.Tensor:
-        """Run Depth Anything V2 on the warped camera image (cached).
+        """Run Depth Anything V2 on the raw camera image, then warp to projector (cached).
 
-        The warped camera image is already in projector perspective (from
-        calibration), so the AI depth map is geometrically correct for
-        projection mapping conditioning.
+        The AI model sees a natural camera image (what it was trained on),
+        then we warp the resulting depth map to projector perspective using
+        the calibration remap tables.
         """
+        from .remap import build_warped_depth_image
+
         cached = getattr(self, "_ai_depth_cache", None)
         if cached is not None:
             return cached
 
-        # Load warped camera (already warped to projector perspective)
-        warped = self._get_static_warped_camera()
+        # Load the raw camera image from calibration (ambient frame)
+        ambient_path = _RESULTS_DIR / "ambient_camera.png"
+        if ambient_path.is_file():
+            img = cv2.imread(str(ambient_path))
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                camera_frame = torch.from_numpy(
+                    img.astype(np.float32) / 255.0
+                ).to(self.device)
+            else:
+                logger.warning("Could not read ambient_camera.png — using grey fallback")
+                camera_frame = None
+        else:
+            # Fall back to warped camera (run depth on it as last resort)
+            logger.warning(
+                "No ambient_camera.png found — re-run calibration to generate it. "
+                "Falling back to warped camera image (less accurate)."
+            )
+            camera_frame = None
 
-        # Run Depth Anything V2
+        if camera_frame is None:
+            # Last resort: use warped camera (not ideal but better than nothing)
+            camera_frame = self._get_static_warped_camera()
+
+        # Run Depth Anything V2 on the camera image
         self._ensure_depth_model()
-        depth = self._depth.estimate(warped)  # (H, W) [0,1], near=bright
+        depth = self._depth.estimate(camera_frame)  # (H, W) [0,1], near=bright
 
-        # Convert to RGB tensor
-        depth_rgb = depth.unsqueeze(-1).expand(-1, -1, 3).contiguous()
-        self._ai_depth_cache = depth_rgb
-        logger.info("AI depth computed and cached (Depth Anything V2 on warped camera)")
-        return depth_rgb
+        # If we have an un-warped camera image, warp the depth to projector space
+        if ambient_path.is_file() and self._map_x is not None:
+            result = build_warped_depth_image(
+                depth, self._map_x, self._map_y,
+                self._proj_valid_mask,
+                self.proj_h, self.proj_w,
+                device=self.device,
+            )
+        else:
+            # Already in projector space (warped camera fallback)
+            result = depth.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+
+        self._ai_depth_cache = result
+        logger.info("AI depth computed and cached (Depth Anything V2)")
+        return result
 
     def _canny_edges(
         self, frame_f: torch.Tensor, is_static: bool = False,
