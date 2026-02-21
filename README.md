@@ -27,7 +27,12 @@ git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectio
 
 ### Setup
 
-1. Select any AI pipeline (e.g. Krea/VACE) as main
+You need an AI pipeline with an in-context adapter that responds to depth conditioning (the preprocessor feeds depth maps as VACE input). Examples that work:
+
+- **Krea Realtime** with VACE enabled
+- **Longlive** with VACE enabled
+
+1. Select your AI pipeline as main and enable VACE
 2. Select **Projection-Map-Anything (VJ.Tools)** as preprocessor
 3. Select **ProjectionMapAnything Projector** as postprocessor
 4. Open the dashboard (change port 8000 to 8765 in the Scope URL)
