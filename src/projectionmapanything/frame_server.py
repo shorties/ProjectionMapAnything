@@ -57,6 +57,53 @@ class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
 
 
+# ── Test card images ────────────────────────────────────────────────────────
+
+_PKG_DIR = Path(__file__).parent
+_TESTCARD_16_9_PATH = _PKG_DIR / "testcard_16_9.jpg"
+_TESTCARD_4_3_PATH = _PKG_DIR / "testcard_4_3.jpg"
+
+
+def _load_testcard(target_w: int, target_h: int) -> np.ndarray:
+    """Load the appropriate test card for the given resolution.
+
+    Picks 16:9 or 4:3 based on nearest aspect ratio, then center-crops
+    and resizes to match the target resolution exactly.
+    """
+    target_ar = target_w / max(target_h, 1)
+    # Pick closest aspect ratio
+    if abs(target_ar - 16 / 9) <= abs(target_ar - 4 / 3):
+        card_path = _TESTCARD_16_9_PATH
+    else:
+        card_path = _TESTCARD_4_3_PATH
+
+    if card_path.is_file():
+        bgr = cv2.imread(str(card_path))
+        if bgr is not None:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            ch, cw = rgb.shape[:2]
+            card_ar = cw / max(ch, 1)
+            # Center-crop to target aspect ratio
+            if card_ar > target_ar:
+                # Card is wider — crop sides
+                new_w = int(ch * target_ar)
+                x0 = (cw - new_w) // 2
+                rgb = rgb[:, x0:x0 + new_w]
+            elif card_ar < target_ar:
+                # Card is taller — crop top/bottom
+                new_h = int(cw / target_ar)
+                y0 = (ch - new_h) // 2
+                rgb = rgb[y0:y0 + new_h, :]
+            # Resize to exact target
+            rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return rgb
+
+    # Fallback: grey card with border
+    card = np.full((target_h, target_w, 3), 128, dtype=np.uint8)
+    cv2.rectangle(card, (2, 2), (target_w - 3, target_h - 3), (200, 200, 200), 1)
+    return card
+
+
 # ── HTML templates ───────────────────────────────────────────────────────────
 
 _PROJECTOR_HTML = """\
@@ -407,9 +454,8 @@ class FrameStreamer:
         self._calibration_active = True
         self.clear_calibration_results()
 
-        # Send initial test card to projector stream
-        card = np.full((proj_h, proj_w, 3), max_brightness, dtype=np.uint8)
-        cv2.rectangle(card, (2, 2), (proj_w - 3, proj_h - 3), (200, 200, 200), 1)
+        # Send test pattern to projector stream while waiting to start
+        card = _load_testcard(proj_w, proj_h)
         self.submit_calibration_frame(card)
 
         total = self._standalone_calib.total_patterns
@@ -1357,6 +1403,10 @@ class FrameStreamer:
             target=self._server.serve_forever, name="frame-streamer", daemon=True
         )
         self._thread.start()
+
+        # Submit initial test card so /projector has something to show
+        card = _load_testcard(1920, 1080)
+        self.submit_calibration_frame(card)
 
         logger.info(
             "FrameStreamer: MJPEG server started on port %d "
