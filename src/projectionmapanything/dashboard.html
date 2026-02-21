@@ -187,14 +187,10 @@
       <div class="ctrl">
         <span class="ctrl-label">Mode</span>
         <select onchange="param('depth_mode',this.value)" id="p-depth_mode">
-          <option value="structured_light">Structured Light</option>
-          <option value="canny">Canny Edges</option>
-          <option value="depth_then_warp">Depth then Warp</option>
-          <option value="warp_then_depth">Warp then Depth</option>
-          <option value="warped_rgb">Warped RGB</option>
-          <option value="static_depth_warped">Static Depth (warped)</option>
-          <option value="static_depth_from_warped">Static Depth (from warped)</option>
-          <option value="static_warped_camera">Static Warped Camera</option>
+          <option value="ai_depth">AI Depth</option>
+          <option value="disparity">Calibration Disparity</option>
+          <option value="canny">Edge Detection</option>
+          <option value="warped_rgb">Warped Camera</option>
           <option value="custom">Custom Upload</option>
         </select>
       </div>

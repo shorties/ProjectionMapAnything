@@ -40,7 +40,6 @@ from .calibration import (
     save_calibration,
 )
 from .frame_server import FrameStreamer, get_or_create_streamer
-from .remap import derive_depth_from_calibration
 from .schema import (
     ProMapAnythingCalibrateConfig,
     ProMapAnythingConfig,
@@ -71,6 +70,7 @@ def publish_calibration_results(
     proj_valid_mask: np.ndarray | None,
     coverage_pct: float,
     streamer: FrameStreamer | None,
+    disparity_map: np.ndarray | None = None,
 ) -> dict[str, bytes]:
     """Generate calibration artifacts, push to streamer, and upload to Scope gallery.
 
@@ -82,6 +82,8 @@ def publish_calibration_results(
         Boolean mask of valid projector pixels (before inpainting).
     streamer : FrameStreamer | None
         Shared MJPEG streamer to push results to.
+    disparity_map : np.ndarray | None
+        (proj_h, proj_w) float32 [0, 1] disparity from calibration.
 
     Returns
     -------
@@ -120,25 +122,19 @@ def publish_calibration_results(
     except Exception:
         logger.warning("Could not generate warped camera image", exc_info=True)
 
-    # 4. Structured light depth maps — both methods
-    for method, filename in [
-        ("displacement", "depth_displacement.png"),
-        ("jacobian", "depth_jacobian.png"),
-    ]:
+    # 4. Disparity depth map (from calibration decode)
+    if disparity_map is not None:
         try:
-            depth = derive_depth_from_calibration(
-                map_x, map_y, proj_valid_mask, method=method,
-            )
-            depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
-            depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
-            ok, buf = cv2.imencode(".png", depth_bgr)
+            disp_u8 = (disparity_map * 255).clip(0, 255).astype(np.uint8)
+            disp_bgr = cv2.cvtColor(disp_u8, cv2.COLOR_GRAY2BGR)
+            ok, buf = cv2.imencode(".png", disp_bgr)
             if ok:
-                files[filename] = buf.tobytes()
-                logger.info("Generated %s depth map", method)
+                files["depth_disparity.png"] = buf.tobytes()
+                logger.info("Generated disparity depth map")
         except Exception:
-            logger.warning("Could not generate %s depth image", method, exc_info=True)
+            logger.warning("Could not generate disparity depth image", exc_info=True)
 
-    # Save result images to disk for static_calibration mode
+    # Save result images to disk
     _RESULTS_DIR.mkdir(exist_ok=True)
     for name, data in files.items():
         if name.endswith(".png"):
@@ -420,6 +416,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                     save_calibration(
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
                         self.proj_w, self.proj_h,
+                        disparity_map=self._calib.disparity_map,
                     )
                     logger.info("Calibration saved.")
 
@@ -542,6 +539,9 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         proj_valid_mask = (
             self._calib.proj_valid_mask if self._calib is not None else None
         )
+        disparity_map = (
+            self._calib.disparity_map if self._calib is not None else None
+        )
 
         publish_calibration_results(
             map_x=map_x,
@@ -552,6 +552,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             proj_valid_mask=proj_valid_mask,
             coverage_pct=coverage_pct,
             streamer=self._streamer,
+            disparity_map=disparity_map,
         )
 
 
@@ -599,6 +600,7 @@ class ProMapAnythingPipeline(Pipeline):
         self._map_x: np.ndarray | None = None
         self._map_y: np.ndarray | None = None
         self._proj_valid_mask: np.ndarray | None = None
+        self._disparity_map: np.ndarray | None = None
         self.proj_w: int = 1920
         self.proj_h: int = 1080
 
@@ -611,6 +613,11 @@ class ProMapAnythingPipeline(Pipeline):
         # Last warped camera frame (for edge blend)
         self._last_warped_camera: np.ndarray | None = None
 
+        # Cached depth results (invalidated on recalibration / resolution change)
+        self._disparity_depth_cache: torch.Tensor | None = None
+        self._ai_depth_cache: torch.Tensor | None = None
+        self._static_warped_camera: torch.Tensor | None = None
+
         # -- Inline calibration state --
         self._calib: CalibrationState | None = None
         self._calibrating = False
@@ -621,14 +628,15 @@ class ProMapAnythingPipeline(Pipeline):
         # Load calibration
         cal_path = _DEFAULT_CALIBRATION_PATH
         if cal_path.is_file():
-            mx, my, pw, ph, ts = load_calibration(cal_path)
+            mx, my, pw, ph, ts, disp = load_calibration(cal_path)
             self._map_x = mx
             self._map_y = my
+            self._disparity_map = disp
             self.proj_w = pw
             self.proj_h = ph
             logger.info(
-                "Calibration loaded from %s (%dx%d, captured %s)",
-                cal_path, pw, ph, ts,
+                "Calibration loaded from %s (%dx%d, captured %s, disparity=%s)",
+                cal_path, pw, ph, ts, "yes" if disp is not None else "no",
             )
         else:
             logger.warning(
@@ -690,9 +698,9 @@ class ProMapAnythingPipeline(Pipeline):
             self._map_x = None
             self._map_y = None
             self._proj_valid_mask = None
+            self._disparity_map = None
             self._prev_depth = None
-            self._sl_depth_cache_displacement = None
-            self._sl_depth_cache_jacobian = None
+            self._disparity_depth_cache = None
             self._ai_depth_cache = None
             self._static_warped_camera = None
             self._calib = None
@@ -719,8 +727,7 @@ class ProMapAnythingPipeline(Pipeline):
                     self.proj_w = new_pw
                     self.proj_h = new_ph
                     # Invalidate caches that depend on projector resolution
-                    self._sl_depth_cache_displacement = None
-                    self._sl_depth_cache_jacobian = None
+                    self._disparity_depth_cache = None
                     self._ai_depth_cache = None
                     self._static_warped_camera = None
                     logger.info("Projector resolution auto-detected: %dx%d", self.proj_w, self.proj_h)
@@ -733,7 +740,7 @@ class ProMapAnythingPipeline(Pipeline):
 
         # All processing params — read from dashboard overrides with sensible defaults
         # (disabled by default; advanced users tune via dashboard)
-        depth_mode = self._p("depth_mode", kwargs, "structured_light")
+        depth_mode = self._p("depth_mode", kwargs, "ai_depth")
         temporal_smoothing = self._p("temporal_smoothing", kwargs, 0.0)
         depth_blur = self._p("depth_blur", kwargs, 0.0)
         edge_erosion = int(self._p("edge_erosion", kwargs, 0))
@@ -766,21 +773,17 @@ class ProMapAnythingPipeline(Pipeline):
         # a visual feedback loop. Only use static/cached depth sources.
         if depth_mode == "ai_depth" and has_calib:
             rgb = self._ai_depth()
-        elif depth_mode == "structured_light" and has_calib:
-            rgb = self._structured_light_depth(method="displacement")
-        elif depth_mode == "structured_light_jacobian" and has_calib:
-            rgb = self._structured_light_depth(method="jacobian")
+        elif depth_mode == "disparity" and has_calib:
+            rgb = self._disparity_depth()
         elif depth_mode == "custom":
             rgb = self._get_custom_depth(frame_f)
-        elif depth_mode.startswith("static_"):
-            rgb = self._get_static_frame(depth_mode)
         elif depth_mode == "canny" and has_calib:
             rgb = self._canny_edges(frame_f, is_static=True)
         elif depth_mode == "warped_rgb" and has_calib:
             rgb = self._warped_rgb_static()
         elif has_calib:
-            # Any other mode with calibration: use displacement depth
-            rgb = self._structured_light_depth(method="displacement")
+            # Any other mode with calibration: use AI depth
+            rgb = self._ai_depth()
         else:
             # No calibration: neutral grey (no live depth — would cause feedback)
             rgb = self._grey_fallback(frame_f)
@@ -1178,9 +1181,11 @@ class ProMapAnythingPipeline(Pipeline):
                 mapping = self._calib.get_mapping()
                 if mapping is not None:
                     map_x, map_y = mapping
+                    disp = self._calib.disparity_map
                     save_calibration(
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
                         self.proj_w, self.proj_h,
+                        disparity_map=disp,
                     )
                     logger.info("Inline calibration saved to %s", _DEFAULT_CALIBRATION_PATH)
 
@@ -1188,10 +1193,10 @@ class ProMapAnythingPipeline(Pipeline):
                     self._map_x = map_x
                     self._map_y = map_y
                     self._proj_valid_mask = self._calib.proj_valid_mask
+                    self._disparity_map = disp
 
                     # Clear cached depth so all depth modes recompute
-                    self._sl_depth_cache_displacement = None
-                    self._sl_depth_cache_jacobian = None
+                    self._disparity_depth_cache = None
                     self._ai_depth_cache = None
                     self._static_warped_camera = None
 
@@ -1220,6 +1225,7 @@ class ProMapAnythingPipeline(Pipeline):
                         logger.warning("Could not save ambient_camera.png", exc_info=True)
 
                     _pvm = self._calib.proj_valid_mask
+                    _disp = self._calib.disparity_map
                     _str = self._streamer
 
                     def _publish_bg():
@@ -1230,6 +1236,7 @@ class ProMapAnythingPipeline(Pipeline):
                             proj_valid_mask=_pvm,
                             coverage_pct=coverage_pct,
                             streamer=_str,
+                            disparity_map=_disp,
                         )
                         if _str is not None:
                             _str.update_calibration_progress(
@@ -1391,22 +1398,44 @@ class ProMapAnythingPipeline(Pipeline):
             (h, w, 3), 0.5, dtype=torch.float32, device=self.device,
         )
 
-    def _structured_light_depth(self, method: str = "displacement") -> torch.Tensor:
-        """Derive depth from structured light calibration (cached per method)."""
-        cache_attr = f"_sl_depth_cache_{method}"
-        cached = getattr(self, cache_attr, None)
+    def _disparity_depth(self) -> torch.Tensor:
+        """Return the calibration disparity map as depth (cached)."""
+        cached = getattr(self, "_disparity_depth_cache", None)
         if cached is not None:
             return cached
 
-        depth = derive_depth_from_calibration(
-            self._map_x, self._map_y, self._proj_valid_mask,
-            method=method,
-        )
-        # Convert to RGB tensor
+        if self._disparity_map is not None:
+            depth = self._disparity_map
+        else:
+            # Fallback: compute simple disparity from map_x
+            logger.warning(
+                "No disparity map in calibration — computing from map_x. "
+                "Re-run calibration to get a proper disparity map."
+            )
+            px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
+                self.proj_h, axis=0,
+            )
+            valid = (self._map_x >= 0) if self._map_x is not None else None
+            if self._map_x is not None and valid is not None:
+                disp = np.zeros_like(self._map_x)
+                disp[valid] = self._map_x[valid] - px[valid]
+                vals = disp[valid]
+                if vals.size > 0:
+                    p2, p98 = float(np.percentile(vals, 2)), float(np.percentile(vals, 98))
+                    if p98 - p2 > 1e-6:
+                        disp = (disp - p2) / (p98 - p2)
+                    else:
+                        disp = np.full_like(disp, 0.5)
+                depth = np.clip(disp, 0.0, 1.0).astype(np.float32)
+            else:
+                depth = np.full(
+                    (self.proj_h, self.proj_w), 0.5, dtype=np.float32,
+                )
+
         depth_rgb = np.stack([depth, depth, depth], axis=-1)
         result = torch.from_numpy(depth_rgb).to(self.device)
-        setattr(self, cache_attr, result)
-        logger.info("Structured light depth (%s) computed and cached", method)
+        self._disparity_depth_cache = result
+        logger.info("Disparity depth loaded and cached")
         return result
 
     def _ai_depth(self) -> torch.Tensor:

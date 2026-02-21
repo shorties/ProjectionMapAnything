@@ -256,8 +256,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     depth_mode: Literal[
         "ai_depth",
-        "structured_light",
-        "structured_light_jacobian",
+        "disparity",
         "canny",
         "warped_rgb",
         "custom",
@@ -267,11 +266,11 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "Conditioning input for the AI model. All modes use static "
             "calibration data — never live camera processing (avoids "
             "camera-projector feedback loops). "
-            "ai_depth: Depth Anything V2 on the warped camera image "
-            "(best quality, recommended). "
-            "structured_light: displacement-based depth from calibration. "
-            "structured_light_jacobian: Jacobian-based depth. "
-            "canny: edge detection on warped camera from calibration. "
+            "ai_depth: Depth Anything V2 on the raw camera image, warped "
+            "to projector perspective (best quality, recommended). "
+            "disparity: horizontal disparity from calibration — simple, "
+            "fast, no AI model needed. "
+            "canny: edge detection on warped camera image. "
             "warped_rgb: warped camera image from calibration. "
             "custom: upload your own via the dashboard."
         ),
