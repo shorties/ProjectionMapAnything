@@ -34,7 +34,6 @@ import torch
 from scope.core.pipelines.interface import Pipeline, Requirements
 
 from .calibration import (
-    CalibrationMethod,
     CalibrationPhase,
     CalibrationState,
     load_calibration,
@@ -232,7 +231,6 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         self.proj_h: int = kwargs.get("projector_height", 1080)
         self._settle_frames: int = kwargs.get("settle_frames", 15)
         self._capture_frames: int = kwargs.get("capture_frames", 3)
-        self._cal_method: str = kwargs.get("calibration_method", "phase_shift")
 
         # Start the MJPEG streamer for the projector pop-out window
         port = kwargs.get("stream_port", 8765)
@@ -392,11 +390,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
 
         # -- Start calibration on first toggle ON ----------------------------
         if start and not self._calibrating and not self._done:
-            # Read method from runtime kwargs (user may have changed it)
-            cal_method = kwargs.get("calibration_method", self._cal_method)
             self._calib = CalibrationState(
                 self.proj_w, self.proj_h,
-                method=cal_method,
                 settle_frames=self._settle_frames,
                 capture_frames=self._capture_frames,
                 max_brightness=self._cal_brightness,
@@ -406,8 +401,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
             logger.info(
-                "Calibration started (%s, %d patterns)",
-                cal_method, self._calib.total_patterns,
+                "Calibration started (Gray code, %d patterns)",
+                self._calib.total_patterns,
             )
 
         # -- Step calibration ------------------------------------------------
@@ -1146,10 +1141,8 @@ class ProMapAnythingPipeline(Pipeline):
 
         # -- First toggle ON: create CalibrationState -----------------------
         if start and not self._calibrating and not self._calib_done:
-            cal_method = str(self._p("calibration_method", kwargs, "phase_shift"))
             self._calib = CalibrationState(
                 self.proj_w, self.proj_h,
-                method=cal_method,
                 settle_frames=settle_frames,
                 capture_frames=capture_frames,
                 max_brightness=cal_brightness,
@@ -1162,9 +1155,9 @@ class ProMapAnythingPipeline(Pipeline):
             if self._streamer is not None:
                 self._streamer.clear_calibration_results()
             logger.info(
-                "Inline calibration started (%s, %d patterns, %dx%d, speed=%.1f, "
-                "capture=%d, change-detection settle)",
-                cal_method, self._calib.total_patterns, self.proj_w, self.proj_h,
+                "Inline calibration started (Gray code, %d patterns, %dx%d, "
+                "speed=%.1f, capture=%d)",
+                self._calib.total_patterns, self.proj_w, self.proj_h,
                 cal_speed, capture_frames,
             )
 

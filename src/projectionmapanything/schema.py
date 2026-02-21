@@ -9,9 +9,6 @@ from scope.core.pipelines.base_schema import (
     ui_field_config,
 )
 
-# Valid calibration methods — must match CalibrationMethod enum values
-_CALIBRATION_METHODS = ["phase_shift", "gray_code"]
-
 
 # =============================================================================
 # Calibration main pipeline
@@ -91,20 +88,6 @@ class ProMapAnythingCalibrateConfig(BasePipelineConfig):
             order=3,
             label="Reset Calibration",
             category="input",
-        ),
-    )
-
-    calibration_method: Literal["phase_shift", "gray_code"] = Field(
-        default="gray_code",
-        description=(
-            "Calibration method. phase_shift: smooth sinusoidal patterns, "
-            "survives JPEG compression, fewer patterns, sub-pixel precision. "
-            "gray_code: binary stripe patterns, requires high-quality capture."
-        ),
-        json_schema_extra=ui_field_config(
-            order=3,
-            label="Calibration Method",
-            category="configuration",
         ),
     )
 
@@ -265,20 +248,6 @@ class ProMapAnythingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=2,
             label="Calibration Speed",
-            category="configuration",
-        ),
-    )
-
-    calibration_method: Literal["phase_shift", "gray_code"] = Field(
-        default="gray_code",
-        description=(
-            "Calibration method. phase_shift: smooth sinusoidal patterns, "
-            "survives JPEG compression, fewer patterns, sub-pixel precision. "
-            "gray_code: binary stripe patterns, requires high-quality capture."
-        ),
-        json_schema_extra=ui_field_config(
-            order=3,
-            label="Calibration Method",
             category="configuration",
         ),
     )
