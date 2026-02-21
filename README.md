@@ -25,28 +25,32 @@ git+https://github.com/shorties/ProjectionMapAnything.git#subdirectory=projectio
 
 ## Quick Start
 
-### Calibration
+### Setup
 
-1. Select your AI pipeline (e.g. Krea/VACE) as main
-2. Select **Projection-Map-Anything (VJ.Tools)** as preprocessor
-3. Open the dashboard (change port 8000 to 8765 in the Scope URL) and click the **Projector** button
-4. Drag the projector window to your projector, click to go fullscreen
-5. Toggle **Start Calibration** in the Scope settings panel
-6. Gray code patterns project automatically — calibration saves when done
-
-### VJ Mode
-
-1. Select your AI pipeline (e.g. Krea/VACE) as main
+1. Select any AI pipeline (e.g. Krea/VACE) as main
 2. Select **Projection-Map-Anything (VJ.Tools)** as preprocessor
 3. Select **ProjectionMapAnything Projector** as postprocessor
-4. The depth map conditions the AI; the AI output streams to your projector
+4. Open the dashboard (change port 8000 to 8765 in the Scope URL)
 
-## Three Pipelines
+### Calibration
+
+Calibration runs inline — no need to switch pipelines. Keep your AI running while you calibrate:
+
+1. Click the **Projector** button on the dashboard
+2. Drag the projector window to your projector, click to go fullscreen
+3. Toggle **Start Calibration** in the Scope settings panel
+4. Gray code patterns project automatically — calibration saves when done
+5. When complete, depth conditioning resumes automatically
+
+### Projection
+
+Once calibrated, depth conditioning feeds the AI model and the generated output streams to the projector. Adjust depth mode, effects, and isolation from the dashboard or Scope settings.
+
+## Pipelines
 
 | Pipeline | Role | Description |
 |----------|------|-------------|
-| **ProjectionMapAnything Calibrate** | Main | Gray code structured light calibration |
-| **Projection-Map-Anything (VJ.Tools)** | Preprocessor | Depth conditioning + projector warp + effects + inline calibration |
+| **Projection-Map-Anything (VJ.Tools)** | Preprocessor | Calibration + depth conditioning + effects + isolation |
 | **ProjectionMapAnything Projector** | Postprocessor | MJPEG stream to projector with color correction |
 
 ## Depth Modes
