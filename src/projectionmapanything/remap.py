@@ -81,9 +81,10 @@ def derive_depth_from_calibration(
     depth = (disparity - p2) / (p98 - p2)
     depth = np.clip(depth, 0.0, 1.0).astype(np.float32)
 
-    # CLAHE for local contrast enhancement
+    # CLAHE for local contrast enhancement (conservative settings to avoid
+    # amplifying noise into visible tile boundaries)
     depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
     depth_u8 = clahe.apply(depth_u8)
 
     # Inpaint holes
@@ -120,11 +121,57 @@ def _disparity_displacement(
     map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarray,
     proj_h: int, proj_w: int,
 ) -> np.ndarray:
-    """Affine-residual displacement magnitude → depth-dependent parallax."""
+    """Homography-residual displacement magnitude → depth-dependent parallax.
+
+    Fits a perspective transform (homography) to the correspondence map
+    to remove the bulk camera-projector geometry.  Residuals from the
+    homography represent depth-dependent parallax — closer objects deviate
+    more from the planar projection model.
+
+    Previous versions used a 3-parameter affine fit which could not capture
+    perspective foreshortening, causing false depth patterns on flat surfaces.
+    """
     px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
     py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
 
-    # Fit affine model to remove bulk camera-projector geometry
+    # Build source/destination point arrays for homography
+    src = np.column_stack([px[valid], py[valid]]).astype(np.float32)
+    dst = np.column_stack([map_x[valid], map_y[valid]]).astype(np.float32)
+
+    # Subsample for performance (findHomography on 100k+ points is slow)
+    rng = np.random.default_rng(42)
+    if len(src) > 10000:
+        idx = rng.choice(len(src), 10000, replace=False)
+        H, _ = cv2.findHomography(src[idx], dst[idx], cv2.RANSAC, 5.0)
+    else:
+        H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+
+    if H is None:
+        # Fallback to affine if homography fails
+        logger.warning("Homography fit failed — falling back to affine")
+        return _disparity_displacement_affine(map_x, map_y, valid, proj_h, proj_w)
+
+    # Apply homography to all projector pixels
+    pts = np.column_stack(
+        [px.ravel(), py.ravel()]
+    ).astype(np.float32).reshape(-1, 1, 2)
+    pred = cv2.perspectiveTransform(pts, H).reshape(proj_h, proj_w, 2)
+
+    res_x = map_x - pred[:, :, 0]
+    res_y = map_y - pred[:, :, 1]
+    disp = np.sqrt(res_x ** 2 + res_y ** 2)
+    disp[~valid] = 0.0
+    return disp
+
+
+def _disparity_displacement_affine(
+    map_x: np.ndarray, map_y: np.ndarray, valid: np.ndarray,
+    proj_h: int, proj_w: int,
+) -> np.ndarray:
+    """Affine-residual fallback (used when homography fails)."""
+    px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
+    py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
+
     vx, vy = px[valid], py[valid]
     A_mat = np.column_stack([vx, vy, np.ones_like(vx)])
     cx, _, _, _ = np.linalg.lstsq(A_mat, map_x[valid], rcond=None)

@@ -698,6 +698,7 @@ class ProMapAnythingPipeline(Pipeline):
             self._prev_depth = None
             self._sl_depth_cache_displacement = None
             self._sl_depth_cache_jacobian = None
+            self._ai_depth_cache = None
             self._static_warped_camera = None
             self._calib = None
             self._calibrating = False
@@ -725,6 +726,7 @@ class ProMapAnythingPipeline(Pipeline):
                     # Invalidate caches that depend on projector resolution
                     self._sl_depth_cache_displacement = None
                     self._sl_depth_cache_jacobian = None
+                    self._ai_depth_cache = None
                     self._static_warped_camera = None
                     logger.info("Projector resolution auto-detected: %dx%d", self.proj_w, self.proj_h)
 
@@ -767,7 +769,9 @@ class ProMapAnythingPipeline(Pipeline):
         # IMPORTANT: Never run live depth estimation on the camera feed in
         # projection mapping — the camera sees the projector output, creating
         # a visual feedback loop. Only use static/cached depth sources.
-        if depth_mode == "structured_light" and has_calib:
+        if depth_mode == "ai_depth" and has_calib:
+            rgb = self._ai_depth()
+        elif depth_mode == "structured_light" and has_calib:
             rgb = self._structured_light_depth(method="displacement")
         elif depth_mode == "structured_light_jacobian" and has_calib:
             rgb = self._structured_light_depth(method="jacobian")
@@ -1192,9 +1196,10 @@ class ProMapAnythingPipeline(Pipeline):
                     self._map_y = map_y
                     self._proj_valid_mask = self._calib.proj_valid_mask
 
-                    # Clear cached depth so structured_light recomputes
+                    # Clear cached depth so all depth modes recompute
                     self._sl_depth_cache_displacement = None
                     self._sl_depth_cache_jacobian = None
+                    self._ai_depth_cache = None
                     self._static_warped_camera = None
 
                     # Coverage
@@ -1401,6 +1406,30 @@ class ProMapAnythingPipeline(Pipeline):
         setattr(self, cache_attr, result)
         logger.info("Structured light depth (%s) computed and cached", method)
         return result
+
+    def _ai_depth(self) -> torch.Tensor:
+        """Run Depth Anything V2 on the warped camera image (cached).
+
+        The warped camera image is already in projector perspective (from
+        calibration), so the AI depth map is geometrically correct for
+        projection mapping conditioning.
+        """
+        cached = getattr(self, "_ai_depth_cache", None)
+        if cached is not None:
+            return cached
+
+        # Load warped camera (already warped to projector perspective)
+        warped = self._get_static_warped_camera()
+
+        # Run Depth Anything V2
+        self._ensure_depth_model()
+        depth = self._depth.estimate(warped)  # (H, W) [0,1], near=bright
+
+        # Convert to RGB tensor
+        depth_rgb = depth.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+        self._ai_depth_cache = depth_rgb
+        logger.info("AI depth computed and cached (Depth Anything V2 on warped camera)")
+        return depth_rgb
 
     def _canny_edges(
         self, frame_f: torch.Tensor, is_static: bool = False,

@@ -118,19 +118,12 @@ _PROJECTOR_HTML = """\
     position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
     object-fit: contain; background: #000;
   }
-  #calib-badge {
-    position: fixed; top: 10px; left: 10px; padding: 5px 12px;
-    background: rgba(234,179,8,0.85); color: #000; font-size: 11px;
-    font-weight: 600; border-radius: 3px; z-index: 50; display: none;
-  }
 </style>
 </head><body>
 <img id="mjpeg" src="/stream" />
-<div id="calib-badge">CALIBRATING</div>
 
 <script>
 const mjpeg = document.getElementById('mjpeg');
-const calibBadge = document.getElementById('calib-badge');
 
 // ---- Fullscreen on click ----
 document.body.addEventListener('click', () => {
@@ -159,13 +152,6 @@ mjpeg.onerror = () => {
   setTimeout(() => { mjpeg.src = '/stream?t=' + Date.now(); }, 1000);
 };
 
-// ---- Calibration badge (poll status) ----
-setInterval(() => {
-  fetch('/calibration/status').then(r => r.ok ? r.json() : null).then(d => {
-    if (!d) return;
-    calibBadge.style.display = d.active ? 'block' : 'none';
-  }).catch(() => {});
-}, 2000);
 
 // ---- Report projector resolution ----
 function postConfig() {
