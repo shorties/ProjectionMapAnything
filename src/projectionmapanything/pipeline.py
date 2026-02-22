@@ -768,9 +768,8 @@ class ProMapAnythingPipeline(Pipeline):
         is_static = True
 
         # -- Depth / source selection -----------------------------------------
-        # IMPORTANT: Never run live depth estimation on the camera feed in
-        # projection mapping — the camera sees the projector output, creating
-        # a visual feedback loop. Only use static/cached depth sources.
+        # All depth modes use static calibration data — never the live camera
+        # feed (the camera sees the projector, creating feedback loops).
         if depth_mode == "ai_depth" and has_calib:
             rgb = self._ai_depth()
         elif depth_mode == "disparity" and has_calib:
@@ -796,6 +795,20 @@ class ProMapAnythingPipeline(Pipeline):
             reference_frame = self._get_static_warped_camera()
         else:
             reference_frame = frame_f
+
+        # -- Temporal smoothing -----------------------------------------------
+        if temporal_smoothing > 0 and self._prev_depth is not None:
+            prev = self._prev_depth
+            if prev.shape == rgb.shape:
+                rgb = temporal_smoothing * prev + (1 - temporal_smoothing) * rgb
+        self._prev_depth = rgb.clone()
+
+        # -- Depth blur -------------------------------------------------------
+        if depth_blur > 0.5:
+            rgb_np = rgb.cpu().numpy()
+            ksize = int(depth_blur) * 2 + 1
+            rgb_np = cv2.GaussianBlur(rgb_np, (ksize, ksize), 0)
+            rgb = torch.from_numpy(rgb_np.astype(np.float32)).to(self.device)
 
         # -- Edge processing (erosion, contrast, clipping) --------------------
         rgb = self._apply_edge_processing(
@@ -1439,60 +1452,96 @@ class ProMapAnythingPipeline(Pipeline):
         return result
 
     def _ai_depth(self) -> torch.Tensor:
-        """Run Depth Anything V2 on the raw camera image, then warp to projector (cached).
+        """Run Depth Anything V2 on the ambient camera image, warp to projector.
 
-        The AI model sees a natural camera image (what it was trained on),
-        then we warp the resulting depth map to projector perspective using
-        the calibration remap tables.
+        Pipeline:
+        1. Load ambient_camera.png (raw camera image from calibration)
+        2. Run Depth Anything V2 → (H_cam, W_cam) float32 [0,1]
+        3. cv2.remap float32 depth to projector space (no uint8 round-trip)
+        4. Inpaint holes from unmapped/invalid calibration pixels
+        5. Cache result (static — recomputed only on recalibration)
+
+        Falls back to warped_camera.png (already projector-space) if the
+        ambient image is unavailable. In that case, warping is skipped.
         """
-        from .remap import build_warped_depth_image
-
         cached = getattr(self, "_ai_depth_cache", None)
         if cached is not None:
             return cached
 
-        # Load the raw camera image from calibration (ambient frame)
+        # -- 1. Load source image (camera space) --
         ambient_path = _RESULTS_DIR / "ambient_camera.png"
+        needs_warp = False
+
         if ambient_path.is_file():
             img = cv2.imread(str(ambient_path))
             if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 camera_frame = torch.from_numpy(
-                    img.astype(np.float32) / 255.0
+                    cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 ).to(self.device)
+                needs_warp = True
+                logger.info(
+                    "AI depth: loaded ambient camera %dx%d",
+                    img.shape[1], img.shape[0],
+                )
             else:
-                logger.warning("Could not read ambient_camera.png — using grey fallback")
-                camera_frame = None
+                logger.warning("AI depth: could not decode ambient_camera.png")
+                camera_frame = self._get_static_warped_camera()
         else:
-            # Fall back to warped camera (run depth on it as last resort)
             logger.warning(
-                "No ambient_camera.png found — re-run calibration to generate it. "
-                "Falling back to warped camera image (less accurate)."
+                "AI depth: no ambient_camera.png — using warped camera "
+                "(re-run calibration to get better results)"
             )
-            camera_frame = None
-
-        if camera_frame is None:
-            # Last resort: use warped camera (not ideal but better than nothing)
             camera_frame = self._get_static_warped_camera()
 
-        # Run Depth Anything V2 on the camera image
+        # -- 2. Run depth estimation --
         self._ensure_depth_model()
         depth = self._depth.estimate(camera_frame)  # (H, W) [0,1], near=bright
+        depth_np = depth.cpu().numpy().astype(np.float32)
 
-        # If we have an un-warped camera image, warp the depth to projector space
-        if ambient_path.is_file() and self._map_x is not None:
-            result = build_warped_depth_image(
-                depth, self._map_x, self._map_y,
-                self._proj_valid_mask,
-                self.proj_h, self.proj_w,
-                device=self.device,
+        # -- 3. Warp to projector space --
+        if needs_warp and self._map_x is not None and self._map_y is not None:
+            # Remap on float32 directly (no uint8 precision loss).
+            # Use borderValue=-1 so we can distinguish unmapped border
+            # pixels from legitimately dark (far) depth values.
+            warped = cv2.remap(
+                depth_np, self._map_x, self._map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=-1.0,
+            )
+
+            # Hole mask: unmapped border pixels + calibration-invalid pixels
+            holes = warped < 0
+            if self._proj_valid_mask is not None:
+                holes = holes | ~self._proj_valid_mask
+            warped[holes] = 0.0
+
+            # -- 4. Inpaint holes for clean edges --
+            if np.any(holes):
+                hole_u8 = holes.astype(np.uint8) * 255
+                warped_u8 = (warped * 255).clip(0, 255).astype(np.uint8)
+                warped_u8 = cv2.inpaint(warped_u8, hole_u8, 5, cv2.INPAINT_TELEA)
+                warped = warped_u8.astype(np.float32) / 255.0
+
+            depth_np = warped
+            logger.info(
+                "AI depth: warped to projector %dx%d, range [%.3f, %.3f], "
+                "holes=%.1f%%",
+                depth_np.shape[1], depth_np.shape[0],
+                depth_np.min(), depth_np.max(),
+                100.0 * np.count_nonzero(holes) / max(holes.size, 1),
             )
         else:
-            # Already in projector space (warped camera fallback)
-            result = depth.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+            logger.info(
+                "AI depth: no warp (source already projector-space), "
+                "shape=%dx%d", depth_np.shape[1], depth_np.shape[0],
+            )
+
+        # -- 5. Grayscale → RGB tensor, cache --
+        rgb_np = np.stack([depth_np, depth_np, depth_np], axis=-1)
+        result = torch.from_numpy(rgb_np).to(self.device)
 
         self._ai_depth_cache = result
-        logger.info("AI depth computed and cached (Depth Anything V2)")
         return result
 
     def _canny_edges(

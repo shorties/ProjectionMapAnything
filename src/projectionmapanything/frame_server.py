@@ -112,52 +112,149 @@ _PROJECTOR_HTML = """\
 <title>Projection-Map-Anything Projector</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; cursor: pointer; }
+  body {
+    background: #000; overflow: hidden; width: 100vw; height: 100vh;
+    cursor: pointer;
+  }
+  /* Hide cursor in any fullscreen mode (API or F11/kiosk) */
   body.fs { cursor: none; }
   #mjpeg {
     position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
     object-fit: contain; background: #000;
   }
+  /* Subtle restore banner — only shown when API fullscreen was lost */
+  #restore {
+    display: none; position: fixed; bottom: 0; left: 0; right: 0;
+    text-align: center; padding: 6px;
+    background: rgba(0,0,0,0.6); color: #888;
+    font: 12px/1.2 sans-serif; z-index: 10; pointer-events: none;
+  }
+  #restore.show { display: block; }
+  /* Auto-hide the banner after 4 seconds */
+  #restore.fade { opacity: 0; transition: opacity 0.5s; }
 </style>
 </head><body>
 <img id="mjpeg" src="/stream" />
+<div id="restore">Click or press any key to restore fullscreen</div>
 
 <script>
 const mjpeg = document.getElementById('mjpeg');
+const restoreBanner = document.getElementById('restore');
 
-// ---- Fullscreen on click ----
-document.body.addEventListener('click', () => {
-  if (!document.fullscreenElement) {
-    document.documentElement.requestFullscreen().catch(() => {});
-  }
-});
-
+// ---- Fullscreen state tracking ----
+// wasFullscreen persists so we always know the user intended fullscreen.
+// It is only cleared by pressing Escape (explicit exit).
 let wasFullscreen = false;
+let fadeTimer = null;
+
+function goFullscreen() {
+  document.documentElement.requestFullscreen().catch(() => {});
+}
+
+function showBanner() {
+  restoreBanner.classList.add('show');
+  restoreBanner.classList.remove('fade');
+  clearTimeout(fadeTimer);
+  fadeTimer = setTimeout(() => { restoreBanner.classList.add('fade'); }, 4000);
+}
+
+function hideBanner() {
+  restoreBanner.classList.remove('show', 'fade');
+  clearTimeout(fadeTimer);
+}
+
+// Detect whether the window fills the screen (F11/kiosk mode).
+// In this case the Fullscreen API is NOT active but we should
+// still hide the cursor and skip the restore banner.
+function isWindowFullscreen() {
+  return (
+    window.outerWidth >= screen.width - 2 &&
+    window.outerHeight >= screen.height - 2
+  );
+}
+
+function updateFSClass() {
+  const apiFS = !!document.fullscreenElement;
+  const windowFS = isWindowFullscreen();
+  document.body.classList.toggle('fs', apiFS || windowFS);
+}
+
+// ---- Fullscreen change tracking ----
 document.addEventListener('fullscreenchange', () => {
   const isFS = !!document.fullscreenElement;
-  document.body.classList.toggle('fs', isFS);
-  wasFullscreen = isFS;
+  updateFSClass();
+  if (isFS) {
+    wasFullscreen = true;
+    hideBanner();
+  } else if (wasFullscreen) {
+    // Fullscreen was lost (focus change, etc.) — show restore hint
+    // unless the window is still filling the screen (F11)
+    if (!isWindowFullscreen()) showBanner();
+  }
   setTimeout(postConfig, 300);
 });
 
-// Auto-re-enter fullscreen when window regains focus
-window.addEventListener('focus', () => {
-  if (wasFullscreen && !document.fullscreenElement) {
-    document.documentElement.requestFullscreen().catch(() => {});
+// Explicit Escape clears the intent — user chose to exit
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    wasFullscreen = false;
+    hideBanner();
   }
 });
+
+// ---- Restore fullscreen on any user-activation event ----
+// requestFullscreen() requires user activation: click, keydown,
+// pointerdown, or touchstart.  We listen on ALL of these so that
+// any interaction with the projector window restores fullscreen.
+function tryRestore(e) {
+  if (wasFullscreen && !document.fullscreenElement) {
+    goFullscreen();
+  }
+}
+document.addEventListener('click', tryRestore);
+document.addEventListener('keydown', tryRestore);
+document.addEventListener('pointerdown', tryRestore);
+document.addEventListener('touchstart', tryRestore);
+
+// First click when not yet fullscreen → enter fullscreen
+document.body.addEventListener('click', () => {
+  if (!document.fullscreenElement) goFullscreen();
+});
+
+// ---- Non-activation restore attempts (may fail, but free to try) ----
+window.addEventListener('focus', () => {
+  updateFSClass();
+  if (wasFullscreen && !document.fullscreenElement && !isWindowFullscreen()) {
+    goFullscreen();  // works in some browsers
+    showBanner();    // show banner in case it fails
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    updateFSClass();
+    if (wasFullscreen && !document.fullscreenElement && !isWindowFullscreen()) {
+      goFullscreen();
+      showBanner();
+    }
+  }
+});
+
+// Periodic check — if user used F11, update cursor style
+setInterval(updateFSClass, 2000);
 
 // ---- MJPEG reconnect on error ----
 mjpeg.onerror = () => {
   setTimeout(() => { mjpeg.src = '/stream?t=' + Date.now(); }, 1000);
 };
 
-
 // ---- Report projector resolution ----
 function postConfig() {
-  const isFS = !!document.fullscreenElement;
-  const w = isFS ? window.innerWidth : window.screen.width;
-  const h = isFS ? window.innerHeight : window.screen.height;
+  const apiFS = !!document.fullscreenElement;
+  const windowFS = isWindowFullscreen();
+  const isFS = apiFS || windowFS;
+  const w = isFS ? screen.width : window.innerWidth;
+  const h = isFS ? screen.height : window.innerHeight;
   fetch('/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -166,7 +263,10 @@ function postConfig() {
 }
 postConfig();
 setInterval(postConfig, 30000);
-window.addEventListener('resize', () => { setTimeout(postConfig, 500); });
+window.addEventListener('resize', () => {
+  updateFSClass();
+  setTimeout(postConfig, 500);
+});
 </script>
 </body></html>
 """
