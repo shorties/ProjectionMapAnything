@@ -116,13 +116,14 @@ _PROJECTOR_HTML = """\
     background: #000; overflow: hidden; width: 100vw; height: 100vh;
     cursor: pointer;
   }
-  /* Hide cursor in any fullscreen mode (API or F11/kiosk) */
   body.fs { cursor: none; }
-  #mjpeg {
+  #webrtc, #mjpeg {
     position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
     object-fit: contain; background: #000;
   }
-  /* Subtle restore banner — only shown when API fullscreen was lost */
+  /* Default: MJPEG on top (fallback until WebRTC connects) */
+  #mjpeg  { z-index: 2; }
+  #webrtc { z-index: 1; }
   #restore {
     display: none; position: fixed; bottom: 0; left: 0; right: 0;
     text-align: center; padding: 6px;
@@ -130,20 +131,157 @@ _PROJECTOR_HTML = """\
     font: 12px/1.2 sans-serif; z-index: 10; pointer-events: none;
   }
   #restore.show { display: block; }
-  /* Auto-hide the banner after 4 seconds */
   #restore.fade { opacity: 0; transition: opacity 0.5s; }
 </style>
 </head><body>
+<video id="webrtc" autoplay playsinline muted></video>
 <img id="mjpeg" src="/stream" />
 <div id="restore">Click or press any key to restore fullscreen</div>
 
 <script>
-const mjpeg = document.getElementById('mjpeg');
+const webrtcEl = document.getElementById('webrtc');
+const mjpegEl = document.getElementById('mjpeg');
 const restoreBanner = document.getElementById('restore');
 
+// ---- Layer state ----
+let calibActive = false;
+let webrtcConnected = false;
+let pc = null;           // RTCPeerConnection
+let rtcRetryTimer = null;
+
+function updateLayers() {
+  if (calibActive) {
+    // Calibration: MJPEG shows patterns on top
+    mjpegEl.style.zIndex = '2';
+    webrtcEl.style.zIndex = '1';
+  } else if (webrtcConnected) {
+    // Normal + WebRTC: AI output on top
+    webrtcEl.style.zIndex = '2';
+    mjpegEl.style.zIndex = '1';
+  } else {
+    // Fallback: MJPEG on top
+    mjpegEl.style.zIndex = '2';
+    webrtcEl.style.zIndex = '1';
+  }
+}
+
+// ---- WebRTC connection ----
+async function connectWebRTC() {
+  // Tear down previous connection
+  if (pc) {
+    pc.oniceconnectionstatechange = null;
+    pc.ontrack = null;
+    pc.close();
+    pc = null;
+  }
+  webrtcConnected = false;
+  updateLayers();
+
+  try {
+    // 1. Get ICE servers
+    const iceResp = await fetch('/scope/ice-servers');
+    if (!iceResp.ok) throw new Error('ICE servers: ' + iceResp.status);
+    const iceData = await iceResp.json();
+
+    // 2. Create peer connection
+    pc = new RTCPeerConnection(iceData);
+
+    // 3. Add recvonly video transceiver
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // 4. Track event — attach stream to video element
+    pc.ontrack = (ev) => {
+      if (ev.streams && ev.streams[0]) {
+        webrtcEl.srcObject = ev.streams[0];
+      } else {
+        const s = new MediaStream();
+        s.addTrack(ev.track);
+        webrtcEl.srcObject = s;
+      }
+    };
+
+    // 5. ICE connection state monitoring
+    pc.oniceconnectionstatechange = () => {
+      const st = pc.iceConnectionState;
+      if (st === 'connected' || st === 'completed') {
+        webrtcConnected = true;
+        updateLayers();
+      } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
+        webrtcConnected = false;
+        updateLayers();
+        scheduleRTCRetry(3000);
+      }
+    };
+
+    // 6. Create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // 7. Send offer to Scope via our proxy
+    const offerResp = await fetch('/scope/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+    });
+    if (!offerResp.ok) throw new Error('Offer: ' + offerResp.status);
+    const answer = await offerResp.json();
+
+    // 8. Set remote description
+    await pc.setRemoteDescription(new RTCSessionDescription({
+      type: answer.type,
+      sdp: answer.sdp,
+    }));
+
+    // 9. Trickle ICE candidates
+    const sessionId = answer.sessionId;
+    if (sessionId) {
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          fetch('/scope/ice/' + sessionId, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              candidates: [{
+                candidate: ev.candidate.candidate,
+                sdpMid: ev.candidate.sdpMid,
+                sdpMLineIndex: ev.candidate.sdpMLineIndex,
+              }],
+            }),
+          }).catch(() => {});
+        }
+      };
+    }
+  } catch (err) {
+    // Scope not running or network error — retry later
+    webrtcConnected = false;
+    updateLayers();
+    scheduleRTCRetry(10000);
+  }
+}
+
+function scheduleRTCRetry(ms) {
+  clearTimeout(rtcRetryTimer);
+  rtcRetryTimer = setTimeout(connectWebRTC, ms);
+}
+
+// Start WebRTC connection
+connectWebRTC();
+
+// ---- Calibration status polling ----
+function pollCalibration() {
+  fetch('/calibration/status')
+    .then(r => r.json())
+    .then(data => {
+      const wasActive = calibActive;
+      calibActive = !!data.active;
+      if (calibActive !== wasActive) updateLayers();
+    })
+    .catch(() => {});
+}
+setInterval(pollCalibration, 2000);
+pollCalibration();
+
 // ---- Fullscreen state tracking ----
-// wasFullscreen persists so we always know the user intended fullscreen.
-// It is only cleared by pressing Escape (explicit exit).
 let wasFullscreen = false;
 let fadeTimer = null;
 
@@ -163,9 +301,6 @@ function hideBanner() {
   clearTimeout(fadeTimer);
 }
 
-// Detect whether the window fills the screen (F11/kiosk mode).
-// In this case the Fullscreen API is NOT active but we should
-// still hide the cursor and skip the restore banner.
 function isWindowFullscreen() {
   return (
     window.outerWidth >= screen.width - 2 &&
@@ -187,14 +322,11 @@ document.addEventListener('fullscreenchange', () => {
     wasFullscreen = true;
     hideBanner();
   } else if (wasFullscreen) {
-    // Fullscreen was lost (focus change, etc.) — show restore hint
-    // unless the window is still filling the screen (F11)
     if (!isWindowFullscreen()) showBanner();
   }
   setTimeout(postConfig, 300);
 });
 
-// Explicit Escape clears the intent — user chose to exit
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     wasFullscreen = false;
@@ -202,10 +334,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ---- Restore fullscreen on any user-activation event ----
-// requestFullscreen() requires user activation: click, keydown,
-// pointerdown, or touchstart.  We listen on ALL of these so that
-// any interaction with the projector window restores fullscreen.
+// ---- Restore fullscreen on user activation ----
 function tryRestore(e) {
   if (wasFullscreen && !document.fullscreenElement) {
     goFullscreen();
@@ -216,17 +345,15 @@ document.addEventListener('keydown', tryRestore);
 document.addEventListener('pointerdown', tryRestore);
 document.addEventListener('touchstart', tryRestore);
 
-// First click when not yet fullscreen → enter fullscreen
 document.body.addEventListener('click', () => {
   if (!document.fullscreenElement) goFullscreen();
 });
 
-// ---- Non-activation restore attempts (may fail, but free to try) ----
 window.addEventListener('focus', () => {
   updateFSClass();
   if (wasFullscreen && !document.fullscreenElement && !isWindowFullscreen()) {
-    goFullscreen();  // works in some browsers
-    showBanner();    // show banner in case it fails
+    goFullscreen();
+    showBanner();
   }
 });
 
@@ -240,12 +367,11 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// Periodic check — if user used F11, update cursor style
 setInterval(updateFSClass, 2000);
 
 // ---- MJPEG reconnect on error ----
-mjpeg.onerror = () => {
-  setTimeout(() => { mjpeg.src = '/stream?t=' + Date.now(); }, 1000);
+mjpegEl.onerror = () => {
+  setTimeout(() => { mjpegEl.src = '/stream?t=' + Date.now(); }, 1000);
 };
 
 // ---- Report projector resolution ----
