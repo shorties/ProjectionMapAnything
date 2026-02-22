@@ -417,6 +417,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
                         self.proj_w, self.proj_h,
                         disparity_map=self._calib.disparity_map,
+                        valid_mask=self._calib.proj_valid_mask,
                     )
                     logger.info("Calibration saved.")
 
@@ -634,9 +635,22 @@ class ProMapAnythingPipeline(Pipeline):
             self._disparity_map = disp
             self.proj_w = pw
             self.proj_h = ph
+            # Derive valid mask from NPZ if available, else from disparity
+            npz_path = cal_path.with_suffix(".npz")
+            if npz_path.is_file():
+                npz = np.load(npz_path)
+                if "valid_mask" in npz.files:
+                    self._proj_valid_mask = npz["valid_mask"].astype(bool)
+            if self._proj_valid_mask is None and disp is not None:
+                # Disparity was computed only for valid pixels — derive mask
+                # from non-uniform regions (inpainted areas are smooth gradients)
+                self._proj_valid_mask = disp > 0.01
             logger.info(
-                "Calibration loaded from %s (%dx%d, captured %s, disparity=%s)",
-                cal_path, pw, ph, ts, "yes" if disp is not None else "no",
+                "Calibration loaded from %s (%dx%d, captured %s, disparity=%s, "
+                "valid_mask=%s)",
+                cal_path, pw, ph, ts,
+                "yes" if disp is not None else "no",
+                "yes" if self._proj_valid_mask is not None else "no",
             )
         else:
             logger.warning(
@@ -1199,6 +1213,7 @@ class ProMapAnythingPipeline(Pipeline):
                         map_x, map_y, _DEFAULT_CALIBRATION_PATH,
                         self.proj_w, self.proj_h,
                         disparity_map=disp,
+                        valid_mask=self._calib.proj_valid_mask,
                     )
                     logger.info("Inline calibration saved to %s", _DEFAULT_CALIBRATION_PATH)
 
@@ -1352,7 +1367,7 @@ class ProMapAnythingPipeline(Pipeline):
         """Lazy-load the depth model on first use."""
         if self._depth is None:
             from .depth_provider import create_depth_provider
-            self._depth = create_depth_provider("auto", self.device, model_size="small")
+            self._depth = create_depth_provider(self.device, model_size="small")
 
     _STATIC_FILE_MAP = {
         "static_depth_warped": "depth_then_warp.png",
@@ -1412,132 +1427,273 @@ class ProMapAnythingPipeline(Pipeline):
         )
 
     def _disparity_depth(self) -> torch.Tensor:
-        """Return the calibration disparity map as depth (cached)."""
-        cached = getattr(self, "_disparity_depth_cache", None)
-        if cached is not None:
-            return cached
+        """Derive depth from calibration correspondence (cached).
+
+        Uses the disparity map from calibration if available, otherwise
+        computes depth from the correspondence maps using homography-
+        residual displacement: fits a perspective transform (homography)
+        to the projector→camera mapping, then uses residual magnitude
+        as depth-dependent parallax (closer objects deviate more from
+        the planar projection model).
+        """
+        if self._disparity_depth_cache is not None:
+            return self._disparity_depth_cache
 
         if self._disparity_map is not None:
-            depth = self._disparity_map
+            depth = self._disparity_map.copy()
+            logger.info("Using saved disparity map from calibration")
+        elif self._map_x is not None:
+            depth = self._compute_disparity_from_maps()
         else:
-            # Fallback: compute simple disparity from map_x
-            logger.warning(
-                "No disparity map in calibration — computing from map_x. "
-                "Re-run calibration to get a proper disparity map."
+            depth = np.full(
+                (self.proj_h, self.proj_w), 0.5, dtype=np.float32,
             )
-            px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
-                self.proj_h, axis=0,
-            )
-            valid = (self._map_x >= 0) if self._map_x is not None else None
-            if self._map_x is not None and valid is not None:
-                disp = np.zeros_like(self._map_x)
-                disp[valid] = self._map_x[valid] - px[valid]
-                vals = disp[valid]
-                if vals.size > 0:
-                    p2, p98 = float(np.percentile(vals, 2)), float(np.percentile(vals, 98))
-                    if p98 - p2 > 1e-6:
-                        disp = (disp - p2) / (p98 - p2)
-                    else:
-                        disp = np.full_like(disp, 0.5)
-                depth = np.clip(disp, 0.0, 1.0).astype(np.float32)
-            else:
-                depth = np.full(
-                    (self.proj_h, self.proj_w), 0.5, dtype=np.float32,
-                )
+            logger.warning("No calibration maps — disparity is uniform grey")
+
+        # CLAHE for local contrast (brings out surface detail)
+        depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+        depth_u8 = clahe.apply(depth_u8)
+
+        # Inpaint holes
+        valid = self._proj_valid_mask
+        if valid is not None:
+            holes = (~valid).astype(np.uint8) * 255
+            if np.any(~valid):
+                depth_u8 = cv2.inpaint(depth_u8, holes, 15, cv2.INPAINT_NS)
+
+        # Smooth
+        depth_u8 = cv2.GaussianBlur(depth_u8, (7, 7), 0)
+        depth = depth_u8.astype(np.float32) / 255.0
 
         depth_rgb = np.stack([depth, depth, depth], axis=-1)
         result = torch.from_numpy(depth_rgb).to(self.device)
         self._disparity_depth_cache = result
-        logger.info("Disparity depth loaded and cached")
+        logger.info(
+            "Disparity depth ready: range [%.3f, %.3f]",
+            depth.min(), depth.max(),
+        )
         return result
 
+    def _compute_disparity_from_maps(self) -> np.ndarray:
+        """Compute depth from calibration correspondence via homography residuals.
+
+        The projector→camera correspondence maps encode depth information
+        through parallax: closer objects produce larger displacements from
+        the expected projective mapping.  By fitting a homography (perspective
+        transform) to the correspondence and taking the residual, we isolate
+        the depth-dependent component.
+
+        Returns (proj_h, proj_w) float32 in [0, 1], near=bright.
+        """
+        proj_h, proj_w = self._map_x.shape
+        px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
+        py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
+
+        # Valid mask — if we have one from calibration, use it; else all valid
+        if self._proj_valid_mask is not None:
+            valid = self._proj_valid_mask
+        else:
+            # After inpainting, maps don't have -1 anymore, so use disparity hint
+            valid = np.ones((proj_h, proj_w), dtype=bool)
+
+        if not np.any(valid):
+            return np.full((proj_h, proj_w), 0.5, dtype=np.float32)
+
+        # Build source/destination point arrays for homography
+        src = np.column_stack([px[valid], py[valid]]).astype(np.float32)
+        dst = np.column_stack(
+            [self._map_x[valid], self._map_y[valid]]
+        ).astype(np.float32)
+
+        # Subsample for performance (findHomography on 100k+ points is slow)
+        rng = np.random.default_rng(42)
+        if len(src) > 10000:
+            idx = rng.choice(len(src), 10000, replace=False)
+            H, _ = cv2.findHomography(src[idx], dst[idx], cv2.RANSAC, 5.0)
+        else:
+            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+
+        if H is None:
+            # Fallback: simple horizontal disparity (camera_x - projector_x)
+            logger.warning("Homography fit failed — using simple disparity")
+            disp = np.abs(self._map_x - px)
+            disp[~valid] = 0.0
+        else:
+            # Apply homography to all projector pixels → predicted camera coords
+            pts = np.column_stack(
+                [px.ravel(), py.ravel()]
+            ).astype(np.float32).reshape(-1, 1, 2)
+            pred = cv2.perspectiveTransform(pts, H).reshape(proj_h, proj_w, 2)
+
+            # Residual = actual - predicted correspondence
+            res_x = self._map_x - pred[:, :, 0]
+            res_y = self._map_y - pred[:, :, 1]
+            disp = np.sqrt(res_x ** 2 + res_y ** 2)
+            disp[~valid] = 0.0
+
+        # Percentile normalization
+        valid_vals = disp[valid]
+        if valid_vals.size > 0:
+            p2 = float(np.percentile(valid_vals, 2))
+            p98 = float(np.percentile(valid_vals, 98))
+            if p98 - p2 > 1e-6:
+                disp = (disp - p2) / (p98 - p2)
+            else:
+                disp = np.full_like(disp, 0.5)
+        depth = np.clip(disp, 0.0, 1.0).astype(np.float32)
+
+        logger.info(
+            "Computed disparity from correspondence maps (%dx%d, "
+            "valid=%.1f%%, homography=%s)",
+            proj_w, proj_h,
+            100.0 * np.count_nonzero(valid) / max(valid.size, 1),
+            "yes" if H is not None else "no (simple fallback)",
+        )
+        return depth
+
+    def _load_camera_image(self) -> torch.Tensor | None:
+        """Load the ambient camera image from calibration results.
+
+        Returns the image as (H, W, 3) float32 [0, 1] on self.device,
+        or None if the file doesn't exist or can't be decoded.
+        """
+        ambient_path = _RESULTS_DIR / "ambient_camera.png"
+        if not ambient_path.is_file():
+            return None
+        img = cv2.imread(str(ambient_path))
+        if img is None:
+            logger.warning("AI depth: could not decode ambient_camera.png")
+            return None
+        logger.info("AI depth: loaded ambient camera %dx%d", img.shape[1], img.shape[0])
+        return torch.from_numpy(
+            cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        ).to(self.device)
+
+    def _warp_to_projector(self, depth_np: np.ndarray) -> np.ndarray:
+        """Warp a camera-space depth map to projector space via calibration.
+
+        Uses the same cv2.remap approach as the warped camera RGB (which is
+        known to work correctly from publish_calibration_results).
+
+        Pipeline:
+        1. Convert depth to uint8 BGR (same format as camera RGB warp)
+        2. cv2.remap with borderValue=0 (matching the RGB warp)
+        3. Detect holes (all-black pixels + invalid mask)
+        4. Inpaint holes with Navier-Stokes method
+        5. Convert back to float32
+
+        Parameters
+        ----------
+        depth_np : np.ndarray
+            (H_cam, W_cam) float32 depth in [0, 1].
+
+        Returns
+        -------
+        np.ndarray
+            (proj_h, proj_w) float32 depth in [0, 1], holes inpainted.
+        """
+        cam_h, cam_w = depth_np.shape[:2]
+
+        # Step 1: Convert to uint8 BGR — same pipeline as warped camera RGB
+        depth_u8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
+        depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
+
+        # Step 2: cv2.remap with borderValue=0 — same as publish_calibration_results
+        warped_bgr = cv2.remap(
+            depth_bgr, self._map_x, self._map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        # Step 3: Detect holes — unmapped regions + invalid calibration pixels
+        holes = np.all(warped_bgr == 0, axis=2)
+        if self._proj_valid_mask is not None:
+            holes = holes | ~self._proj_valid_mask
+
+        # Step 4: Inpaint holes
+        if np.any(holes):
+            hole_u8 = holes.astype(np.uint8) * 255
+            warped_bgr = cv2.inpaint(warped_bgr, hole_u8, 15, cv2.INPAINT_NS)
+
+        # Step 5: Convert back to float32 grayscale
+        warped_gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+        warped = warped_gray.astype(np.float32) / 255.0
+
+        logger.info(
+            "Depth warped to projector %dx%d (from camera %dx%d), "
+            "range [%.3f, %.3f], holes=%.1f%%",
+            warped.shape[1], warped.shape[0], cam_w, cam_h,
+            warped.min(), warped.max(),
+            100.0 * np.count_nonzero(holes) / max(holes.size, 1),
+        )
+        return warped
+
     def _ai_depth(self) -> torch.Tensor:
-        """Run Depth Anything V2 on the ambient camera image, warp to projector.
+        """Run Depth Anything V2 on a camera image, warp to projector space.
 
         Pipeline:
         1. Load ambient_camera.png (raw camera image from calibration)
-        2. Run Depth Anything V2 → (H_cam, W_cam) float32 [0,1]
-        3. cv2.remap float32 depth to projector space (no uint8 round-trip)
-        4. Inpaint holes from unmapped/invalid calibration pixels
-        5. Cache result (static — recomputed only on recalibration)
-
-        Falls back to warped_camera.png (already projector-space) if the
-        ambient image is unavailable. In that case, warping is skipped.
+           Falls back to warped_camera.png if ambient not available.
+        2. Run Depth Anything V2 → (H, W) float32 [0,1], near=bright
+        3. If source was camera-space, warp to projector via calibration maps
+        4. Apply CLAHE for local contrast enhancement
+        5. Gaussian blur for smooth output
+        6. Cache result (static — recomputed only on recalibration)
         """
-        cached = getattr(self, "_ai_depth_cache", None)
-        if cached is not None:
-            return cached
+        if self._ai_depth_cache is not None:
+            return self._ai_depth_cache
 
-        # -- 1. Load source image (camera space) --
-        ambient_path = _RESULTS_DIR / "ambient_camera.png"
-        needs_warp = False
+        # Load source image — prefer camera-space ambient for best quality
+        camera_frame = self._load_camera_image()
+        needs_warp = camera_frame is not None
 
-        if ambient_path.is_file():
-            img = cv2.imread(str(ambient_path))
-            if img is not None:
-                camera_frame = torch.from_numpy(
-                    cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-                ).to(self.device)
-                needs_warp = True
-                logger.info(
-                    "AI depth: loaded ambient camera %dx%d",
-                    img.shape[1], img.shape[0],
-                )
-            else:
-                logger.warning("AI depth: could not decode ambient_camera.png")
-                camera_frame = self._get_static_warped_camera()
-        else:
-            logger.warning(
-                "AI depth: no ambient_camera.png — using warped camera "
-                "(re-run calibration to get better results)"
-            )
+        if camera_frame is None:
+            # Fallback: warped camera (already in projector space)
             camera_frame = self._get_static_warped_camera()
+            if camera_frame.mean() < 0.05 or camera_frame.mean() > 0.95:
+                # Warped camera is all black/white — useless
+                logger.warning(
+                    "AI depth: no usable source image — returning grey. "
+                    "Run calibration to capture an ambient frame."
+                )
+                result = torch.full(
+                    (self.proj_h, self.proj_w, 3), 0.5,
+                    dtype=torch.float32, device=self.device,
+                )
+                self._ai_depth_cache = result
+                return result
+            logger.warning(
+                "AI depth: no ambient_camera.png — using warped camera fallback "
+                "(re-run calibration for better results)"
+            )
 
-        # -- 2. Run depth estimation --
+        # Run depth estimation
         self._ensure_depth_model()
         depth = self._depth.estimate(camera_frame)  # (H, W) [0,1], near=bright
         depth_np = depth.cpu().numpy().astype(np.float32)
 
-        # -- 3. Warp to projector space --
+        # Warp to projector space (only if source was camera-space)
         if needs_warp and self._map_x is not None and self._map_y is not None:
-            # Remap on float32 directly (no uint8 precision loss).
-            # Use borderValue=-1 so we can distinguish unmapped border
-            # pixels from legitimately dark (far) depth values.
-            warped = cv2.remap(
-                depth_np, self._map_x, self._map_y,
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=-1.0,
-            )
-
-            # Hole mask: unmapped border pixels + calibration-invalid pixels
-            holes = warped < 0
-            if self._proj_valid_mask is not None:
-                holes = holes | ~self._proj_valid_mask
-            warped[holes] = 0.0
-
-            # -- 4. Inpaint holes for clean edges --
-            if np.any(holes):
-                hole_u8 = holes.astype(np.uint8) * 255
-                warped_u8 = (warped * 255).clip(0, 255).astype(np.uint8)
-                warped_u8 = cv2.inpaint(warped_u8, hole_u8, 5, cv2.INPAINT_TELEA)
-                warped = warped_u8.astype(np.float32) / 255.0
-
-            depth_np = warped
+            depth_np = self._warp_to_projector(depth_np)
+        elif not needs_warp:
             logger.info(
-                "AI depth: warped to projector %dx%d, range [%.3f, %.3f], "
-                "holes=%.1f%%",
+                "AI depth: source already projector-space, shape=%dx%d",
                 depth_np.shape[1], depth_np.shape[0],
-                depth_np.min(), depth_np.max(),
-                100.0 * np.count_nonzero(holes) / max(holes.size, 1),
-            )
-        else:
-            logger.info(
-                "AI depth: no warp (source already projector-space), "
-                "shape=%dx%d", depth_np.shape[1], depth_np.shape[0],
             )
 
-        # -- 5. Grayscale → RGB tensor, cache --
+        # CLAHE for local contrast enhancement — brings out surface detail
+        # that percentile normalization alone misses
+        depth_u8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+        depth_u8 = clahe.apply(depth_u8)
+        depth_np = depth_u8.astype(np.float32) / 255.0
+
+        # Light Gaussian blur for smooth output
+        depth_np = cv2.GaussianBlur(depth_np, (5, 5), 0)
+
+        # Grayscale → RGB tensor, cache
         rgb_np = np.stack([depth_np, depth_np, depth_np], axis=-1)
         result = torch.from_numpy(rgb_np).to(self.device)
 

@@ -720,6 +720,7 @@ def save_calibration(
     proj_w: int,
     proj_h: int,
     disparity_map: np.ndarray | None = None,
+    valid_mask: np.ndarray | None = None,
 ) -> None:
     """Save calibration mapping.
 
@@ -736,6 +737,8 @@ def save_calibration(
     }
     if disparity_map is not None:
         arrays["disparity"] = disparity_map
+    if valid_mask is not None:
+        arrays["valid_mask"] = valid_mask.astype(np.uint8)
     np.savez_compressed(npz_path, **arrays)
 
     meta = {

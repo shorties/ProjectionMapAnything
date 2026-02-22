@@ -278,7 +278,7 @@ function pollCalibration() {
     })
     .catch(() => {});
 }
-setInterval(pollCalibration, 2000);
+setInterval(pollCalibration, 1000);
 pollCalibration();
 
 // ---- Fullscreen state tracking ----
@@ -853,16 +853,27 @@ class FrameStreamer:
             save_calibration(
                 map_x, map_y, cal_path,
                 self._standalone_proj_w, self._standalone_proj_h,
+                valid_mask=new_valid,
             )
 
-            # Publish results (warped camera, coverage map, etc.)
-            from .pipeline import publish_calibration_results
-
+            # Save ambient camera for AI depth estimation
+            from pathlib import Path as _Path
+            results_dir = _Path.home() / ".projectionmapanything_results"
+            results_dir.mkdir(exist_ok=True)
             ambient = self._standalone_ambient
             if ambient is None:
                 ambient = np.full(
                     (480, 640, 3), 128, dtype=np.uint8,
                 )
+            try:
+                ambient_bgr = cv2.cvtColor(ambient, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(results_dir / "ambient_camera.png"), ambient_bgr)
+                logger.info("Saved ambient camera frame for AI depth")
+            except Exception:
+                logger.warning("Could not save ambient_camera.png", exc_info=True)
+
+            # Publish results (warped camera, coverage map, etc.)
+            from .pipeline import publish_calibration_results
 
             publish_calibration_results(
                 map_x=map_x,
