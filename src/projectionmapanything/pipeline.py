@@ -416,10 +416,19 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         if self._calibrating and self._calib is not None:
             pattern = self._calib.step(frame, self.device)
 
+            # Push pattern params for client-side canvas rendering
+            if self._streamer is not None:
+                self._streamer.set_calibration_pattern(
+                    self._calib.get_current_pattern_params()
+                )
+
             # Update progress on streamer
             self._update_streamer_progress()
 
             if self._calib.phase == CalibrationPhase.DONE:
+                # Clear canvas pattern now that calibration is done
+                if self._streamer is not None:
+                    self._streamer.set_calibration_pattern(None)
                 mapping = self._calib.get_mapping()
                 if mapping is not None:
                     map_x, map_y = mapping
@@ -941,26 +950,25 @@ class ProMapAnythingPipeline(Pipeline):
     ) -> torch.Tensor:
         """Apply auto-range, edge erosion, contrast, and depth clipping.
 
-        Auto-range stretches the depth values to fill [0, 1] using
-        percentile normalization (p2/p98).  This runs unconditionally
-        so that poorly-defined depth maps (narrow dynamic range) are
-        automatically improved without requiring manual contrast tuning.
+        Auto-range always stretches the depth values to fill [0, 1] using
+        percentile normalization (p2/p98).  This ensures depth maps with
+        any dynamic range — narrow disparity, AI depth, etc. — always
+        produce usable contrast without manual tuning.
         """
         img = rgb.cpu().numpy()
         gray = img.mean(axis=-1)
 
-        # -- Auto-range: percentile stretch to fill [0, 1] ------------------
+        # -- Auto-range: always percentile stretch to fill [0, 1] ----------
         # Pixels near zero are background/holes — exclude from stats
         fg = gray[gray > 0.01]
         if fg.size > 100:
             p2 = float(np.percentile(fg, 2))
             p98 = float(np.percentile(fg, 98))
             spread = p98 - p2
-            if spread < 0.5:
-                # Depth is poorly defined — stretch to full range
+            if spread > 1e-6:
                 gray = np.where(
                     gray > 0.01,
-                    ((gray - p2) / max(spread, 1e-6)).clip(0, 1),
+                    ((gray - p2) / spread).clip(0, 1),
                     0.0,
                 )
 
@@ -1304,6 +1312,12 @@ class ProMapAnythingPipeline(Pipeline):
         if self._calibrating and self._calib is not None:
             pattern = self._calib.step(frame, self.device)
 
+            # Push pattern params for client-side canvas rendering
+            if self._streamer is not None:
+                self._streamer.set_calibration_pattern(
+                    self._calib.get_current_pattern_params()
+                )
+
             # Update progress on streamer
             if self._streamer is not None:
                 phase = self._calib.phase.name
@@ -1578,13 +1592,32 @@ class ProMapAnythingPipeline(Pipeline):
             )
             logger.warning("No calibration maps — disparity is uniform grey")
 
+        # -- Auto-range: percentile stretch to fill [0, 1] -----------------
+        # The raw disparity may have very narrow dynamic range (e.g. flat
+        # scene, small baseline) — stretch before CLAHE so it has data to
+        # enhance.
+        valid = self._proj_valid_mask
+        if valid is not None:
+            fg = depth[valid]
+        else:
+            fg = depth[depth > 0.01]
+        if fg.size > 100:
+            p2 = float(np.percentile(fg, 2))
+            p98 = float(np.percentile(fg, 98))
+            spread = p98 - p2
+            if spread > 1e-6:
+                depth = ((depth - p2) / spread).clip(0, 1).astype(np.float32)
+            logger.info(
+                "Disparity auto-range: p2=%.4f p98=%.4f spread=%.4f",
+                p2, p98, spread,
+            )
+
         # CLAHE for local contrast (brings out surface detail)
         depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
         depth_u8 = clahe.apply(depth_u8)
 
         # Inpaint holes
-        valid = self._proj_valid_mask
         if valid is not None:
             holes = (~valid).astype(np.uint8) * 255
             if np.any(~valid):
@@ -2061,6 +2094,23 @@ class ProMapAnythingPipeline(Pipeline):
             logger.info(
                 "AI depth: source already projector-space, shape=%dx%d",
                 depth_np.shape[1], depth_np.shape[0],
+            )
+
+        # Auto-range: percentile stretch to fill [0, 1] before CLAHE
+        fg = depth_np[depth_np > 0.01]
+        if fg.size > 100:
+            p2 = float(np.percentile(fg, 2))
+            p98 = float(np.percentile(fg, 98))
+            spread = p98 - p2
+            if spread > 1e-6:
+                depth_np = np.where(
+                    depth_np > 0.01,
+                    ((depth_np - p2) / spread).clip(0, 1),
+                    0.0,
+                ).astype(np.float32)
+            logger.info(
+                "AI depth auto-range: p2=%.4f p98=%.4f spread=%.4f",
+                p2, p98, spread,
             )
 
         # CLAHE for local contrast enhancement — brings out surface detail

@@ -121,6 +121,12 @@ _PROJECTOR_HTML = """\
     position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
     object-fit: contain; background: #000;
   }
+  #calibCanvas {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    z-index: 10; display: none;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
   /* Default: MJPEG on top (fallback until WebRTC connects) */
   #mjpeg  { z-index: 2; }
   #webrtc { z-index: 1; }
@@ -134,6 +140,7 @@ _PROJECTOR_HTML = """\
   #restore.fade { opacity: 0; transition: opacity 0.5s; }
 </style>
 </head><body>
+<canvas id="calibCanvas"></canvas>
 <video id="webrtc" autoplay playsinline muted></video>
 <img id="mjpeg" src="/stream" />
 <div id="restore">Press F11 for fullscreen (persists during calibration)</div>
@@ -274,12 +281,121 @@ function pollCalibration() {
     .then(data => {
       const wasActive = calibActive;
       calibActive = !!data.active;
-      if (calibActive !== wasActive) updateLayers();
+      if (calibActive !== wasActive) {
+        updateLayers();
+        // Start/stop canvas pattern polling
+        if (calibActive && !calibPatternTimer) {
+          calibPatternTimer = setInterval(pollCalibPattern, 100);
+          pollCalibPattern();
+        }
+        if (!calibActive && calibPatternTimer) {
+          clearInterval(calibPatternTimer);
+          calibPatternTimer = null;
+          calibCanvas.style.display = 'none';
+          lastPatternKey = '';
+        }
+      }
     })
     .catch(() => {});
 }
 setInterval(pollCalibration, 1000);
 pollCalibration();
+
+// ---- Client-side canvas Gray code rendering ----
+// Renders calibration patterns directly on a <canvas> at the projector's
+// native pixel resolution — zero JPEG compression or CSS scaling artifacts.
+const calibCanvas = document.getElementById('calibCanvas');
+const calibCtx = calibCanvas.getContext('2d');
+let lastPatternKey = '';
+let calibPatternTimer = null;
+
+function grayEncode(n) { return n ^ (n >>> 1); }
+
+function renderCalibPattern(params, projW, projH) {
+  if (calibCanvas.width !== projW || calibCanvas.height !== projH) {
+    calibCanvas.width = projW;
+    calibCanvas.height = projH;
+  }
+  const key = JSON.stringify(params);
+  if (key === lastPatternKey) return;
+  lastPatternKey = key;
+
+  const ctx = calibCtx;
+  const {type, brightness} = params;
+
+  if (type === 'white') {
+    ctx.fillStyle = 'rgb(' + brightness + ',' + brightness + ',' + brightness + ')';
+    ctx.fillRect(0, 0, projW, projH);
+    return;
+  }
+  if (type === 'black') {
+    ctx.fillStyle = 'rgb(0,0,0)';
+    ctx.fillRect(0, 0, projW, projH);
+    return;
+  }
+
+  // Gray code pattern — use ImageData for pixel-perfect rendering
+  const {axis, bit, inverted} = params;
+  const imageData = ctx.createImageData(projW, projH);
+  const data = imageData.data;
+
+  if (axis === 0) {
+    // Vertical stripes — precompute one row, replicate
+    const row = new Uint8Array(projW);
+    for (let x = 0; x < projW; x++) {
+      const gray = grayEncode(x);
+      let val = ((gray >>> bit) & 1) ? brightness : 0;
+      if (inverted) val = brightness - val;
+      row[x] = val;
+    }
+    for (let y = 0; y < projH; y++) {
+      const rowOff = y * projW * 4;
+      for (let x = 0; x < projW; x++) {
+        const off = rowOff + x * 4;
+        data[off] = row[x];
+        data[off + 1] = row[x];
+        data[off + 2] = row[x];
+        data[off + 3] = 255;
+      }
+    }
+  } else {
+    // Horizontal stripes — precompute one column, replicate
+    const col = new Uint8Array(projH);
+    for (let y = 0; y < projH; y++) {
+      const gray = grayEncode(y);
+      let val = ((gray >>> bit) & 1) ? brightness : 0;
+      if (inverted) val = brightness - val;
+      col[y] = val;
+    }
+    for (let y = 0; y < projH; y++) {
+      const rowOff = y * projW * 4;
+      const v = col[y];
+      for (let x = 0; x < projW; x++) {
+        const off = rowOff + x * 4;
+        data[off] = v;
+        data[off + 1] = v;
+        data[off + 2] = v;
+        data[off + 3] = 255;
+      }
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function pollCalibPattern() {
+  fetch('/calibration/current-pattern')
+    .then(r => r.json())
+    .then(data => {
+      if (data.active && data.params) {
+        calibCanvas.style.display = 'block';
+        renderCalibPattern(data.params, data.proj_w, data.proj_h);
+      } else {
+        calibCanvas.style.display = 'none';
+        lastPatternKey = '';
+      }
+    })
+    .catch(() => {});
+}
 
 // ---- Fullscreen state tracking ----
 // Two fullscreen modes: API fullscreen (requestFullscreen) exits on focus
@@ -529,6 +645,14 @@ class FrameStreamer:
         self._client_config: dict | None = None
         self._load_persisted_config()
 
+        # Client-side canvas calibration pattern params — JSON-serialisable
+        # dict describing the current pattern (type, axis, bit, inverted,
+        # brightness) or None when calibration is inactive.  The /projector
+        # page polls /calibration/current-pattern and renders patterns
+        # directly on a <canvas> at native projector resolution — bypassing
+        # JPEG compression and CSS scaling entirely.
+        self._calibration_pattern_params: dict | None = None
+
         # Dashboard parameter overrides — set via POST /api/params,
         # read by pipelines as kwargs overrides.
         self._param_overrides: dict = {}
@@ -554,6 +678,17 @@ class FrameStreamer:
     @calibration_active.setter
     def calibration_active(self, value: bool) -> None:
         self._calibration_active = value
+        if not value:
+            self._calibration_pattern_params = None
+
+    def set_calibration_pattern(self, params: dict | None) -> None:
+        """Set the current calibration pattern params for client-side canvas rendering.
+
+        Called by the pipeline each frame during calibration.  The projector
+        page polls ``/calibration/current-pattern`` and renders the pattern
+        directly on a ``<canvas>`` at native projector pixel resolution.
+        """
+        self._calibration_pattern_params = params
 
     @property
     def client_config(self) -> dict | None:
@@ -1123,6 +1258,8 @@ class FrameStreamer:
                     self_handler._handle_projector()
                 elif path == "/calibration/status":
                     self_handler._handle_calibration_status()
+                elif path == "/calibration/current-pattern":
+                    self_handler._handle_calibration_current_pattern()
                 elif path.startswith("/calibration/download/"):
                     self_handler._handle_calibration_download(path)
                 elif path.startswith("/calibration/preview/"):
@@ -1502,6 +1639,31 @@ class FrameStreamer:
                 self_handler.send_header("Content-Length", str(len(body)))
                 self_handler.send_header("Access-Control-Allow-Origin", "*")
                 self_handler.send_header("Cache-Control", "no-cache")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_calibration_current_pattern(self_handler) -> None:  # noqa: N805
+                """Return the current calibration pattern params for client-side canvas rendering."""
+                params = streamer._calibration_pattern_params
+                if params is not None:
+                    # Include projector resolution so the canvas knows what size to render
+                    cfg = streamer._client_config or {}
+                    proj_w = cfg.get("width", 1920)
+                    proj_h = cfg.get("height", 1080)
+                    data = {
+                        "active": True,
+                        "params": params,
+                        "proj_w": proj_w,
+                        "proj_h": proj_h,
+                    }
+                else:
+                    data = {"active": False, "params": None}
+                body = json.dumps(data).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.send_header("Cache-Control", "no-cache, no-store")
                 self_handler.end_headers()
                 self_handler.wfile.write(body)
 

@@ -262,6 +262,41 @@ class CalibrationState:
                 f" — {captured}/{total_cap} captures"
             )
 
+    def get_current_pattern_params(self) -> dict | None:
+        """Return lightweight params describing the current pattern for client-side rendering.
+
+        The projector page uses these to render Gray code patterns directly
+        on a ``<canvas>`` at native pixel resolution — zero JPEG compression
+        or CSS scaling artifacts.
+
+        Returns ``None`` when no pattern should be displayed (IDLE, DECODING, DONE).
+        """
+        if self.phase == CalibrationPhase.WHITE:
+            return {"type": "white", "brightness": self.max_brightness}
+        if self.phase == CalibrationPhase.BLACK:
+            return {"type": "black"}
+        if self.phase == CalibrationPhase.PATTERNS:
+            total_x = 2 * self.bits_x
+            idx = self._pattern_index
+            if idx < total_x:
+                capture_bit = idx // 2
+                bit = (self.bits_x - 1) - capture_bit
+                inverted = idx % 2 == 1
+                return {
+                    "type": "graycode", "axis": 0, "bit": bit,
+                    "inverted": inverted, "brightness": self.max_brightness,
+                }
+            else:
+                y_idx = idx - total_x
+                capture_bit = y_idx // 2
+                bit = (self.bits_y - 1) - capture_bit
+                inverted = y_idx % 2 == 1
+                return {
+                    "type": "graycode", "axis": 1, "bit": bit,
+                    "inverted": inverted, "brightness": self.max_brightness,
+                }
+        return None
+
     # -- Frame stepping -------------------------------------------------------
 
     def step(
