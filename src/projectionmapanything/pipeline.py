@@ -904,7 +904,7 @@ class ProMapAnythingPipeline(Pipeline):
             self._streamer.submit_input_preview(preview_np)
             # Also push depth to main projector stream (useful when no
             # postprocessor is loaded — makes depth visible on the projector).
-            if not self._streamer._overlay_active:
+            if not getattr(self._streamer, "_overlay_active", False):
                 self._streamer.submit_frame(preview_np)
 
         # -- Resize to match what Scope / the main pipeline expects -----------
