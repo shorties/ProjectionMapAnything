@@ -170,12 +170,17 @@
       <div class="hint" id="sc-status">Enable webcam for standalone calibration</div>
       <!-- Camera Intrinsics -->
       <div style="border-top:1px solid #2a2f3a; margin-top:6px; padding-top:8px;">
-        <div class="muted" style="margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; font-size:10px;">Camera Intrinsics</div>
+        <div class="muted" style="margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; font-size:10px;">Camera + Projector Intrinsics</div>
         <div class="ctrl">
           <span class="ctrl-label">Board Size</span>
           <input type="number" id="cc-cols" value="7" min="3" max="20" style="width:50px" />
           <span class="muted" style="margin:0 2px;">&times;</span>
           <input type="number" id="cc-rows" value="5" min="3" max="20" style="width:50px" />
+        </div>
+        <div class="ctrl">
+          <span class="ctrl-label">Square px</span>
+          <input type="number" id="cc-square-px" value="0" min="0" max="500" style="width:60px" />
+          <span class="muted" style="font-size:10px; margin-left:4px;">0 = auto</span>
         </div>
         <div class="btn-row" style="margin-top:6px;">
           <button class="btn btn-p btn-sm" id="cc-auto-btn" onclick="ccAutoStart()" disabled>Auto Calibrate</button>
@@ -866,6 +871,7 @@ async function ccAutoStart() {
     proj_h: parseInt(document.getElementById('sc-proj-h').value) || 1080,
     cols: parseInt(document.getElementById('cc-cols').value) || 7,
     rows: parseInt(document.getElementById('cc-rows').value) || 5,
+    square_px: parseInt(document.getElementById('cc-square-px').value) || 0,
   };
   st.textContent = 'Starting auto calibration...'; st.className = 'hint';
   try {
@@ -911,9 +917,16 @@ async function ccAutoCaptureLoop() {
       } else if (d.done) {
         ccAutoRunning = false;
         if (d.ok) {
-          st.textContent = 'Done! fx=' + (d.focal_length || 0).toFixed(1) +
-            ' error=' + (d.reprojection_error || 0).toFixed(4) + 'px' +
-            ' (' + d.captures_so_far + ' boards)';
+          let msg = 'Cam fx=' + (d.focal_length || 0).toFixed(1) +
+            ' err=' + (d.reprojection_error || 0).toFixed(3) + 'px';
+          if (d.proj_focal_length) {
+            msg += ' | Proj fx=' + d.proj_focal_length.toFixed(1) +
+              ' err=' + (d.proj_reprojection_error || 0).toFixed(3) + 'px';
+          } else if (d.proj_error) {
+            msg += ' | Proj: ' + d.proj_error;
+          }
+          msg += ' (' + d.captures_so_far + ' boards)';
+          st.textContent = msg;
           st.className = 'hint ok';
         } else if (d.error) {
           st.textContent = d.error;

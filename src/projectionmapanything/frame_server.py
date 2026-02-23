@@ -110,113 +110,141 @@ def _load_testcard(target_w: int, target_h: int) -> np.ndarray:
 def generate_projected_checkerboard(
     cols: int,
     rows: int,
-    square_size: int,
+    square_px: int,
     offset_x: int,
     offset_y: int,
     proj_w: int,
     proj_h: int,
+    white_level: int = 255,
 ) -> np.ndarray:
     """Generate a checkerboard image for projector display.
 
-    The board has ``(cols+1) x (rows+1)`` squares with a 1-square white
-    margin around the pattern.  Inner corners are ``cols x rows``.
+    Black background with a white border region around the board, then
+    black squares drawn on top.  This contrast is essential for
+    ``findChessboardCorners`` to detect the board boundary.
+
+    The board has ``(cols+1) x (rows+1)`` squares.
+    Inner corners are ``cols x rows``.
 
     Returns ``(proj_h, proj_w, 3)`` uint8 RGB.
     """
-    img = np.full((proj_h, proj_w, 3), 255, dtype=np.uint8)  # white bg
+    img = np.zeros((proj_h, proj_w), dtype=np.uint8)  # black background
 
-    # Total board dimensions including margin
-    board_cols = cols + 1  # number of squares horizontally
-    board_rows = rows + 1  # number of squares vertically
+    n_sq_x = cols + 1
+    n_sq_y = rows + 1
 
-    for r in range(board_rows):
-        for c in range(board_cols):
-            if (r + c) % 2 == 1:
-                x0 = offset_x + c * square_size
-                y0 = offset_y + r * square_size
-                x1 = min(x0 + square_size, proj_w)
-                y1 = min(y0 + square_size, proj_h)
-                if x0 < proj_w and y0 < proj_h:
-                    img[y0:y1, x0:x1] = 0  # black square
+    # Draw white border (1 square-width padding) around the checkerboard
+    border = square_px
+    bx0 = max(0, offset_x - border)
+    by0 = max(0, offset_y - border)
+    bx1 = min(proj_w, offset_x + n_sq_x * square_px + border)
+    by1 = min(proj_h, offset_y + n_sq_y * square_px + border)
+    img[by0:by1, bx0:bx1] = white_level
 
-    return img
+    # Draw black squares on top of the white border
+    for sy in range(n_sq_y):
+        for sx in range(n_sq_x):
+            if (sx + sy) % 2 == 1:
+                x0 = offset_x + sx * square_px
+                y0 = offset_y + sy * square_px
+                x1 = x0 + square_px
+                y1 = y0 + square_px
+                x0c = max(0, min(x0, proj_w))
+                y0c = max(0, min(y0, proj_h))
+                x1c = max(0, min(x1, proj_w))
+                y1c = max(0, min(y1, proj_h))
+                if x1c > x0c and y1c > y0c:
+                    img[y0c:y1c, x0c:x1c] = 0
+
+    # Convert to 3-channel RGB
+    return np.stack([img, img, img], axis=-1)
 
 
 def generate_checkerboard_sequence(
-    cols: int, rows: int, proj_w: int, proj_h: int,
+    cols: int, rows: int, square_px: int, proj_w: int, proj_h: int,
 ) -> list[dict]:
-    """Generate a sequence of checkerboard positions and sizes.
+    """Generate a sequence of checkerboard positions for a single square size.
 
-    Returns a list of dicts with ``square_size``, ``offset_x``, ``offset_y``,
-    and ``label`` for each pattern.  Filters out patterns that don't fit.
+    Uses 7 well-chosen positions (center, 4 corners, 2 midpoints) matching
+    Zhang's method requirements: varied positions across the frame.
+
+    Returns a list of dicts with ``offset_x``, ``offset_y``, and ``label``.
 
     Parameters
     ----------
     cols, rows : int
         Inner corner counts (e.g. 7x5).
+    square_px : int
+        Square size in projector pixels.
     proj_w, proj_h : int
         Projector resolution.
     """
-    min_dim = min(proj_w, proj_h)
-    board_cols = cols + 1  # total squares including margin
-    board_rows = rows + 1
+    board_w = (cols + 1) * square_px
+    board_h = (rows + 1) * square_px
+    border = square_px  # white border around board
+    margin = border + square_px // 2  # border + extra breathing room
 
-    # 3 size tiers
-    sizes = [
-        ("large", max(8, min_dim // 12)),
-        ("medium", max(6, min_dim // 18)),
-        ("small", max(4, min_dim // 25)),
+    # Check if board fits at all
+    if board_w + 2 * margin > proj_w or board_h + 2 * margin > proj_h:
+        logger.warning(
+            "Checkerboard too large for %dx%d (board %dx%d + margin %d)",
+            proj_w, proj_h, board_w, board_h, margin,
+        )
+        return []
+
+    max_x = proj_w - board_w - margin
+    max_y = proj_h - board_h - margin
+    min_x = margin
+    min_y = margin
+
+    if max_x < min_x:
+        max_x = min_x
+    if max_y < min_y:
+        max_y = min_y
+
+    cx = (min_x + max_x) // 2
+    cy = (min_y + max_y) // 2
+
+    positions = [
+        ("center", cx, cy),
+        ("top-left", min_x, min_y),
+        ("top-right", max_x, min_y),
+        ("bottom-left", min_x, max_y),
+        ("bottom-right", max_x, max_y),
+        ("top-center", cx, min_y),
+        ("bottom-center", cx, max_y),
     ]
 
     patterns: list[dict] = []
-
-    for size_label, sq in sizes:
-        board_w = board_cols * sq
-        board_h = board_rows * sq
-        # Skip if board doesn't fit at all (even centered)
-        if board_w > proj_w or board_h > proj_h:
-            continue
-
-        # Margin of 1 square around the board for detection
-        margin = sq
-
-        # Available space for offsets
-        avail_w = proj_w - board_w
-        avail_h = proj_h - board_h
-
-        # Center position
-        cx = avail_w // 2
-        cy = avail_h // 2
-
-        positions = [("center", cx, cy)]
-
-        # Corner positions (if there's room with margin)
-        if avail_w >= margin * 2 and avail_h >= margin * 2:
-            positions.extend([
-                ("top-left", margin, margin),
-                ("top-right", avail_w - margin, margin),
-                ("bottom-left", margin, avail_h - margin),
-                ("bottom-right", avail_w - margin, avail_h - margin),
-            ])
-
-        for pos_label, ox, oy in positions:
-            # Clamp to valid range
-            ox = max(0, min(ox, avail_w))
-            oy = max(0, min(oy, avail_h))
-            patterns.append({
-                "square_size": sq,
-                "offset_x": ox,
-                "offset_y": oy,
-                "label": f"{size_label} @ {pos_label}",
-            })
-
-    if not patterns:
-        logger.warning(
-            "No checkerboard patterns fit in %dx%d for %dx%d board",
-            proj_w, proj_h, cols, rows,
-        )
+    for label, ox, oy in positions:
+        patterns.append({
+            "offset_x": ox,
+            "offset_y": oy,
+            "label": label,
+        })
 
     return patterns
+
+
+def get_projected_corner_positions(
+    cols: int,
+    rows: int,
+    square_px: int,
+    offset_x: int,
+    offset_y: int,
+) -> np.ndarray:
+    """Get the projector-pixel coordinates of the inner corners.
+
+    Returns ``(cols * rows, 1, 2)`` float32 array of projector pixel positions.
+    """
+    corners = np.zeros((rows * cols, 1, 2), dtype=np.float32)
+    for r in range(rows):
+        for c in range(cols):
+            # Inner corners start at (1,1) square offset
+            px = offset_x + (c + 1) * square_px
+            py = offset_y + (r + 1) * square_px
+            corners[r * cols + c, 0] = (px, py)
+    return corners
 
 
 # ── HTML templates ───────────────────────────────────────────────────────────
@@ -595,6 +623,13 @@ class FrameStreamer:
         self._cc_auto_rows: int = 5
         self._cc_auto_proj_w: int = 0
         self._cc_auto_proj_h: int = 0
+        self._cc_auto_square_px: int = 0
+        self._cc_auto_proj_pts: list[np.ndarray] = []
+        # Camera calibration results (for projector intrinsics computation)
+        self._cam_K: np.ndarray | None = None
+        self._cam_dist: np.ndarray | None = None
+        self._cam_rvecs: list | None = None
+        self._cam_tvecs: list | None = None
         # Settle state (mirrors Gray code settle)
         self._cc_settle_waiting: bool = False
         self._cc_settle_baseline: np.ndarray | None = None
@@ -1161,6 +1196,12 @@ class FrameStreamer:
             logger.warning("calibrateCamera failed: %s", exc, exc_info=True)
             return {"ok": False, "error": f"calibrateCamera failed: {exc}"}
 
+        # Store for projector intrinsics computation
+        self._cam_K = K_cam
+        self._cam_dist = dist_cam
+        self._cam_rvecs = rvecs
+        self._cam_tvecs = tvecs
+
         from .calibration import save_camera_intrinsics
 
         save_camera_intrinsics(K_cam, dist_cam, (w, h), ret)
@@ -1223,11 +1264,13 @@ class FrameStreamer:
         proj_h: int,
         cols: int = 7,
         rows: int = 5,
+        square_px: int = 0,
     ) -> dict:
         """Start automated camera intrinsics calibration using projected checkerboards.
 
-        Projects checkerboard patterns at different sizes and positions,
-        detects corners in webcam frames, then runs cv2.calibrateCamera.
+        Projects checkerboard patterns at 7 well-chosen positions,
+        detects corners in webcam frames, then runs cv2.calibrateCamera
+        followed by projector intrinsics recovery.
 
         Parameters
         ----------
@@ -1235,25 +1278,36 @@ class FrameStreamer:
             Projector resolution (must match the projector page window).
         cols, rows : int
             Inner corner counts for the checkerboard pattern.
+        square_px : int
+            Square size in projector pixels.  0 = auto-compute from projector res.
         """
         if self._cc_auto_active:
             return {"ok": False, "error": "Auto calibration already in progress"}
         if self._calibration_active:
             return {"ok": False, "error": "Gray code calibration in progress"}
 
-        # Generate pattern sequence
-        patterns = generate_checkerboard_sequence(cols, rows, proj_w, proj_h)
+        # Auto-compute square size if not specified
+        if square_px <= 0:
+            square_px = max(8, min(proj_w, proj_h) // 12)
+
+        # Generate pattern sequence (single size, 7 positions)
+        patterns = generate_checkerboard_sequence(
+            cols, rows, square_px, proj_w, proj_h,
+        )
         if not patterns:
             return {
                 "ok": False,
-                "error": f"No patterns fit in {proj_w}x{proj_h} for {cols}x{rows} board",
+                "error": (
+                    f"No patterns fit in {proj_w}x{proj_h} for {cols}x{rows}"
+                    f" board with square_px={square_px}"
+                ),
             }
 
         # Pre-generate all pattern images
         images = []
         for p in patterns:
             img = generate_projected_checkerboard(
-                cols, rows, p["square_size"],
+                cols, rows, square_px,
                 p["offset_x"], p["offset_y"],
                 proj_w, proj_h,
             )
@@ -1274,6 +1328,8 @@ class FrameStreamer:
         self._cc_auto_rows = rows
         self._cc_auto_proj_w = proj_w
         self._cc_auto_proj_h = proj_h
+        self._cc_auto_square_px = square_px
+        self._cc_auto_proj_pts: list[np.ndarray] = []  # projector corner positions
         self._calibration_active = True  # suppress normal frames
 
         # Project first pattern and start settling
@@ -1360,12 +1416,24 @@ class FrameStreamer:
             criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
             corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
-            # Object points (unit squares)
-            obj_pts = np.zeros((self._cc_auto_cols * self._cc_auto_rows, 3), dtype=np.float32)
-            obj_pts[:, :2] = np.mgrid[0:self._cc_auto_cols, 0:self._cc_auto_rows].T.reshape(-1, 2)
+            # Object points with real square_px spacing (not unit squares)
+            sq = self._cc_auto_square_px
+            nc, nr = self._cc_auto_cols, self._cc_auto_rows
+            obj_pts = np.zeros((nc * nr, 3), dtype=np.float32)
+            for r in range(nr):
+                for c in range(nc):
+                    obj_pts[r * nc + c] = (c * sq, r * sq, 0.0)
 
             self._checkerboard_captures.append((obj_pts, corners.reshape(-1, 2)))
             self._checkerboard_img_size = (w, h)
+
+            # Store projector-pixel corner positions for projector intrinsics
+            proj_corners = get_projected_corner_positions(
+                nc, nr, sq,
+                pattern["offset_x"], pattern["offset_y"],
+            )
+            self._cc_auto_proj_pts.append(proj_corners)
+
             last_found = True
             logger.info(
                 "Auto CC pattern %d/%d (%s): %d corners found, %d captures total",
@@ -1401,26 +1469,26 @@ class FrameStreamer:
         }
 
     def _finish_auto_camera_calibration(self) -> dict:
-        """Finalize auto camera calibration: compute intrinsics if enough captures."""
+        """Finalize auto camera calibration: compute camera + projector intrinsics."""
         n = len(self._checkerboard_captures)
         total = len(self._cc_auto_patterns)
 
         result: dict
-        if n < 5:
+        if n < 3:
             result = {
                 "phase": "done",
                 "done": True,
                 "ok": False,
-                "error": f"Only {n} boards detected (need 5+). Try better lighting or larger patterns.",
+                "error": f"Only {n} boards detected (need 3+). Try better lighting or larger patterns.",
                 "captures_so_far": n,
                 "total_patterns": total,
                 "progress": 1.0,
             }
             logger.warning(
-                "Auto CC: only %d captures (need 5+), cannot compute intrinsics", n,
+                "Auto CC: only %d captures (need 3+), cannot compute intrinsics", n,
             )
         else:
-            # Reuse existing compute method
+            # Phase 1: Camera intrinsics
             cal_result = self.compute_camera_intrinsics()
             result = {
                 "phase": "done",
@@ -1432,10 +1500,28 @@ class FrameStreamer:
             }
             if cal_result.get("ok"):
                 logger.info(
-                    "Auto CC complete: %d captures, fx=%.1f, error=%.4f px",
+                    "Auto CC camera: %d captures, fx=%.1f, error=%.4f px",
                     n, cal_result.get("focal_length", 0),
                     cal_result.get("reprojection_error", 0),
                 )
+                # Phase 2: Projector intrinsics
+                proj_result = self._compute_projector_intrinsics()
+                if proj_result.get("ok"):
+                    result["proj_focal_length"] = proj_result["focal_length"]
+                    result["proj_reprojection_error"] = proj_result[
+                        "reprojection_error"
+                    ]
+                    logger.info(
+                        "Auto CC projector: fx=%.1f, error=%.4f px",
+                        proj_result["focal_length"],
+                        proj_result["reprojection_error"],
+                    )
+                else:
+                    result["proj_error"] = proj_result.get("error", "unknown")
+                    logger.warning(
+                        "Auto CC projector intrinsics failed: %s",
+                        proj_result.get("error"),
+                    )
 
         # Cleanup
         self._cc_auto_active = False
@@ -1452,6 +1538,114 @@ class FrameStreamer:
         self.submit_calibration_frame(card)
 
         return result
+
+    def _compute_projector_intrinsics(self) -> dict:
+        """Compute projector intrinsics using camera rvecs/tvecs.
+
+        Uses the camera's extrinsic parameters to transform object points
+        to 3D camera coordinates, then calibrates the projector using those
+        3D points and the known projector pixel positions.
+
+        Must be called after ``compute_camera_intrinsics()`` has stored
+        ``_cam_K``, ``_cam_rvecs``, ``_cam_tvecs``, and after
+        ``_cc_auto_proj_pts`` has been populated during capture.
+        """
+        if not hasattr(self, "_cam_rvecs") or self._cam_rvecs is None:
+            return {"ok": False, "error": "No camera rvecs available"}
+
+        proj_pts = getattr(self, "_cc_auto_proj_pts", [])
+        if len(proj_pts) < 3:
+            return {"ok": False, "error": f"Need 3+ proj pts, have {len(proj_pts)}"}
+
+        n = len(proj_pts)
+        if n != len(self._cam_rvecs):
+            return {
+                "ok": False,
+                "error": f"Mismatch: {n} proj pts vs {len(self._cam_rvecs)} rvecs",
+            }
+
+        # Build object point template (same as used during capture)
+        sq = self._cc_auto_square_px
+        nc, nr = self._cc_auto_cols, self._cc_auto_rows
+        obj_template = np.zeros((nc * nr, 3), dtype=np.float32)
+        for r in range(nr):
+            for c in range(nc):
+                obj_template[r * nc + c] = (c * sq, r * sq, 0.0)
+
+        # Transform object points to camera coordinates for each view
+        obj_3d_list = []
+        for i in range(n):
+            R_cam, _ = cv2.Rodrigues(self._cam_rvecs[i])
+            t_cam = self._cam_tvecs[i].reshape(3)
+            pts_3d = (R_cam @ obj_template.T).T + t_cam
+            obj_3d_list.append(pts_3d.astype(np.float32))
+
+        proj_w = self._cc_auto_proj_w or 1920
+        proj_h = self._cc_auto_proj_h or 1080
+        proj_size = (proj_w, proj_h)
+
+        # Initial projector intrinsic guess
+        fx_init = float(max(proj_w, proj_h))
+        K_init = np.array([
+            [fx_init, 0, proj_w / 2.0],
+            [0, fx_init, proj_h / 2.0],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        try:
+            ret, K_proj, dist_proj, _, _ = cv2.calibrateCamera(
+                obj_3d_list,
+                proj_pts,
+                proj_size,
+                K_init,
+                None,
+                flags=cv2.CALIB_USE_INTRINSIC_GUESS,
+            )
+        except Exception as exc:
+            logger.warning("Projector calibrateCamera failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": f"Projector calibration failed: {exc}"}
+
+        fx = float(K_proj[0, 0])
+        fy = float(K_proj[1, 1])
+        logger.info(
+            "Projector intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f error=%.3f px",
+            fx, fy, float(K_proj[0, 2]), float(K_proj[1, 2]), ret,
+        )
+
+        # Save projector intrinsics alongside camera intrinsics
+        self._save_projector_intrinsics(K_proj, dist_proj, ret)
+
+        return {
+            "ok": True,
+            "focal_length": fx,
+            "focal_length_y": fy,
+            "reprojection_error": float(ret),
+        }
+
+    def _save_projector_intrinsics(
+        self,
+        K_proj: np.ndarray,
+        dist_proj: np.ndarray,
+        reprojection_error: float,
+    ) -> None:
+        """Save projector intrinsics to the calibration JSON (merge with existing)."""
+        try:
+            if _CALIBRATION_JSON_PATH.is_file():
+                data = json.loads(_CALIBRATION_JSON_PATH.read_text())
+            else:
+                data = {}
+            data["K_proj"] = K_proj.tolist()
+            data["dist_proj"] = (
+                dist_proj.flatten().tolist() if dist_proj is not None
+                else [0.0] * 5
+            )
+            data["proj_reprojection_error"] = float(reprojection_error)
+            _CALIBRATION_JSON_PATH.write_text(json.dumps(data))
+            logger.info("Saved projector intrinsics to %s", _CALIBRATION_JSON_PATH.name)
+        except Exception:
+            logger.warning(
+                "Could not save projector intrinsics", exc_info=True,
+            )
 
     def stop_auto_camera_calibration(self) -> dict:
         """Cancel an in-progress auto camera calibration."""
@@ -2262,6 +2456,7 @@ class FrameStreamer:
                         proj_h=int(cfg.get("proj_h", 1080)),
                         cols=int(cfg.get("cols", 7)),
                         rows=int(cfg.get("rows", 5)),
+                        square_px=int(cfg.get("square_px", 0)),
                     )
                     resp = json.dumps(result).encode()
                     status = 200 if result.get("ok") else 409
