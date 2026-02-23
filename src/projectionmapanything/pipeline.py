@@ -37,6 +37,8 @@ from .calibration import (
     CalibrationPhase,
     CalibrationState,
     load_calibration,
+    load_calibration_meta,
+    load_camera_intrinsics,
     save_calibration,
 )
 from .frame_server import FrameStreamer, get_or_create_streamer
@@ -418,6 +420,8 @@ class ProMapAnythingCalibratePipeline(Pipeline):
                         self.proj_w, self.proj_h,
                         disparity_map=self._calib.disparity_map,
                         valid_mask=self._calib.proj_valid_mask,
+                        cam_w=self._calib.cam_w,
+                        cam_h=self._calib.cam_h,
                     )
                     logger.info("Calibration saved.")
 
@@ -617,7 +621,12 @@ class ProMapAnythingPipeline(Pipeline):
         # Cached depth results (invalidated on recalibration / resolution change)
         self._disparity_depth_cache: torch.Tensor | None = None
         self._ai_depth_cache: torch.Tensor | None = None
+        self._stereo_depth_cache: torch.Tensor | None = None
         self._static_warped_camera: torch.Tensor | None = None
+
+        # Camera resolution from calibration metadata (for stereo triangulation)
+        self._cam_w: int | None = None
+        self._cam_h: int | None = None
 
         # -- Inline calibration state --
         self._calib: CalibrationState | None = None
@@ -645,18 +654,34 @@ class ProMapAnythingPipeline(Pipeline):
                 # Disparity was computed only for valid pixels — derive mask
                 # from non-uniform regions (inpainted areas are smooth gradients)
                 self._proj_valid_mask = disp > 0.01
+            # Load camera dimensions from metadata (for stereo triangulation)
+            meta = load_calibration_meta(cal_path)
+            self._cam_w = meta.get("camera_width")
+            self._cam_h = meta.get("camera_height")
             logger.info(
                 "Calibration loaded from %s (%dx%d, captured %s, disparity=%s, "
-                "valid_mask=%s)",
+                "valid_mask=%s, cam=%s)",
                 cal_path, pw, ph, ts,
                 "yes" if disp is not None else "no",
                 "yes" if self._proj_valid_mask is not None else "no",
+                f"{self._cam_w}x{self._cam_h}" if self._cam_w else "unknown",
             )
         else:
             logger.warning(
                 "No calibration found at %s — output will be un-warped camera depth",
                 cal_path,
             )
+
+        # Check for camera intrinsics (from checkerboard calibration)
+        intrinsics = load_camera_intrinsics()
+        if intrinsics is not None:
+            logger.info(
+                "Camera intrinsics available: fx=%.1f fy=%.1f (error=%.4f px)",
+                intrinsics["K_cam"][0, 0], intrinsics["K_cam"][1, 1],
+                intrinsics["reprojection_error"],
+            )
+        else:
+            logger.info("No camera intrinsics found — stereo will estimate from FOV")
 
         logger.info("Preprocessor ready on port %d", port)
 
@@ -716,7 +741,10 @@ class ProMapAnythingPipeline(Pipeline):
             self._prev_depth = None
             self._disparity_depth_cache = None
             self._ai_depth_cache = None
+            self._stereo_depth_cache = None
             self._static_warped_camera = None
+            self._cam_w = None
+            self._cam_h = None
             self._calib = None
             self._calibrating = False
             self._calib_done = False
@@ -743,6 +771,7 @@ class ProMapAnythingPipeline(Pipeline):
                     # Invalidate caches that depend on projector resolution
                     self._disparity_depth_cache = None
                     self._ai_depth_cache = None
+                    self._stereo_depth_cache = None
                     self._static_warped_camera = None
                     logger.info("Projector resolution auto-detected: %dx%d", self.proj_w, self.proj_h)
 
@@ -751,6 +780,13 @@ class ProMapAnythingPipeline(Pipeline):
         result = self._handle_inline_calibration(frame, start_cal, kwargs)
         if result is not None:
             return result
+
+        # Read projector FOV (for stereo depth) — invalidate cache if changed
+        new_proj_fov = float(self._p("projector_fov", kwargs, 50.0))
+        if not hasattr(self, "_projector_fov") or new_proj_fov != self._projector_fov:
+            if hasattr(self, "_projector_fov") and self._projector_fov != new_proj_fov:
+                self._stereo_depth_cache = None
+            self._projector_fov = new_proj_fov
 
         # All processing params — read from dashboard overrides with sensible defaults
         # (disabled by default; advanced users tune via dashboard)
@@ -788,6 +824,8 @@ class ProMapAnythingPipeline(Pipeline):
             rgb = self._ai_depth()
         elif depth_mode == "disparity" and has_calib:
             rgb = self._disparity_depth()
+        elif depth_mode == "stereo" and has_calib:
+            rgb = self._stereo_depth()
         elif depth_mode == "custom":
             rgb = self._get_custom_depth(frame_f)
         elif depth_mode == "canny" and has_calib:
@@ -1214,6 +1252,8 @@ class ProMapAnythingPipeline(Pipeline):
                         self.proj_w, self.proj_h,
                         disparity_map=disp,
                         valid_mask=self._calib.proj_valid_mask,
+                        cam_w=self._calib.cam_w,
+                        cam_h=self._calib.cam_h,
                     )
                     logger.info("Inline calibration saved to %s", _DEFAULT_CALIBRATION_PATH)
 
@@ -1223,9 +1263,14 @@ class ProMapAnythingPipeline(Pipeline):
                     self._proj_valid_mask = self._calib.proj_valid_mask
                     self._disparity_map = disp
 
+                    # Store camera resolution from this calibration
+                    self._cam_w = self._calib.cam_w
+                    self._cam_h = self._calib.cam_h
+
                     # Clear cached depth so all depth modes recompute
                     self._disparity_depth_cache = None
                     self._ai_depth_cache = None
+                    self._stereo_depth_cache = None
                     self._static_warped_camera = None
 
                     # Coverage
@@ -1551,6 +1596,258 @@ class ProMapAnythingPipeline(Pipeline):
             "yes" if H is not None else "no (simple fallback)",
         )
         return depth
+
+    def _stereo_depth(self) -> torch.Tensor:
+        """Compute geometric 3D depth via stereo triangulation (cached).
+
+        Treats the projector as a second camera and uses the Gray code
+        correspondences (map_x, map_y) to triangulate 3D points.  The
+        essential matrix is recovered from matched points, giving the
+        camera-projector pose (R, T).  All valid correspondence points
+        are then triangulated and the Z-depth in the projector frame is
+        used as the depth map.
+
+        Falls back to disparity if the geometry recovery fails.
+        """
+        if self._stereo_depth_cache is not None:
+            return self._stereo_depth_cache
+
+        if self._map_x is None or self._map_y is None:
+            logger.warning("Stereo depth: no calibration — falling back to grey")
+            result = torch.full(
+                (self.proj_h, self.proj_w, 3), 0.5,
+                dtype=torch.float32, device=self.device,
+            )
+            self._stereo_depth_cache = result
+            return result
+
+        proj_h, proj_w = self._map_x.shape
+
+        # -- Camera resolution: from calibration meta, ambient image, or default
+        cam_w = self._cam_w
+        cam_h = self._cam_h
+        if cam_w is None or cam_h is None:
+            ambient_path = _RESULTS_DIR / "ambient_camera.png"
+            if ambient_path.is_file():
+                img = cv2.imread(str(ambient_path))
+                if img is not None:
+                    cam_h, cam_w = img.shape[:2]
+                    logger.info("Stereo: camera res from ambient image: %dx%d", cam_w, cam_h)
+            if cam_w is None or cam_h is None:
+                cam_w, cam_h = 1280, 720
+                logger.info("Stereo: using default camera res %dx%d", cam_w, cam_h)
+
+        # -- Camera intrinsics: reload from disk on cache miss (lazy)
+        intrinsics = load_camera_intrinsics()
+        if intrinsics is not None:
+            K_cam = intrinsics["K_cam"].copy()
+            dist_cam = intrinsics["dist_cam"].copy()
+            # Scale intrinsics if camera resolution differs from calibration
+            cal_w, cal_h = intrinsics["image_size"]
+            if cal_w != cam_w or cal_h != cam_h:
+                sx = cam_w / cal_w
+                sy = cam_h / cal_h
+                K_cam[0, 0] *= sx  # fx
+                K_cam[1, 1] *= sy  # fy
+                K_cam[0, 2] *= sx  # cx
+                K_cam[1, 2] *= sy  # cy
+                logger.info(
+                    "Stereo: scaled intrinsics %dx%d -> %dx%d (fx=%.1f)",
+                    cal_w, cal_h, cam_w, cam_h, K_cam[0, 0],
+                )
+            logger.info("Stereo: using real camera intrinsics (fx=%.1f)", K_cam[0, 0])
+        else:
+            # Fallback: estimate from resolution + assumed 70 deg FOV
+            cam_fov_deg = 70.0
+            cam_fx = cam_w / (2.0 * np.tan(np.radians(cam_fov_deg / 2.0)))
+            K_cam = np.array([
+                [cam_fx, 0, cam_w / 2.0],
+                [0, cam_fx, cam_h / 2.0],
+                [0, 0, 1],
+            ], dtype=np.float64)
+            dist_cam = np.zeros(5, dtype=np.float64)
+            logger.info("Stereo: using estimated camera intrinsics (FOV=%.0f deg, fx=%.1f)", cam_fov_deg, cam_fx)
+
+        # Projector intrinsics: estimated from FOV (dashboard-configurable)
+        proj_fov_deg = getattr(self, "_projector_fov", 50.0)
+        proj_fx = proj_w / (2.0 * np.tan(np.radians(proj_fov_deg / 2.0)))
+        K_proj = np.array([
+            [proj_fx, 0, proj_w / 2.0],
+            [0, proj_fx, proj_h / 2.0],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        # -- Extract correspondence pairs from map_x, map_y
+        # Build projector pixel coordinates
+        px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
+        py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
+
+        valid = self._proj_valid_mask if self._proj_valid_mask is not None else np.ones(
+            (proj_h, proj_w), dtype=bool,
+        )
+        n_valid = int(np.count_nonzero(valid))
+        if n_valid < 100:
+            logger.warning(
+                "Stereo: too few valid points (%d) — falling back to disparity",
+                n_valid,
+            )
+            result = self._disparity_depth()
+            self._stereo_depth_cache = result
+            return result
+
+        # Camera points (from map_x, map_y) and projector points
+        cam_pts = np.column_stack([
+            self._map_x[valid], self._map_y[valid],
+        ]).astype(np.float64)
+        proj_pts = np.column_stack([
+            px[valid], py[valid],
+        ]).astype(np.float64)
+
+        # -- Undistort to normalized coordinates
+        dist_proj = np.zeros(5, dtype=np.float64)
+        cam_norm = cv2.undistortPoints(
+            cam_pts.reshape(-1, 1, 2), K_cam, dist_cam,
+        ).reshape(-1, 2)
+        proj_norm = cv2.undistortPoints(
+            proj_pts.reshape(-1, 1, 2), K_proj, dist_proj,
+        ).reshape(-1, 2)
+
+        # -- Subsample for essential matrix estimation (RANSAC on 20K points)
+        rng = np.random.default_rng(42)
+        n_pts = len(cam_norm)
+        n_sample = min(20000, n_pts)
+        idx = rng.choice(n_pts, n_sample, replace=False) if n_pts > n_sample else np.arange(n_pts)
+
+        E, mask_E = cv2.findEssentialMat(
+            cam_norm[idx], proj_norm[idx],
+            focal=1.0, pp=(0.0, 0.0),
+            method=cv2.RANSAC, prob=0.999, threshold=0.001,
+        )
+        if E is None:
+            logger.warning("Stereo: findEssentialMat failed — falling back to disparity")
+            result = self._disparity_depth()
+            self._stereo_depth_cache = result
+            return result
+
+        # -- Recover pose (R, T) with cheirality check
+        n_inliers, R, T, mask_pose = cv2.recoverPose(
+            E, cam_norm[idx], proj_norm[idx],
+            mask=mask_E,
+        )
+        if n_inliers < 50:
+            logger.warning(
+                "Stereo: recoverPose found only %d inliers — falling back to disparity",
+                n_inliers,
+            )
+            result = self._disparity_depth()
+            self._stereo_depth_cache = result
+            return result
+
+        logger.info(
+            "Stereo: essential matrix recovered, %d/%d inliers, "
+            "R det=%.4f, T=[%.3f, %.3f, %.3f]",
+            n_inliers, n_sample, np.linalg.det(R), T[0, 0], T[1, 0], T[2, 0],
+        )
+
+        # -- Build projection matrices
+        P_cam = K_cam @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P_proj = K_proj @ np.hstack([R, T])
+
+        # -- Triangulate ALL valid points
+        points_4d = cv2.triangulatePoints(
+            P_cam.astype(np.float64),
+            P_proj.astype(np.float64),
+            cam_pts.T,   # (2, N)
+            proj_pts.T,  # (2, N)
+        )
+
+        # Convert from homogeneous to 3D
+        w_vals = points_4d[3, :]
+        w_valid = np.abs(w_vals) > 1e-8
+        points_3d = np.zeros((3, len(w_vals)), dtype=np.float64)
+        points_3d[:, w_valid] = points_4d[:3, w_valid] / w_vals[w_valid]
+
+        # -- Transform to projector frame → Z-depth
+        points_proj = R @ points_3d + T  # (3, N)
+        z_depth = points_proj[2, :]  # depth along projector optical axis
+
+        # Filter: keep only positive, finite depths
+        depth_valid = np.isfinite(z_depth) & (z_depth > 0) & w_valid
+        n_depth_valid = int(np.count_nonzero(depth_valid))
+        if n_depth_valid < 100:
+            logger.warning(
+                "Stereo: only %d valid depths after filtering — "
+                "falling back to disparity",
+                n_depth_valid,
+            )
+            result = self._disparity_depth()
+            self._stereo_depth_cache = result
+            return result
+
+        # -- Scatter into projector-space depth map
+        proj_ys = py[valid].astype(np.int32)
+        proj_xs = px[valid].astype(np.int32)
+        depth_map = np.zeros((proj_h, proj_w), dtype=np.float32)
+        depth_filled = np.zeros((proj_h, proj_w), dtype=bool)
+
+        valid_z = z_depth.copy()
+        valid_z[~depth_valid] = 0.0
+
+        # For pixels with multiple correspondences, use mean
+        sum_z = np.zeros((proj_h, proj_w), dtype=np.float64)
+        count_z = np.zeros((proj_h, proj_w), dtype=np.int32)
+        np.add.at(sum_z, (proj_ys[depth_valid], proj_xs[depth_valid]),
+                  valid_z[depth_valid])
+        np.add.at(count_z, (proj_ys[depth_valid], proj_xs[depth_valid]), 1)
+
+        has_data = count_z > 0
+        depth_map[has_data] = (sum_z[has_data] / count_z[has_data]).astype(np.float32)
+        depth_filled = has_data
+
+        # -- Percentile normalize to [0, 1], invert (near=bright for VACE)
+        filled_vals = depth_map[depth_filled]
+        if filled_vals.size > 0:
+            p2 = float(np.percentile(filled_vals, 2))
+            p98 = float(np.percentile(filled_vals, 98))
+            if p98 - p2 > 1e-6:
+                depth_map = (depth_map - p2) / (p98 - p2)
+            else:
+                depth_map = np.full_like(depth_map, 0.5)
+        depth_map = np.clip(depth_map, 0.0, 1.0).astype(np.float32)
+
+        # Invert: near=bright (matching VACE / Depth Anything convention)
+        depth_map = 1.0 - depth_map
+
+        # Zero out unfilled pixels before post-processing
+        depth_map[~depth_filled] = 0.0
+
+        # -- CLAHE for local contrast enhancement
+        depth_u8 = (depth_map * 255).clip(0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+        depth_u8 = clahe.apply(depth_u8)
+
+        # -- Inpaint holes
+        if not np.all(depth_filled):
+            hole_mask = (~depth_filled).astype(np.uint8) * 255
+            depth_u8 = cv2.inpaint(depth_u8, hole_mask, 15, cv2.INPAINT_NS)
+
+        # -- Gaussian blur for smooth output
+        depth_u8 = cv2.GaussianBlur(depth_u8, (7, 7), 0)
+        depth_np = depth_u8.astype(np.float32) / 255.0
+
+        # Build (H, W, 3) RGB tensor
+        depth_rgb = np.stack([depth_np, depth_np, depth_np], axis=-1)
+        result = torch.from_numpy(depth_rgb).to(self.device)
+        self._stereo_depth_cache = result
+
+        logger.info(
+            "Stereo depth ready: %dx%d, %d/%d triangulated (%.1f%%), "
+            "range [%.3f, %.3f]",
+            proj_w, proj_h, n_depth_valid, n_valid,
+            100.0 * n_depth_valid / max(n_valid, 1),
+            depth_np.min(), depth_np.max(),
+        )
+        return result
 
     def _load_camera_image(self) -> torch.Tensor | None:
         """Load the ambient camera image from calibration results.

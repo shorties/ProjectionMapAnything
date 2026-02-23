@@ -168,6 +168,38 @@
         <input type="number" id="sc-brightness" value="128" min="10" max="255" />
       </div>
       <div class="hint" id="sc-status">Enable webcam for standalone calibration</div>
+      <!-- Camera Intrinsics -->
+      <div style="border-top:1px solid #2a2f3a; margin-top:6px; padding-top:8px;">
+        <div class="muted" style="margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; font-size:10px;">Camera Intrinsics</div>
+        <div class="ctrl">
+          <span class="ctrl-label">Board Size</span>
+          <input type="number" id="cc-cols" value="7" min="3" max="20" style="width:50px" />
+          <span class="muted" style="margin:0 2px;">&times;</span>
+          <input type="number" id="cc-rows" value="5" min="3" max="20" style="width:50px" />
+        </div>
+        <div class="btn-row" style="margin-top:6px;">
+          <button class="btn btn-p btn-sm" id="cc-auto-btn" onclick="ccAutoStart()" disabled>Auto Calibrate</button>
+          <button class="btn btn-s btn-sm hidden" id="cc-auto-stop-btn" onclick="ccAutoStop()">Cancel</button>
+          <button class="btn btn-s btn-sm" onclick="ccReset()">Reset</button>
+        </div>
+        <div id="cc-auto-progress" class="hidden" style="margin-top:6px;">
+          <div class="prog-wrap">
+            <div class="prog-bar" id="cc-auto-bar" style="width:0%"></div>
+            <div class="prog-text" id="cc-auto-pct">0%</div>
+          </div>
+          <div class="muted" id="cc-auto-detail"></div>
+        </div>
+        <div class="hint" id="cc-status">No captures yet</div>
+        <details style="margin-top:6px; background:#13161e;">
+          <summary style="font-size:10px; padding:6px 8px;">Manual Capture</summary>
+          <div style="padding:4px 8px 8px;">
+            <div class="btn-row">
+              <button class="btn btn-s btn-sm" onclick="ccCapture()">Capture Board</button>
+              <button class="btn btn-p btn-sm" id="cc-compute-btn" onclick="ccCompute()" disabled>Compute</button>
+            </div>
+          </div>
+        </details>
+      </div>
       <!-- Progress -->
       <div id="calib-progress" class="hidden">
         <div class="prog-wrap">
@@ -189,10 +221,17 @@
         <select onchange="param('depth_mode',this.value)" id="p-depth_mode">
           <option value="ai_depth">AI Depth</option>
           <option value="disparity">Calibration Disparity</option>
+          <option value="stereo">Stereo Triangulation</option>
           <option value="canny">Edge Detection</option>
           <option value="warped_rgb">Warped Camera</option>
           <option value="custom">Custom Upload</option>
         </select>
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Proj FOV</span>
+        <input type="range" min="20" max="120" step="1" value="50"
+               oninput="param('projector_fov',+this.value);this.nextElementSibling.textContent=this.value+'°'" id="p-projector_fov" />
+        <span class="range-val">50°</span>
       </div>
       <div class="ctrl">
         <span class="ctrl-label">Smoothing</span>
@@ -650,6 +689,7 @@ async function scToggleWebcam() {
     if (scStream) { scStream.getTracks().forEach(t => t.stop()); scStream = null; }
     video.srcObject = null; wrap.classList.add('hidden');
     btn.textContent = 'Webcam'; startBtn.disabled = true; scWebcamOn = false;
+    document.getElementById('cc-auto-btn').disabled = true;
     st.textContent = 'Webcam disabled'; return;
   }
   try {
@@ -659,6 +699,7 @@ async function scToggleWebcam() {
     });
     video.srcObject = scStream; wrap.classList.remove('hidden');
     btn.textContent = 'Stop Cam'; startBtn.disabled = false; scWebcamOn = true;
+    document.getElementById('cc-auto-btn').disabled = false;
     st.textContent = 'Ready. Open projector, then Start.';
     try {
       const cfg = await (await fetch('/config')).json();
@@ -739,6 +780,205 @@ async function scStopCalibration() {
   document.getElementById('sc-start-btn').disabled = !scWebcamOn;
   document.getElementById('sc-stop-btn').classList.add('hidden');
 }
+
+// -- Camera Intrinsics (Checkerboard) --
+async function ccCapture() {
+  const st = document.getElementById('cc-status');
+  const video = document.getElementById('sc-video');
+  const canvas = document.getElementById('sc-canvas');
+
+  if (!scWebcamOn || !video.srcObject) {
+    st.textContent = 'Enable webcam first';
+    st.className = 'hint err';
+    return;
+  }
+
+  st.textContent = 'Capturing...'; st.className = 'hint';
+
+  // Grab frame from webcam
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  try {
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.95));
+    if (!blob) { st.textContent = 'Failed to capture frame'; st.className = 'hint err'; return; }
+
+    const cols = parseInt(document.getElementById('cc-cols').value) || 9;
+    const rows = parseInt(document.getElementById('cc-rows').value) || 6;
+
+    const r = await fetch('/camera-calibration/capture?cols=' + cols + '&rows=' + rows, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/octet-stream'},
+      body: blob
+    });
+    const d = await r.json();
+
+    if (!d.ok) {
+      st.textContent = 'Error: ' + (d.error || 'unknown'); st.className = 'hint err';
+    } else if (!d.found) {
+      st.textContent = 'No board found (' + d.captures + ' captures). Try a different angle.';
+      st.className = 'hint err';
+    } else {
+      st.textContent = d.captures + ' capture(s) — need ' + Math.max(0, 5 - d.captures) + ' more';
+      st.className = 'hint ok';
+      document.getElementById('cc-compute-btn').disabled = d.captures < 5;
+    }
+  } catch (e) {
+    st.textContent = 'Error: ' + e.message; st.className = 'hint err';
+  }
+}
+
+async function ccCompute() {
+  const st = document.getElementById('cc-status');
+  st.textContent = 'Computing intrinsics...'; st.className = 'hint';
+  try {
+    const r = await fetch('/camera-calibration/compute', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      st.textContent = 'Done! fx=' + d.focal_length.toFixed(1) +
+        ' error=' + d.reprojection_error.toFixed(4) + 'px';
+      st.className = 'hint ok';
+    } else {
+      st.textContent = 'Failed: ' + (d.error || ''); st.className = 'hint err';
+    }
+  } catch (e) { st.textContent = 'Error: ' + e.message; st.className = 'hint err'; }
+}
+
+async function ccReset() {
+  const st = document.getElementById('cc-status');
+  try {
+    await fetch('/camera-calibration/reset', { method: 'POST' });
+    st.textContent = 'No captures yet'; st.className = 'hint';
+    document.getElementById('cc-compute-btn').disabled = true;
+  } catch (e) { st.textContent = 'Error: ' + e.message; st.className = 'hint err'; }
+}
+
+// -- Auto Camera Calibration (Projected Checkerboards) --
+let ccAutoRunning = false;
+
+async function ccAutoStart() {
+  if (!scWebcamOn || ccAutoRunning) return;
+  const st = document.getElementById('cc-status');
+  const config = {
+    proj_w: parseInt(document.getElementById('sc-proj-w').value) || 1920,
+    proj_h: parseInt(document.getElementById('sc-proj-h').value) || 1080,
+    cols: parseInt(document.getElementById('cc-cols').value) || 7,
+    rows: parseInt(document.getElementById('cc-rows').value) || 5,
+  };
+  st.textContent = 'Starting auto calibration...'; st.className = 'hint';
+  try {
+    const r = await fetch('/camera-calibration/auto/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(config)
+    });
+    const d = await r.json();
+    if (!d.ok) { st.textContent = 'Failed: ' + (d.error || ''); st.className = 'hint err'; return; }
+    if (!_projectorWin || _projectorWin.closed) openProjector();
+    ccAutoRunning = true;
+    document.getElementById('cc-auto-btn').disabled = true;
+    document.getElementById('cc-auto-stop-btn').classList.remove('hidden');
+    document.getElementById('cc-auto-progress').classList.remove('hidden');
+    st.textContent = 'Projecting ' + d.total_patterns + ' patterns...';
+    ccAutoCaptureLoop();
+  } catch (e) { st.textContent = 'Error: ' + e.message; st.className = 'hint err'; }
+}
+
+async function ccAutoCaptureLoop() {
+  if (!ccAutoRunning) return;
+  const video = document.getElementById('sc-video');
+  const canvas = document.getElementById('sc-canvas');
+  const st = document.getElementById('cc-status');
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+  const ctx = canvas.getContext('2d');
+
+  while (ccAutoRunning) {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    try {
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+      if (!blob || !ccAutoRunning) break;
+      const r = await fetch('/camera-calibration/auto/frame', {
+        method: 'POST', headers: {'Content-Type': 'application/octet-stream'}, body: blob
+      });
+      const d = await r.json();
+      if (d.error && d.done) {
+        ccAutoRunning = false;
+        st.textContent = 'Error: ' + d.error; st.className = 'hint err';
+        ccAutoCleanupUI();
+        break;
+      } else if (d.done) {
+        ccAutoRunning = false;
+        if (d.ok) {
+          st.textContent = 'Done! fx=' + (d.focal_length || 0).toFixed(1) +
+            ' error=' + (d.reprojection_error || 0).toFixed(4) + 'px' +
+            ' (' + d.captures_so_far + ' boards)';
+          st.className = 'hint ok';
+        } else if (d.error) {
+          st.textContent = d.error;
+          st.className = 'hint err';
+        } else {
+          st.textContent = 'Complete (' + d.captures_so_far + ' captures)';
+          st.className = 'hint ok';
+        }
+        const pct = 100;
+        document.getElementById('cc-auto-bar').style.width = pct + '%';
+        document.getElementById('cc-auto-pct').textContent = pct + '%';
+        document.getElementById('cc-auto-detail').textContent = 'Finished';
+        ccAutoCleanupUI();
+        break;
+      } else {
+        // Update progress
+        const pct = Math.round((d.progress || 0) * 100);
+        document.getElementById('cc-auto-bar').style.width = pct + '%';
+        document.getElementById('cc-auto-pct').textContent = pct + '%';
+        let detail = (d.pattern_idx || 0) + '/' + (d.total_patterns || 0) +
+          ' ' + (d.pattern_label || '');
+        if (d.settling) detail += ' [settling]';
+        if (d.captures_so_far > 0) detail += ' \u2014 ' + d.captures_so_far + ' found';
+        document.getElementById('cc-auto-detail').textContent = detail;
+        st.textContent = d.phase + ': ' + detail;
+      }
+    } catch (e) { st.textContent = 'Frame error: ' + e.message; st.className = 'hint err'; }
+    await new Promise(r => setTimeout(r, 16));
+  }
+}
+
+function ccAutoCleanupUI() {
+  document.getElementById('cc-auto-btn').disabled = !scWebcamOn;
+  document.getElementById('cc-auto-stop-btn').classList.add('hidden');
+}
+
+async function ccAutoStop() {
+  ccAutoRunning = false;
+  try { await fetch('/camera-calibration/auto/stop', { method: 'POST' }); } catch {}
+  document.getElementById('cc-status').textContent = 'Auto calibration cancelled';
+  document.getElementById('cc-auto-progress').classList.add('hidden');
+  ccAutoCleanupUI();
+}
+
+// Load camera calibration status on page load
+(async function ccLoadStatus() {
+  try {
+    const r = await fetch('/camera-calibration/status');
+    const d = await r.json();
+    const st = document.getElementById('cc-status');
+    if (d.has_intrinsics && d.intrinsics) {
+      st.textContent = 'Intrinsics loaded: fx=' + d.intrinsics.fx.toFixed(1) +
+        ' error=' + d.intrinsics.error.toFixed(4) + 'px';
+      st.className = 'hint ok';
+    }
+    if (d.captures > 0) {
+      document.getElementById('cc-compute-btn').disabled = d.captures < 5;
+      if (!d.has_intrinsics) {
+        st.textContent = d.captures + ' capture(s) — need ' + Math.max(0, 5 - d.captures) + ' more';
+      }
+    }
+    document.getElementById('cc-cols').value = d.cols || 9;
+    document.getElementById('cc-rows').value = d.rows || 6;
+  } catch {}
+})();
 
 // -- Transfer --
 function exportCalibration() {

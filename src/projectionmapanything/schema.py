@@ -257,6 +257,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
     depth_mode: Literal[
         "ai_depth",
         "disparity",
+        "stereo",
         "canny",
         "warped_rgb",
         "custom",
@@ -270,6 +271,8 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "to projector perspective (best quality, recommended). "
             "disparity: horizontal disparity from calibration — simple, "
             "fast, no AI model needed. "
+            "stereo: proper stereo triangulation from calibration "
+            "correspondences — geometric 3D depth, no AI model needed. "
             "canny: edge detection on warped camera image. "
             "warped_rgb: warped camera image from calibration. "
             "custom: upload your own via the dashboard."
@@ -293,6 +296,23 @@ class ProMapAnythingConfig(BasePipelineConfig):
             order=3,
             label="Dashboard",
             is_load_param=True,
+            category="configuration",
+        ),
+    )
+
+    # -- Stereo depth config ---------------------------------------------------
+
+    projector_fov: float = Field(
+        default=50.0,
+        ge=20.0,
+        le=120.0,
+        description=(
+            "Projector horizontal field of view in degrees (for stereo "
+            "depth mode). Projectors are typically 40-60 degrees."
+        ),
+        json_schema_extra=ui_field_config(
+            order=5,
+            label="Projector FOV",
             category="configuration",
         ),
     )

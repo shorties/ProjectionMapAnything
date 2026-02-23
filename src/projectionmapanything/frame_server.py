@@ -104,6 +104,121 @@ def _load_testcard(target_w: int, target_h: int) -> np.ndarray:
     return card
 
 
+# ── Projected checkerboard pattern generation ─────────────────────────────
+
+
+def generate_projected_checkerboard(
+    cols: int,
+    rows: int,
+    square_size: int,
+    offset_x: int,
+    offset_y: int,
+    proj_w: int,
+    proj_h: int,
+) -> np.ndarray:
+    """Generate a checkerboard image for projector display.
+
+    The board has ``(cols+1) x (rows+1)`` squares with a 1-square white
+    margin around the pattern.  Inner corners are ``cols x rows``.
+
+    Returns ``(proj_h, proj_w, 3)`` uint8 RGB.
+    """
+    img = np.full((proj_h, proj_w, 3), 255, dtype=np.uint8)  # white bg
+
+    # Total board dimensions including margin
+    board_cols = cols + 1  # number of squares horizontally
+    board_rows = rows + 1  # number of squares vertically
+
+    for r in range(board_rows):
+        for c in range(board_cols):
+            if (r + c) % 2 == 1:
+                x0 = offset_x + c * square_size
+                y0 = offset_y + r * square_size
+                x1 = min(x0 + square_size, proj_w)
+                y1 = min(y0 + square_size, proj_h)
+                if x0 < proj_w and y0 < proj_h:
+                    img[y0:y1, x0:x1] = 0  # black square
+
+    return img
+
+
+def generate_checkerboard_sequence(
+    cols: int, rows: int, proj_w: int, proj_h: int,
+) -> list[dict]:
+    """Generate a sequence of checkerboard positions and sizes.
+
+    Returns a list of dicts with ``square_size``, ``offset_x``, ``offset_y``,
+    and ``label`` for each pattern.  Filters out patterns that don't fit.
+
+    Parameters
+    ----------
+    cols, rows : int
+        Inner corner counts (e.g. 7x5).
+    proj_w, proj_h : int
+        Projector resolution.
+    """
+    min_dim = min(proj_w, proj_h)
+    board_cols = cols + 1  # total squares including margin
+    board_rows = rows + 1
+
+    # 3 size tiers
+    sizes = [
+        ("large", max(8, min_dim // 12)),
+        ("medium", max(6, min_dim // 18)),
+        ("small", max(4, min_dim // 25)),
+    ]
+
+    patterns: list[dict] = []
+
+    for size_label, sq in sizes:
+        board_w = board_cols * sq
+        board_h = board_rows * sq
+        # Skip if board doesn't fit at all (even centered)
+        if board_w > proj_w or board_h > proj_h:
+            continue
+
+        # Margin of 1 square around the board for detection
+        margin = sq
+
+        # Available space for offsets
+        avail_w = proj_w - board_w
+        avail_h = proj_h - board_h
+
+        # Center position
+        cx = avail_w // 2
+        cy = avail_h // 2
+
+        positions = [("center", cx, cy)]
+
+        # Corner positions (if there's room with margin)
+        if avail_w >= margin * 2 and avail_h >= margin * 2:
+            positions.extend([
+                ("top-left", margin, margin),
+                ("top-right", avail_w - margin, margin),
+                ("bottom-left", margin, avail_h - margin),
+                ("bottom-right", avail_w - margin, avail_h - margin),
+            ])
+
+        for pos_label, ox, oy in positions:
+            # Clamp to valid range
+            ox = max(0, min(ox, avail_w))
+            oy = max(0, min(oy, avail_h))
+            patterns.append({
+                "square_size": sq,
+                "offset_x": ox,
+                "offset_y": oy,
+                "label": f"{size_label} @ {pos_label}",
+            })
+
+    if not patterns:
+        logger.warning(
+            "No checkerboard patterns fit in %dx%d for %dx%d board",
+            proj_w, proj_h, cols, rows,
+        )
+
+    return patterns
+
+
 # ── HTML templates ───────────────────────────────────────────────────────────
 
 _PROJECTOR_HTML = """\
@@ -464,6 +579,29 @@ class FrameStreamer:
         # Dashboard parameter overrides — set via POST /api/params,
         # read by pipelines as kwargs overrides.
         self._param_overrides: dict = {}
+
+        # Checkerboard camera intrinsics calibration state
+        self._checkerboard_captures: list[tuple[np.ndarray, np.ndarray]] = []
+        self._checkerboard_img_size: tuple[int, int] | None = None
+        self._checkerboard_cols: int = 9
+        self._checkerboard_rows: int = 6
+
+        # Auto camera calibration (projected checkerboards)
+        self._cc_auto_active: bool = False
+        self._cc_auto_patterns: list[dict] = []
+        self._cc_auto_images: list[np.ndarray] = []
+        self._cc_auto_idx: int = 0
+        self._cc_auto_cols: int = 7
+        self._cc_auto_rows: int = 5
+        self._cc_auto_proj_w: int = 0
+        self._cc_auto_proj_h: int = 0
+        # Settle state (mirrors Gray code settle)
+        self._cc_settle_waiting: bool = False
+        self._cc_settle_baseline: np.ndarray | None = None
+        self._cc_settle_prev: np.ndarray | None = None
+        self._cc_settle_counter: int = 0
+        self._cc_settle_stable: int = 0
+        self._cc_settle_changed: bool = False
 
         # Track active MJPEG stream clients (projector pages).
         # When zero AND dashboard preview is disabled, submit_frame()
@@ -854,6 +992,8 @@ class FrameStreamer:
                 map_x, map_y, cal_path,
                 self._standalone_proj_w, self._standalone_proj_h,
                 valid_mask=new_valid,
+                cam_w=calib.cam_w,
+                cam_h=calib.cam_h,
             )
 
             # Save ambient camera for AI depth estimation
@@ -923,6 +1063,475 @@ class FrameStreamer:
         self.clear_calibration_results()
         logger.info("Standalone calibration stopped (was_active=%s)", was_active)
         return {"ok": True}
+
+    # -- Checkerboard camera intrinsics calibration ----------------------------
+
+    def capture_checkerboard(
+        self, jpeg_bytes: bytes, cols: int = 9, rows: int = 6,
+    ) -> dict:
+        """Detect checkerboard corners in a JPEG frame and store if found.
+
+        Parameters
+        ----------
+        jpeg_bytes : bytes
+            JPEG-encoded webcam frame.
+        cols, rows : int
+            Inner corner counts of the checkerboard pattern.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "found": True, "captures": N}`` on success,
+            ``{"ok": True, "found": False}`` if no board detected.
+        """
+        # Decode JPEG → grayscale
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return {"ok": False, "error": "Could not decode image"}
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+
+        self._checkerboard_cols = cols
+        self._checkerboard_rows = rows
+
+        # Try multiple flag sets for robustness (from standalone app)
+        board_size = (cols, rows)
+        flag_sets = [
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FILTER_QUADS,
+            cv2.CALIB_CB_ADAPTIVE_THRESH,
+        ]
+        found = False
+        corners = None
+        for flags in flag_sets:
+            found, corners = cv2.findChessboardCorners(gray, board_size, flags)
+            if found and corners is not None:
+                break
+
+        if not found or corners is None:
+            return {"ok": True, "found": False, "captures": len(self._checkerboard_captures)}
+
+        # Sub-pixel refinement
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+        # Build object points (3D coordinates on the board plane, z=0)
+        obj_pts = np.zeros((cols * rows, 3), dtype=np.float32)
+        obj_pts[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+
+        self._checkerboard_captures.append((obj_pts, corners.reshape(-1, 2)))
+        self._checkerboard_img_size = (w, h)
+
+        n = len(self._checkerboard_captures)
+        logger.info(
+            "Checkerboard capture %d: %dx%d board detected in %dx%d image",
+            n, cols, rows, w, h,
+        )
+        return {"ok": True, "found": True, "captures": n}
+
+    def compute_camera_intrinsics(self) -> dict:
+        """Run cv2.calibrateCamera on captured checkerboard frames.
+
+        Requires at least 5 captures. Saves intrinsics to disk.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "focal_length": fx, "reprojection_error": err}``
+            or ``{"ok": False, "error": "..."}``
+        """
+        n = len(self._checkerboard_captures)
+        if n < 5:
+            return {"ok": False, "error": f"Need at least 5 captures (have {n})"}
+
+        if self._checkerboard_img_size is None:
+            return {"ok": False, "error": "No image size recorded"}
+
+        obj_pts_list = [c[0] for c in self._checkerboard_captures]
+        img_pts_list = [c[1].reshape(-1, 1, 2).astype(np.float32)
+                        for c in self._checkerboard_captures]
+        w, h = self._checkerboard_img_size
+
+        try:
+            ret, K_cam, dist_cam, rvecs, tvecs = cv2.calibrateCamera(
+                obj_pts_list, img_pts_list, (w, h), None, None,
+            )
+        except Exception as exc:
+            logger.warning("calibrateCamera failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": f"calibrateCamera failed: {exc}"}
+
+        from .calibration import save_camera_intrinsics
+
+        save_camera_intrinsics(K_cam, dist_cam, (w, h), ret)
+
+        fx = float(K_cam[0, 0])
+        fy = float(K_cam[1, 1])
+        logger.info(
+            "Camera intrinsics computed: fx=%.1f fy=%.1f, error=%.4f px, "
+            "%d captures",
+            fx, fy, ret, n,
+        )
+        return {
+            "ok": True,
+            "focal_length": fx,
+            "focal_length_y": fy,
+            "reprojection_error": float(ret),
+            "image_width": w,
+            "image_height": h,
+            "captures": n,
+        }
+
+    def get_camera_calibration_status(self) -> dict:
+        """Return current checkerboard calibration status."""
+        from .calibration import load_camera_intrinsics
+
+        intrinsics = load_camera_intrinsics()
+        status: dict = {
+            "captures": len(self._checkerboard_captures),
+            "cols": self._checkerboard_cols,
+            "rows": self._checkerboard_rows,
+            "has_intrinsics": intrinsics is not None,
+            "intrinsics": {
+                "fx": float(intrinsics["K_cam"][0, 0]),
+                "fy": float(intrinsics["K_cam"][1, 1]),
+                "error": intrinsics["reprojection_error"],
+                "image_size": list(intrinsics["image_size"]),
+                "timestamp": intrinsics["timestamp"],
+            } if intrinsics is not None else None,
+            "auto_active": self._cc_auto_active,
+            "auto_progress": (
+                self._cc_auto_idx / len(self._cc_auto_patterns)
+                if self._cc_auto_patterns else 0.0
+            ),
+            "auto_total": len(self._cc_auto_patterns),
+        }
+        return status
+
+    def reset_camera_calibration(self) -> dict:
+        """Clear checkerboard captures."""
+        self._checkerboard_captures = []
+        self._checkerboard_img_size = None
+        logger.info("Checkerboard captures cleared")
+        return {"ok": True}
+
+    # -- Auto camera calibration (projected checkerboards) ----------------------
+
+    def start_auto_camera_calibration(
+        self,
+        proj_w: int,
+        proj_h: int,
+        cols: int = 7,
+        rows: int = 5,
+    ) -> dict:
+        """Start automated camera intrinsics calibration using projected checkerboards.
+
+        Projects checkerboard patterns at different sizes and positions,
+        detects corners in webcam frames, then runs cv2.calibrateCamera.
+
+        Parameters
+        ----------
+        proj_w, proj_h : int
+            Projector resolution (must match the projector page window).
+        cols, rows : int
+            Inner corner counts for the checkerboard pattern.
+        """
+        if self._cc_auto_active:
+            return {"ok": False, "error": "Auto calibration already in progress"}
+        if self._calibration_active:
+            return {"ok": False, "error": "Gray code calibration in progress"}
+
+        # Generate pattern sequence
+        patterns = generate_checkerboard_sequence(cols, rows, proj_w, proj_h)
+        if not patterns:
+            return {
+                "ok": False,
+                "error": f"No patterns fit in {proj_w}x{proj_h} for {cols}x{rows} board",
+            }
+
+        # Pre-generate all pattern images
+        images = []
+        for p in patterns:
+            img = generate_projected_checkerboard(
+                cols, rows, p["square_size"],
+                p["offset_x"], p["offset_y"],
+                proj_w, proj_h,
+            )
+            images.append(img)
+
+        # Clear existing captures
+        self._checkerboard_captures = []
+        self._checkerboard_img_size = None
+        self._checkerboard_cols = cols
+        self._checkerboard_rows = rows
+
+        # Set state
+        self._cc_auto_active = True
+        self._cc_auto_patterns = patterns
+        self._cc_auto_images = images
+        self._cc_auto_idx = 0
+        self._cc_auto_cols = cols
+        self._cc_auto_rows = rows
+        self._cc_auto_proj_w = proj_w
+        self._cc_auto_proj_h = proj_h
+        self._calibration_active = True  # suppress normal frames
+
+        # Project first pattern and start settling
+        self.submit_calibration_frame(images[0])
+        self._cc_begin_settle()
+
+        total = len(patterns)
+        logger.info(
+            "Auto camera calibration started: %dx%d board, %dx%d proj, %d patterns",
+            cols, rows, proj_w, proj_h, total,
+        )
+        return {"ok": True, "total_patterns": total}
+
+    def step_auto_camera_calibration(self, jpeg_bytes: bytes) -> dict:
+        """Process one webcam frame for auto camera calibration.
+
+        Handles settle detection, corner finding, and pattern advancement.
+
+        Parameters
+        ----------
+        jpeg_bytes : bytes
+            JPEG-encoded webcam frame from browser getUserMedia.
+
+        Returns
+        -------
+        dict with phase, pattern_idx, total_patterns, pattern_label,
+        captures_so_far, last_found, progress, settling, done.
+        """
+        if not self._cc_auto_active:
+            return {"error": "No auto calibration in progress", "done": True}
+
+        idx = self._cc_auto_idx
+        total = len(self._cc_auto_patterns)
+
+        # Check if we've exhausted all patterns
+        if idx >= total:
+            return self._finish_auto_camera_calibration()
+
+        # Decode JPEG
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return {"error": "Could not decode JPEG frame", "done": False}
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+        pattern = self._cc_auto_patterns[idx]
+        last_found = False
+
+        # Phase 1: Settling — wait for image to stabilize after pattern change
+        if self._cc_settle_waiting:
+            settled = self._cc_check_settle(gray)
+            if not settled:
+                return {
+                    "phase": "settling",
+                    "pattern_idx": idx,
+                    "total_patterns": total,
+                    "pattern_label": pattern["label"],
+                    "captures_so_far": len(self._checkerboard_captures),
+                    "last_found": False,
+                    "progress": idx / total,
+                    "settling": True,
+                    "done": False,
+                }
+            # Settled — fall through to capture
+
+        # Phase 2: Capture — detect corners
+        h, w = gray.shape[:2]
+        board_size = (self._cc_auto_cols, self._cc_auto_rows)
+
+        flag_sets = [
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FILTER_QUADS,
+            cv2.CALIB_CB_ADAPTIVE_THRESH,
+        ]
+        found = False
+        corners = None
+        for flags in flag_sets:
+            found, corners = cv2.findChessboardCorners(gray, board_size, flags)
+            if found and corners is not None:
+                break
+
+        if found and corners is not None:
+            # Sub-pixel refinement
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+            # Object points (unit squares)
+            obj_pts = np.zeros((self._cc_auto_cols * self._cc_auto_rows, 3), dtype=np.float32)
+            obj_pts[:, :2] = np.mgrid[0:self._cc_auto_cols, 0:self._cc_auto_rows].T.reshape(-1, 2)
+
+            self._checkerboard_captures.append((obj_pts, corners.reshape(-1, 2)))
+            self._checkerboard_img_size = (w, h)
+            last_found = True
+            logger.info(
+                "Auto CC pattern %d/%d (%s): %d corners found, %d captures total",
+                idx + 1, total, pattern["label"],
+                len(corners), len(self._checkerboard_captures),
+            )
+        else:
+            logger.info(
+                "Auto CC pattern %d/%d (%s): no corners found, skipping",
+                idx + 1, total, pattern["label"],
+            )
+
+        # Advance to next pattern
+        self._cc_auto_idx = idx + 1
+        if self._cc_auto_idx < total:
+            # Project next pattern and begin settle
+            self.submit_calibration_frame(self._cc_auto_images[self._cc_auto_idx])
+            self._cc_begin_settle()
+        else:
+            # All patterns done
+            return self._finish_auto_camera_calibration()
+
+        return {
+            "phase": "capturing",
+            "pattern_idx": self._cc_auto_idx,
+            "total_patterns": total,
+            "pattern_label": self._cc_auto_patterns[min(self._cc_auto_idx, total - 1)]["label"],
+            "captures_so_far": len(self._checkerboard_captures),
+            "last_found": last_found,
+            "progress": self._cc_auto_idx / total,
+            "settling": False,
+            "done": False,
+        }
+
+    def _finish_auto_camera_calibration(self) -> dict:
+        """Finalize auto camera calibration: compute intrinsics if enough captures."""
+        n = len(self._checkerboard_captures)
+        total = len(self._cc_auto_patterns)
+
+        result: dict
+        if n < 5:
+            result = {
+                "phase": "done",
+                "done": True,
+                "ok": False,
+                "error": f"Only {n} boards detected (need 5+). Try better lighting or larger patterns.",
+                "captures_so_far": n,
+                "total_patterns": total,
+                "progress": 1.0,
+            }
+            logger.warning(
+                "Auto CC: only %d captures (need 5+), cannot compute intrinsics", n,
+            )
+        else:
+            # Reuse existing compute method
+            cal_result = self.compute_camera_intrinsics()
+            result = {
+                "phase": "done",
+                "done": True,
+                "captures_so_far": n,
+                "total_patterns": total,
+                "progress": 1.0,
+                **cal_result,
+            }
+            if cal_result.get("ok"):
+                logger.info(
+                    "Auto CC complete: %d captures, fx=%.1f, error=%.4f px",
+                    n, cal_result.get("focal_length", 0),
+                    cal_result.get("reprojection_error", 0),
+                )
+
+        # Cleanup
+        self._cc_auto_active = False
+        self._calibration_active = False
+        self._cc_auto_patterns = []
+        self._cc_auto_images = []
+        self._cc_settle_baseline = None
+        self._cc_settle_prev = None
+
+        # Show test card on projector
+        pw = self._cc_auto_proj_w or 1920
+        ph = self._cc_auto_proj_h or 1080
+        card = _load_testcard(pw, ph)
+        self.submit_calibration_frame(card)
+
+        return result
+
+    def stop_auto_camera_calibration(self) -> dict:
+        """Cancel an in-progress auto camera calibration."""
+        was_active = self._cc_auto_active
+        self._cc_auto_active = False
+        self._calibration_active = False
+        self._cc_auto_patterns = []
+        self._cc_auto_images = []
+        self._cc_settle_baseline = None
+        self._cc_settle_prev = None
+        logger.info("Auto camera calibration stopped (was_active=%s)", was_active)
+
+        # Show test card
+        pw = self._cc_auto_proj_w or 1920
+        ph = self._cc_auto_proj_h or 1080
+        card = _load_testcard(pw, ph)
+        self.submit_calibration_frame(card)
+
+        return {"ok": True}
+
+    def _cc_begin_settle(self) -> None:
+        """Reset settle state for a new pattern."""
+        self._cc_settle_waiting = True
+        self._cc_settle_baseline = None
+        self._cc_settle_prev = None
+        self._cc_settle_counter = 0
+        self._cc_settle_stable = 0
+        self._cc_settle_changed = False
+
+    def _cc_check_settle(self, gray: np.ndarray) -> bool:
+        """Check if the camera image has settled after a pattern change.
+
+        Uses the same change-detection approach as Gray code calibration:
+        wait for a significant change from baseline, then wait for stability.
+
+        Returns True when settled and ready to capture.
+        """
+        self._cc_settle_counter += 1
+        change_threshold = 5.0
+        stability_threshold = 3.0
+        timeout = 60
+
+        # Downsample for fast comparison
+        small = cv2.resize(gray, (160, 120), interpolation=cv2.INTER_AREA)
+
+        if self._cc_settle_baseline is None:
+            self._cc_settle_baseline = small.astype(np.float32)
+            self._cc_settle_prev = small.astype(np.float32)
+            return False
+
+        curr = small.astype(np.float32)
+
+        if not self._cc_settle_changed:
+            # Wait for change from baseline
+            diff_from_baseline = np.mean(np.abs(curr - self._cc_settle_baseline))
+            if diff_from_baseline > change_threshold:
+                self._cc_settle_changed = True
+                self._cc_settle_stable = 0
+            elif self._cc_settle_counter > timeout:
+                # Timeout — proceed anyway
+                return True
+            self._cc_settle_prev = curr
+            return False
+
+        # Changed detected — now wait for stability
+        diff_from_prev = np.mean(np.abs(curr - self._cc_settle_prev))
+        self._cc_settle_prev = curr
+
+        if diff_from_prev < stability_threshold:
+            self._cc_settle_stable += 1
+        else:
+            self._cc_settle_stable = 0
+
+        if self._cc_settle_stable >= 3:
+            return True
+
+        if self._cc_settle_counter > timeout:
+            return True
+
+        return False
 
     # -- Calibration export/import ---------------------------------------------
 
@@ -1044,6 +1653,8 @@ class FrameStreamer:
                     self_handler._handle_input_stream()
                 elif path == "/upload/status":
                     self_handler._handle_upload_status()
+                elif path == "/camera-calibration/status":
+                    self_handler._handle_camera_cal_status()
                 elif path == "/calibration/export":
                     self_handler._handle_calibration_export()
                 elif path == "/api/params":
@@ -1069,6 +1680,18 @@ class FrameStreamer:
                     self_handler._handle_calibrate_frame()
                 elif path == "/calibrate/stop":
                     self_handler._handle_calibrate_stop()
+                elif path == "/camera-calibration/capture":
+                    self_handler._handle_camera_cal_capture()
+                elif path == "/camera-calibration/compute":
+                    self_handler._handle_camera_cal_compute()
+                elif path == "/camera-calibration/reset":
+                    self_handler._handle_camera_cal_reset()
+                elif path == "/camera-calibration/auto/start":
+                    self_handler._handle_cc_auto_start()
+                elif path == "/camera-calibration/auto/frame":
+                    self_handler._handle_cc_auto_frame()
+                elif path == "/camera-calibration/auto/stop":
+                    self_handler._handle_cc_auto_stop()
                 elif path == "/api/params":
                     self_handler._handle_post_params()
                 elif path == "/scope/offer":
@@ -1542,6 +2165,155 @@ class FrameStreamer:
                     self_handler.wfile.write(body)
                 except Exception:
                     logger.warning("Calibration import failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_camera_cal_capture(self_handler) -> None:  # noqa: N805
+                """Capture a checkerboard frame for camera intrinsics."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    if length <= 0 or length > 10 * 1024 * 1024:
+                        self_handler.send_response(400)
+                        self_handler.end_headers()
+                        return
+                    jpeg_bytes = self_handler.rfile.read(length)
+                    # Parse cols/rows from query string
+                    qs = self_handler.path.split("?", 1)[1] if "?" in self_handler.path else ""
+                    params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+                    cols = int(params.get("cols", 9))
+                    rows = int(params.get("rows", 6))
+                    result = streamer.capture_checkerboard(jpeg_bytes, cols, rows)
+                    resp = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/capture failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_camera_cal_compute(self_handler) -> None:  # noqa: N805
+                """Compute camera intrinsics from captured checkerboards."""
+                try:
+                    # Read body if any (may be empty)
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    if length > 0:
+                        self_handler.rfile.read(length)
+                    result = streamer.compute_camera_intrinsics()
+                    resp = json.dumps(result).encode()
+                    status = 200 if result.get("ok") else 400
+                    self_handler.send_response(status)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/compute failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_camera_cal_status(self_handler) -> None:  # noqa: N805
+                """Return camera intrinsics calibration status."""
+                try:
+                    result = streamer.get_camera_calibration_status()
+                    resp = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/status failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_camera_cal_reset(self_handler) -> None:  # noqa: N805
+                """Reset checkerboard captures."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    if length > 0:
+                        self_handler.rfile.read(length)
+                    result = streamer.reset_camera_calibration()
+                    resp = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/reset failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_cc_auto_start(self_handler) -> None:  # noqa: N805
+                """Start auto camera calibration with projected checkerboards."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    body = self_handler.rfile.read(length) if length > 0 else b"{}"
+                    cfg = json.loads(body) if body else {}
+                    result = streamer.start_auto_camera_calibration(
+                        proj_w=int(cfg.get("proj_w", 1920)),
+                        proj_h=int(cfg.get("proj_h", 1080)),
+                        cols=int(cfg.get("cols", 7)),
+                        rows=int(cfg.get("rows", 5)),
+                    )
+                    resp = json.dumps(result).encode()
+                    status = 200 if result.get("ok") else 409
+                    self_handler.send_response(status)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/auto/start failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_cc_auto_frame(self_handler) -> None:  # noqa: N805
+                """Process one webcam frame for auto camera calibration."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    if length <= 0 or length > 10 * 1024 * 1024:
+                        self_handler.send_response(400)
+                        self_handler.end_headers()
+                        return
+                    jpeg_bytes = self_handler.rfile.read(length)
+                    result = streamer.step_auto_camera_calibration(jpeg_bytes)
+                    resp = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/auto/frame failed", exc_info=True)
+                    self_handler.send_response(500)
+                    self_handler.end_headers()
+
+            def _handle_cc_auto_stop(self_handler) -> None:  # noqa: N805
+                """Stop auto camera calibration."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    if length > 0:
+                        self_handler.rfile.read(length)
+                    result = streamer.stop_auto_camera_calibration()
+                    resp = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(resp)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(resp)
+                except Exception:
+                    logger.warning("camera-calibration/auto/stop failed", exc_info=True)
                     self_handler.send_response(500)
                     self_handler.end_headers()
 

@@ -178,6 +178,10 @@ class CalibrationState:
         self.proj_valid_mask: np.ndarray | None = None
         self.disparity_map: np.ndarray | None = None
 
+        # Camera resolution (set during decode)
+        self.cam_w: int | None = None
+        self.cam_h: int | None = None
+
         logger.info(
             "CalibrationState: %dx%d, %d patterns (%d bits_x, %d bits_y), "
             "settle=%d (timeout), capture=%d",
@@ -679,6 +683,10 @@ class CalibrationState:
         self.map_x = map_x
         self.map_y = map_y
 
+        # Store camera resolution for stereo triangulation
+        self.cam_w = w
+        self.cam_h = h
+
         # -- Compute disparity map (cam_x - proj_x) -------------------------
         # For each projector pixel, horizontal disparity = camera_x - projector_x
         px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
@@ -721,6 +729,8 @@ def save_calibration(
     proj_h: int,
     disparity_map: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
+    cam_w: int | None = None,
+    cam_h: int | None = None,
 ) -> None:
     """Save calibration mapping.
 
@@ -741,13 +751,17 @@ def save_calibration(
         arrays["valid_mask"] = valid_mask.astype(np.uint8)
     np.savez_compressed(npz_path, **arrays)
 
-    meta = {
+    meta: dict = {
         "version": 2,
         "projector_width": proj_w,
         "projector_height": proj_h,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "npz_file": npz_path.name,
     }
+    if cam_w is not None:
+        meta["camera_width"] = cam_w
+    if cam_h is not None:
+        meta["camera_height"] = cam_h
     p.write_text(json.dumps(meta))
     logger.info("Saved calibration: %s + %s", p.name, npz_path.name)
 
@@ -790,3 +804,96 @@ def load_calibration(
         data["projector_width"], data["projector_height"],
         timestamp, None,
     )
+
+
+def load_calibration_meta(path: str | Path) -> dict:
+    """Load calibration metadata from the JSON sidecar.
+
+    Returns all JSON fields including optional ``camera_width`` and
+    ``camera_height``.  Gracefully handles missing fields for older
+    calibration files.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        logger.warning("Could not read calibration metadata from %s", p)
+        return {}
+
+
+# -- Camera intrinsics I/O ---------------------------------------------------
+
+_INTRINSICS_PATH = Path.home() / ".projectionmapanything_intrinsics.json"
+
+
+def save_camera_intrinsics(
+    K_cam: np.ndarray,
+    dist_cam: np.ndarray,
+    image_size: tuple[int, int],
+    reprojection_error: float,
+    path: str | Path | None = None,
+) -> None:
+    """Save camera intrinsics to JSON.
+
+    Parameters
+    ----------
+    K_cam : np.ndarray
+        (3, 3) float64 camera matrix.
+    dist_cam : np.ndarray
+        (1, 5) or (5,) float64 distortion coefficients.
+    image_size : tuple[int, int]
+        (width, height) of the calibration images.
+    reprojection_error : float
+        Mean reprojection error in pixels from ``cv2.calibrateCamera``.
+    path : str | Path | None
+        Output path.  Defaults to ``_INTRINSICS_PATH``.
+    """
+    p = Path(path) if path is not None else _INTRINSICS_PATH
+    data = {
+        "version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_width": image_size[0],
+        "image_height": image_size[1],
+        "reprojection_error": float(reprojection_error),
+        "K_cam": K_cam.tolist(),
+        "dist_cam": dist_cam.flatten().tolist(),
+    }
+    p.write_text(json.dumps(data, indent=2))
+    logger.info(
+        "Saved camera intrinsics to %s (fx=%.1f, fy=%.1f, error=%.4f px)",
+        p.name, K_cam[0, 0], K_cam[1, 1], reprojection_error,
+    )
+
+
+def load_camera_intrinsics(
+    path: str | Path | None = None,
+) -> dict | None:
+    """Load camera intrinsics from JSON.
+
+    Returns
+    -------
+    dict | None
+        Dict with ``K_cam`` (3x3 ndarray), ``dist_cam`` (1x5 ndarray),
+        ``image_size`` (w, h), ``reprojection_error`` (float), and
+        ``timestamp``.  Returns ``None`` if the file doesn't exist or
+        can't be parsed.
+    """
+    p = Path(path) if path is not None else _INTRINSICS_PATH
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        K_cam = np.array(data["K_cam"], dtype=np.float64)
+        dist_cam = np.array(data["dist_cam"], dtype=np.float64).reshape(1, -1)
+        return {
+            "K_cam": K_cam,
+            "dist_cam": dist_cam,
+            "image_size": (data["image_width"], data["image_height"]),
+            "reprojection_error": float(data["reprojection_error"]),
+            "timestamp": data.get("timestamp", "unknown"),
+        }
+    except Exception:
+        logger.warning("Could not load camera intrinsics from %s", p)
+        return None
