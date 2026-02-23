@@ -4,16 +4,18 @@ Projects binary Gray code stripe patterns, captures them with a camera,
 and decodes the per-pixel correspondence to build a dense mapping from
 projector pixels to camera pixels (map_x, map_y) usable with ``cv2.remap``.
 
-The decode pipeline (RoomAlive-informed):
+The decode pipeline (ported from standalone app):
 1. Multi-frame averaged captures for noise rejection
-2. Per-bit comparison (pos > neg) with per-bit reliability threshold
-3. MSB-only validity gating (LSBs excluded from mask, per RoomAlive)
-4. Vectorized Gray-to-binary decode
-5. Explicit boundary validation (decoded values in projector range)
-6. Confidence-weighted accumulation into projector-space maps
-7. Light median filter (3x3) for noise
-8. Inpainting remaining holes
-9. Disparity map computed as cam_x - proj_x
+2. Per-bit comparison (pos > neg) with ALL-bit reliability gating
+3. Vectorized Gray-to-binary decode
+4. Morphological cleanup (close + open)
+5. Spatial consistency check (reject local outliers)
+6. Gaussian splat fill into projector-space maps
+7. Small-hole-only inpainting (< 0.5% area, connected components)
+8. Iterative outlier removal + monotonicity enforcement
+9. Simple horizontal disparity (cam_x - proj_x)
+
+Unmapped pixels use -1 sentinel (``cv2.remap`` produces 0 for out-of-range).
 """
 
 from __future__ import annotations
@@ -583,20 +585,19 @@ class CalibrationState:
     def _decode(self) -> None:
         """Decode captured Gray code patterns into a camera->projector mapping.
 
-        Pipeline (informed by OpenCV structured_light + RoomAlive):
-        1. Shadow mask from white-black reference (OpenCV blackThreshold)
-        2. Decode each bit: compare positive vs inverted pattern
-        3. Per-bit reliability threshold (OpenCV whiteThreshold)
-        4. Only top MSB bits gate validity (RoomAlive: LSBs too noisy)
-        5. Vectorized Gray-to-binary conversion
-        6. Explicit boundary validation (decoded values in projector range)
-        7. Confidence-weighted accumulation into projector-space maps
-        8. Light median filter (3x3) for noise
-        9. Inpaint remaining holes
-        10. Compute disparity map (cam_x - proj_x)
+        Pipeline (ported from standalone app's proven decode):
+        1. Shadow mask from white-black reference
+        2. Decode each bit with ALL-bit reliability gating
+        3. Vectorized Gray-to-binary conversion
+        4. Morphological cleanup (close + open)
+        5. Spatial consistency check (reject local outliers)
+        6. Gaussian splat fill into projector-space maps
+        7. Small-hole-only inpainting (connected components)
+        8. Iterative outlier removal + monotonicity enforcement
+        9. Simple horizontal disparity (cam_x - proj_x)
+        10. Diagnostic image saves
         """
         # Guard: white and black references are required for shadow mask.
-        # If either was skipped (settle timeout), calibration cannot proceed.
         if not self._captures[0] or not self._captures[1]:
             logger.error(
                 "Missing white/black reference captures (white=%d, black=%d). "
@@ -629,10 +630,6 @@ class CalibrationState:
         )
 
         # -- Shadow mask (OpenCV convention) ---------------------------------
-        # Pixels where white-black > shadow_threshold are illuminated by the
-        # projector. Everything else is in shadow or outside coverage.
-        # This is the critical first filter — without it, noise pixels
-        # decode to random projector coordinates and pollute the maps.
         shadow_mask = (white_f - black_f) > st
         n_shadow = int(np.count_nonzero(shadow_mask))
         logger.info(
@@ -655,13 +652,7 @@ class CalibrationState:
         # -- Decode X (column) Gray codes -----------------------------------
         base = 2  # skip white + black
         decoded_x = np.zeros((h, w), dtype=np.int32)
-        valid_x = shadow_mask.copy()  # start from shadow mask
-        conf_x = np.zeros((h, w), dtype=np.float32)
-
-        # Only the top 2 MSB bits gate validity — these are the coarsest
-        # stripes with the highest contrast. Finer bits are too noisy to
-        # use as a validity gate (especially through webcam/MJPEG compression).
-        msb_gate_count_x = min(2, self.bits_x)
+        valid_x = shadow_mask.copy()
 
         for capture_idx in range(self.bits_x):
             actual_bit = (self.bits_x - 1) - capture_idx  # MSB first
@@ -681,31 +672,22 @@ class CalibrationState:
             bit_val = (diff > 0).astype(np.int32)
             decoded_x |= bit_val << actual_bit
 
-            # Per-bit reliability (OpenCV whiteThreshold equivalent)
+            # ALL bits gate validity (standalone app method)
             abs_diff = np.abs(diff)
-            conf_x += abs_diff
-
-            # Only the top N MSB bits gate validity
-            if capture_idx < msb_gate_count_x:
-                bit_reliable = abs_diff > bt
-                valid_x &= bit_reliable
+            valid_x &= abs_diff > bt
 
             if capture_idx < 3 or capture_idx == self.bits_x - 1:
                 logger.info(
                     "  X bit %d (capture %d): diff mean=%.1f, "
-                    "reliable(>%.1f)=%.1f%%, gate=%s",
+                    "reliable(>%.1f)=%.1f%%",
                     actual_bit, capture_idx, abs_diff.mean(), bt,
                     100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
-                    "yes" if capture_idx < msb_gate_count_x else "no",
                 )
 
         # -- Decode Y (row) Gray codes --------------------------------------
         base_y = base + self.bits_x * 2
         decoded_y = np.zeros((h, w), dtype=np.int32)
-        valid_y = shadow_mask.copy()  # start from shadow mask
-        conf_y = np.zeros((h, w), dtype=np.float32)
-
-        msb_gate_count_y = min(2, self.bits_y)
+        valid_y = shadow_mask.copy()
 
         for capture_idx in range(self.bits_y):
             actual_bit = (self.bits_y - 1) - capture_idx  # MSB first
@@ -726,19 +708,14 @@ class CalibrationState:
             decoded_y |= bit_val << actual_bit
 
             abs_diff = np.abs(diff)
-            conf_y += abs_diff
-
-            if capture_idx < msb_gate_count_y:
-                bit_reliable = abs_diff > bt
-                valid_y &= bit_reliable
+            valid_y &= abs_diff > bt
 
             if capture_idx < 3 or capture_idx == self.bits_y - 1:
                 logger.info(
                     "  Y bit %d (capture %d): diff mean=%.1f, "
-                    "reliable(>%.1f)=%.1f%%, gate=%s",
+                    "reliable(>%.1f)=%.1f%%",
                     actual_bit, capture_idx, abs_diff.mean(), bt,
                     100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
-                    "yes" if capture_idx < msb_gate_count_y else "no",
                 )
 
         # -- Vectorized Gray-to-binary decode --------------------------------
@@ -756,7 +733,7 @@ class CalibrationState:
             shift >>= 1
         decoded_y = binary_y
 
-        # -- Combine shadow mask + per-bit reliability + bounds ---------------
+        # -- Combine validity + bounds ---------------------------------------
         valid_mask = (
             valid_x
             & valid_y
@@ -777,53 +754,139 @@ class CalibrationState:
             n_valid, h * w, 100.0 * n_valid / max(h * w, 1),
         )
 
-        # -- Weighted accumulation into projector-space maps -----------------
+        # -- Morphological cleanup (standalone app method) -------------------
+        # Close (fill small holes) then Open (remove specks) on validity mask
+        morph_k = 5
+        morph_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (morph_k, morph_k),
+        )
+        mask_u8 = valid_mask.astype(np.uint8) * 255
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, morph_kernel)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
+        valid_mask = mask_u8 > 127
+        n_after_morph = int(np.count_nonzero(valid_mask))
+        logger.info(
+            "  After morph cleanup: %d pixels (was %d)",
+            n_after_morph, n_valid,
+        )
+
+        # -- Spatial consistency check (standalone app method) ---------------
+        # Reject pixels where decoded coord differs too much from local mean
+        sc_ksize = 5
+        mask_f = valid_mask.astype(np.float32)
+        dx_f = decoded_x.astype(np.float32) * mask_f
+        dy_f = decoded_y.astype(np.float32) * mask_f
+        local_sum_x = cv2.blur(dx_f, (sc_ksize, sc_ksize))
+        local_sum_y = cv2.blur(dy_f, (sc_ksize, sc_ksize))
+        local_count = cv2.blur(mask_f, (sc_ksize, sc_ksize))
+        has_neighbors = local_count > 0.01
+        safe_count = np.where(has_neighbors, local_count, 1.0)
+        local_mean_x = np.where(
+            has_neighbors, local_sum_x / safe_count,
+            decoded_x.astype(np.float32),
+        )
+        local_mean_y = np.where(
+            has_neighbors, local_sum_y / safe_count,
+            decoded_y.astype(np.float32),
+        )
+        diff_x = np.abs(decoded_x.astype(np.float32) - local_mean_x)
+        diff_y = np.abs(decoded_y.astype(np.float32) - local_mean_y)
+        consistency_thresh = 3.0
+        consistent = (
+            (diff_x <= consistency_thresh) & (diff_y <= consistency_thresh)
+        )
+        valid_mask = valid_mask & consistent
+        n_after_consistency = int(np.count_nonzero(valid_mask))
+        logger.info(
+            "  After spatial consistency: %d pixels (was %d, removed %d)",
+            n_after_consistency, n_after_morph,
+            n_after_morph - n_after_consistency,
+        )
+
+        # -- Gaussian splat fill into projector-space maps -------------------
+        # Each valid camera pixel "splatters" its contribution across nearby
+        # projector pixels via Gaussian blur, filling gaps between sparse
+        # samples. This is the method that produces clean RGB warps in the
+        # standalone app.
         cam_ys, cam_xs = np.where(valid_mask)
         proj_xs = decoded_x[cam_ys, cam_xs].astype(np.int32)
         proj_ys = decoded_y[cam_ys, cam_xs].astype(np.int32)
-        weights = (conf_x[cam_ys, cam_xs] + conf_y[cam_ys, cam_xs]).astype(np.float32)
 
         sum_cx = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
         sum_cy = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-        sum_w = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
+        count = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
 
-        np.add.at(sum_cx, (proj_ys, proj_xs), cam_xs.astype(np.float32) * weights)
-        np.add.at(sum_cy, (proj_ys, proj_xs), cam_ys.astype(np.float32) * weights)
-        np.add.at(sum_w, (proj_ys, proj_xs), weights)
+        np.add.at(sum_cx, (proj_ys, proj_xs), cam_xs.astype(np.float32))
+        np.add.at(sum_cy, (proj_ys, proj_xs), cam_ys.astype(np.float32))
+        np.add.at(count, (proj_ys, proj_xs), 1.0)
 
-        valid_proj = sum_w > 0
-        map_x = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-        map_y = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-        map_x[valid_proj] = sum_cx[valid_proj] / sum_w[valid_proj]
-        map_y[valid_proj] = sum_cy[valid_proj] / sum_w[valid_proj]
+        sparse_valid = int(np.count_nonzero(count > 0))
+
+        # Gaussian splat: spread correspondences to fill gaps
+        fk = 11  # fill kernel size
+        sum_cx = cv2.GaussianBlur(sum_cx, (fk, fk), 0)
+        sum_cy = cv2.GaussianBlur(sum_cy, (fk, fk), 0)
+        count = cv2.GaussianBlur(count, (fk, fk), 0)
+
+        valid_proj = count > 0.01
+        map_x = np.full((self.proj_h, self.proj_w), -1.0, dtype=np.float32)
+        map_y = np.full((self.proj_h, self.proj_w), -1.0, dtype=np.float32)
+        map_x[valid_proj] = sum_cx[valid_proj] / count[valid_proj]
+        map_y[valid_proj] = sum_cy[valid_proj] / count[valid_proj]
 
         n_filled = int(np.count_nonzero(valid_proj))
         total_proj = self.proj_h * self.proj_w
         logger.info(
-            "  Projector pixels with data: %d/%d (%.1f%%)",
-            n_filled, total_proj, 100.0 * n_filled / max(total_proj, 1),
+            "  Projector pixels: %d sparse → %d after Gaussian fill "
+            "(%d/%d = %.1f%%)",
+            sparse_valid, n_filled, n_filled, total_proj,
+            100.0 * n_filled / max(total_proj, 1),
         )
 
-        # Store validity mask BEFORE smoothing/inpainting
+        # Store validity mask BEFORE inpainting/sanitization
         self.proj_valid_mask = valid_proj.copy()
 
-        # -- Light median filter (3x3) for noise ----------------------------
-        map_x_f = np.where(valid_proj, map_x, 0).astype(np.float32)
-        map_y_f = np.where(valid_proj, map_y, 0).astype(np.float32)
-        map_x_f = cv2.medianBlur(map_x_f, 3)
-        map_y_f = cv2.medianBlur(map_y_f, 3)
-        map_x[valid_proj] = map_x_f[valid_proj]
-        map_y[valid_proj] = map_y_f[valid_proj]
-
-        # -- Inpaint remaining holes ----------------------------------------
+        # -- Small-hole-only inpainting (standalone app method) --------------
+        # Only fill small internal holes (< 0.5% of image area). Large
+        # uncovered boundary regions are left as -1 to prevent fabricated
+        # coordinates that create fold-overs.
         hole_mask = (~valid_proj).astype(np.uint8) * 255
         if np.any(~valid_proj):
-            map_x = cv2.inpaint(map_x, hole_mask, 7, cv2.INPAINT_NS)
-            map_y = cv2.inpaint(map_y, hole_mask, 7, cv2.INPAINT_NS)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                hole_mask, connectivity=8,
+            )
+            max_small_area = max(int(self.proj_w * self.proj_h * 0.005), 100)
+            small_hole_mask = np.zeros_like(hole_mask)
+            n_small_holes = 0
+            for label_id in range(1, num_labels):
+                area = stats[label_id, cv2.CC_STAT_AREA]
+                if area < max_small_area:
+                    small_hole_mask[labels == label_id] = 255
+                    n_small_holes += 1
+            if np.any(small_hole_mask):
+                inpaint_r = max(fk, 5)
+                map_x = cv2.inpaint(
+                    map_x, small_hole_mask, inpaint_r, cv2.INPAINT_NS,
+                )
+                map_y = cv2.inpaint(
+                    map_y, small_hole_mask, inpaint_r, cv2.INPAINT_NS,
+                )
+                # Update valid mask for inpainted small holes
+                valid_proj = valid_proj | (small_hole_mask > 0)
+                logger.info(
+                    "  Inpainted %d small holes (max area=%d)",
+                    n_small_holes, max_small_area,
+                )
 
+        # -- Sanitize: iterative outlier removal + monotonicity --------------
+        map_x, map_y = _sanitize_correspondence_maps(map_x, map_y)
+        # Update valid mask after sanitization
+        self.proj_valid_mask = (map_x >= 0) & (map_y >= 0)
+        n_after_sanitize = int(np.count_nonzero(self.proj_valid_mask))
         logger.info(
-            "  Final projector coverage: %d/%d (%.1f%%)",
-            n_filled, total_proj, 100.0 * n_filled / max(total_proj, 1),
+            "  After sanitization: %d/%d projector pixels (%.1f%%)",
+            n_after_sanitize, total_proj,
+            100.0 * n_after_sanitize / max(total_proj, 1),
         )
 
         self.map_x = map_x
@@ -833,81 +896,215 @@ class CalibrationState:
         self.cam_w = w
         self.cam_h = h
 
-        # -- Compute disparity map (homography residual) ----------------------
-        # Raw (cam_x - proj_x) is dominated by the planar projection
-        # relationship and produces a smooth gradient even for flat scenes.
-        # Instead, fit a homography (perspective transform) to the
-        # projector→camera mapping and use the RESIDUAL displacement as
-        # depth — closer objects deviate more from the planar model.
+        # -- Quality validation ----------------------------------------------
+        final_valid = self.proj_valid_mask
+        mx_valid = map_x[final_valid]
+        my_valid = map_y[final_valid]
+        if mx_valid.size > 0:
+            logger.info(
+                "  map_x range: [%.1f, %.1f] (expected ~[0, %d]), "
+                "mean=%.1f, std=%.1f",
+                mx_valid.min(), mx_valid.max(), w,
+                mx_valid.mean(), mx_valid.std(),
+            )
+            logger.info(
+                "  map_y range: [%.1f, %.1f] (expected ~[0, %d]), "
+                "mean=%.1f, std=%.1f",
+                my_valid.min(), my_valid.max(), h,
+                my_valid.mean(), my_valid.std(),
+            )
+
+        # -- Simple horizontal disparity (cam_x - proj_x) -------------------
         px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
             self.proj_h, axis=0,
         )
-        py = np.arange(self.proj_h, dtype=np.float32)[:, None].repeat(
-            self.proj_w, axis=1,
-        )
-
-        src = np.column_stack([px[valid_proj], py[valid_proj]]).astype(np.float32)
-        dst = np.column_stack(
-            [map_x[valid_proj], map_y[valid_proj]],
-        ).astype(np.float32)
-
-        # Subsample for findHomography performance
-        rng = np.random.default_rng(42)
-        if len(src) > 10000:
-            idx = rng.choice(len(src), 10000, replace=False)
-            H, _ = cv2.findHomography(src[idx], dst[idx], cv2.RANSAC, 5.0)
-        elif len(src) > 4:
-            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-        else:
-            H = None
-
         disparity = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
+        disparity[final_valid] = map_x[final_valid] - px[final_valid]
+        disparity[~final_valid] = 0.0
 
-        if H is not None:
-            # Apply homography to all projector pixels → predicted camera coords
-            pts = np.column_stack(
-                [px.ravel(), py.ravel()],
-            ).astype(np.float32).reshape(-1, 1, 2)
-            pred = cv2.perspectiveTransform(pts, H).reshape(
-                self.proj_h, self.proj_w, 2,
-            )
-            # Residual = actual - predicted correspondence
-            res_x = map_x - pred[:, :, 0]
-            res_y = map_y - pred[:, :, 1]
-            disp = np.sqrt(res_x ** 2 + res_y ** 2)
-            disp[~valid_proj] = 0.0
-            disparity = disp
-            logger.info("  Disparity: homography residual method (H found)")
-        else:
-            # Fallback: simple horizontal disparity
-            disparity[valid_proj] = map_x[valid_proj] - px[valid_proj]
-            logger.warning("  Disparity: homography fit failed — raw cam_x - proj_x")
-
-        # Normalize to [0, 1] (near=bright, far=dark)
-        valid_vals = disparity[valid_proj]
+        # Normalize valid values to [0, 1]
+        valid_vals = disparity[final_valid]
         if valid_vals.size > 0:
             p2 = float(np.percentile(valid_vals, 2))
             p98 = float(np.percentile(valid_vals, 98))
-            if p98 - p2 > 1e-6:
-                disparity = (disparity - p2) / (p98 - p2)
+            spread = p98 - p2
+            if spread > 1e-6:
+                disparity = np.where(
+                    final_valid, (disparity - p2) / spread, 0.0,
+                )
             else:
-                disparity = np.full_like(disparity, 0.5)
+                disparity = np.where(final_valid, 0.5, 0.0)
+                logger.warning(
+                    "  Disparity has near-zero spread (%.6f) — scene may "
+                    "be too flat or calibration may have failed",
+                    spread,
+                )
             logger.info(
-                "  Disparity normalize: p2=%.4f p98=%.4f spread=%.4f",
-                p2, p98, p98 - p2,
+                "  Disparity: p2=%.4f p98=%.4f spread=%.4f",
+                p2, p98, spread,
             )
         disparity = np.clip(disparity, 0.0, 1.0).astype(np.float32)
 
-        # Inpaint holes in disparity too
-        if np.any(~valid_proj):
-            disp_hole = (~valid_proj).astype(np.uint8) * 255
-            disparity = cv2.inpaint(disparity, disp_hole, 7, cv2.INPAINT_NS)
-
         self.disparity_map = disparity
         logger.info(
-            "  Disparity map computed: range [%.3f, %.3f]",
-            disparity.min(), disparity.max(),
+            "  Disparity map: range [%.3f, %.3f], mean=%.3f",
+            disparity.min(), disparity.max(), disparity.mean(),
         )
+
+        # -- Save diagnostic images ------------------------------------------
+        self._save_decode_diagnostics(map_x, map_y, disparity, final_valid)
+
+    def _save_decode_diagnostics(
+        self,
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        disparity: np.ndarray,
+        valid: np.ndarray,
+    ) -> None:
+        """Save diagnostic images to ~/.projectionmapanything_results/."""
+        results_dir = Path.home() / ".projectionmapanything_results"
+        results_dir.mkdir(exist_ok=True)
+
+        try:
+            # Coverage map (green = valid, black = hole)
+            coverage = np.zeros(
+                (self.proj_h, self.proj_w, 3), dtype=np.uint8,
+            )
+            coverage[valid] = [0, 200, 100]
+            cv2.imwrite(
+                str(results_dir / "decode_coverage.png"),
+                cv2.cvtColor(coverage, cv2.COLOR_RGB2BGR),
+            )
+
+            # Normalized map_x (valid pixels only)
+            if np.any(valid):
+                mx_vis = np.zeros_like(map_x)
+                mx_vals = map_x[valid]
+                mn, mx = mx_vals.min(), mx_vals.max()
+                if mx - mn > 1e-6:
+                    mx_vis[valid] = (map_x[valid] - mn) / (mx - mn)
+                mx_u8 = (mx_vis * 255).clip(0, 255).astype(np.uint8)
+                cv2.imwrite(str(results_dir / "decode_map_x.png"), mx_u8)
+
+                # Normalized map_y
+                my_vis = np.zeros_like(map_y)
+                my_vals = map_y[valid]
+                mn, mx = my_vals.min(), my_vals.max()
+                if mx - mn > 1e-6:
+                    my_vis[valid] = (map_y[valid] - mn) / (mx - mn)
+                my_u8 = (my_vis * 255).clip(0, 255).astype(np.uint8)
+                cv2.imwrite(str(results_dir / "decode_map_y.png"), my_u8)
+
+            # Disparity visualization
+            disp_u8 = (disparity * 255).clip(0, 255).astype(np.uint8)
+            cv2.imwrite(str(results_dir / "decode_disparity.png"), disp_u8)
+
+            logger.info("  Diagnostic images saved to %s", results_dir)
+        except Exception:
+            logger.warning(
+                "  Could not save diagnostic images", exc_info=True,
+            )
+
+
+# -- Map sanitization (ported from standalone app) ---------------------------
+
+
+def _sanitize_correspondence_maps(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    max_deviation: float = 20.0,
+    iterations: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove fold-overs from correspondence maps via iterative outlier removal.
+
+    Uses weighted local smoothing to estimate what the map *should* look
+    like, then removes pixels that deviate significantly.  Each iteration
+    refines the estimate as outliers are excluded from the smooth.
+
+    Finally enforces per-row/per-column monotonicity to catch gradual
+    reversals that the smooth missed.
+
+    Preserves the original per-pixel accuracy in valid regions.
+    """
+    h, w = map_x.shape
+    valid = (map_x >= 0) & (map_y >= 0)
+    had_valid = valid.copy()
+
+    if not np.any(valid):
+        return map_x, map_y
+
+    ksize = 101
+
+    map_x = map_x.copy().astype(np.float64)
+    map_y = map_y.copy().astype(np.float64)
+
+    for it in range(iterations):
+        # Weighted Gaussian smooth: only valid pixels contribute
+        mask_f = valid.astype(np.float64)
+        wx = np.where(valid, map_x, 0.0) * mask_f
+        wy = np.where(valid, map_y, 0.0) * mask_f
+
+        smooth_wx = cv2.GaussianBlur(wx, (ksize, ksize), 0)
+        smooth_wy = cv2.GaussianBlur(wy, (ksize, ksize), 0)
+        smooth_count = cv2.GaussianBlur(mask_f, (ksize, ksize), 0)
+
+        has_data = smooth_count > 0.01
+        safe_count = np.where(has_data, smooth_count, 1.0)
+        pred_x = smooth_wx / safe_count
+        pred_y = smooth_wy / safe_count
+
+        diff = np.sqrt((map_x - pred_x) ** 2 + (map_y - pred_y) ** 2)
+        newly_bad = (diff > max_deviation) & valid
+
+        n_removed = int(newly_bad.sum())
+        if n_removed == 0:
+            break
+
+        valid = valid & ~newly_bad
+        logger.debug(
+            "  Sanitize iter %d: removed %d outliers", it, n_removed,
+        )
+
+    # Enforce per-row / per-column monotonicity
+    noise_tol = 3.0
+    for y in range(h):
+        idx = np.where(valid[y])[0]
+        if len(idx) < 2:
+            continue
+        vals = map_x[y, idx]
+        cummax = np.maximum.accumulate(vals)
+        back = (cummax - vals) > noise_tol
+        for i in np.where(back)[0]:
+            valid[y, idx[i]] = False
+
+    for x in range(w):
+        idx = np.where(valid[:, x])[0]
+        if len(idx) < 2:
+            continue
+        vals = map_y[idx, x]
+        cummax = np.maximum.accumulate(vals)
+        back = (cummax - vals) > noise_tol
+        for i in np.where(back)[0]:
+            valid[idx[i], x] = False
+
+    total_removed = int((had_valid & ~valid).sum())
+    if total_removed > 0:
+        # Small dilation to clean ragged edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        inv_u8 = (~valid & had_valid).astype(np.uint8) * 255
+        inv_u8 = cv2.dilate(inv_u8, kernel, iterations=1)
+        valid = valid & ~(inv_u8 > 0)
+
+        map_x[~valid] = -1.0
+        map_y[~valid] = -1.0
+
+        kept = int(np.count_nonzero(map_x >= 0))
+        logger.info(
+            "  Sanitize: removed %d bad pixels, kept %d/%d (%.1f%%)",
+            total_removed, kept, h * w, 100.0 * kept / max(h * w, 1),
+        )
+
+    return map_x.astype(np.float32), map_y.astype(np.float32)
 
 
 # -- Calibration file I/O ----------------------------------------------------

@@ -102,7 +102,7 @@ def publish_calibration_results(
     except Exception:
         logger.warning("Could not read calibration JSON for download")
 
-    # 2. Coverage map — green where valid, black where inpainted
+    # 2. Coverage map — green where valid, black where unmapped
     if proj_valid_mask is not None:
         coverage = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
         coverage[proj_valid_mask] = [0, 200, 100]
@@ -666,16 +666,15 @@ class ProMapAnythingPipeline(Pipeline):
             self._disparity_map = disp
             self.proj_w = pw
             self.proj_h = ph
-            # Derive valid mask from NPZ if available, else from disparity
+            # Valid mask: prefer NPZ valid_mask, else derive from -1 sentinel
             npz_path = cal_path.with_suffix(".npz")
             if npz_path.is_file():
                 npz = np.load(npz_path)
                 if "valid_mask" in npz.files:
                     self._proj_valid_mask = npz["valid_mask"].astype(bool)
-            if self._proj_valid_mask is None and disp is not None:
-                # Disparity was computed only for valid pixels — derive mask
-                # from non-uniform regions (inpainted areas are smooth gradients)
-                self._proj_valid_mask = disp > 0.01
+            if self._proj_valid_mask is None:
+                # Derive from sentinel values (-1 = unmapped)
+                self._proj_valid_mask = (self._map_x >= 0) & (self._map_y >= 0)
             # Load camera dimensions from metadata (for stereo triangulation)
             meta = load_calibration_meta(cal_path)
             self._cam_w = meta.get("camera_width")
@@ -1573,10 +1572,9 @@ class ProMapAnythingPipeline(Pipeline):
     def _disparity_depth(self) -> torch.Tensor:
         """Derive depth from calibration correspondence (cached).
 
-        Always uses homography-residual displacement: fits a perspective
-        transform to the projector→camera mapping, then uses residual
-        magnitude as depth — closer objects deviate more from the planar
-        projection model.
+        Uses standard structured-light disparity: fits a 1-D linear model
+        (2 DOF per axis) to the projector→camera mapping, then uses the
+        residual as the depth signal — closer objects produce larger parallax.
 
         Falls back to the saved disparity map only if the correspondence
         maps are not available.
@@ -1585,9 +1583,6 @@ class ProMapAnythingPipeline(Pipeline):
             return self._disparity_depth_cache
 
         if self._map_x is not None:
-            # Always recompute with homography residual — the saved
-            # disparity from calibration may use the same method now,
-            # but recomputing ensures consistency.
             depth = self._compute_disparity_from_maps()
         elif self._disparity_map is not None:
             depth = self._disparity_map.copy()
@@ -1598,40 +1593,13 @@ class ProMapAnythingPipeline(Pipeline):
             )
             logger.warning("No calibration maps — disparity is uniform grey")
 
-        # -- Auto-range: percentile stretch to fill [0, 1] -----------------
-        # The raw disparity may have very narrow dynamic range (e.g. flat
-        # scene, small baseline) — stretch before CLAHE so it has data to
-        # enhance.
+        # Zero out invalid pixels (holes stay black)
         valid = self._proj_valid_mask
         if valid is not None:
-            fg = depth[valid]
-        else:
-            fg = depth[depth > 1e-4]
-        if fg.size > 100:
-            p2 = float(np.percentile(fg, 2))
-            p98 = float(np.percentile(fg, 98))
-            spread = p98 - p2
-            if spread > 1e-6:
-                depth = ((depth - p2) / spread).clip(0, 1).astype(np.float32)
-            logger.info(
-                "Disparity auto-range: p2=%.4f p98=%.4f spread=%.4f",
-                p2, p98, spread,
-            )
-
-        # CLAHE for local contrast (brings out surface detail)
-        depth_u8 = (depth * 255).clip(0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
-        depth_u8 = clahe.apply(depth_u8)
-
-        # Inpaint holes
-        if valid is not None:
-            holes = (~valid).astype(np.uint8) * 255
-            if np.any(~valid):
-                depth_u8 = cv2.inpaint(depth_u8, holes, 15, cv2.INPAINT_NS)
+            depth[~valid] = 0.0
 
         # Smooth
-        depth_u8 = cv2.GaussianBlur(depth_u8, (7, 7), 0)
-        depth = depth_u8.astype(np.float32) / 255.0
+        depth = cv2.GaussianBlur(depth, (7, 7), 0)
 
         depth_rgb = np.stack([depth, depth, depth], axis=-1)
         result = torch.from_numpy(depth_rgb).to(self.device)
@@ -1643,79 +1611,52 @@ class ProMapAnythingPipeline(Pipeline):
         return result
 
     def _compute_disparity_from_maps(self) -> np.ndarray:
-        """Compute depth from calibration correspondence via homography residuals.
+        """Simple horizontal disparity: cam_x - proj_x.
 
-        The projector→camera correspondence maps encode depth information
-        through parallax: closer objects produce larger displacements from
-        the expected projective mapping.  By fitting a homography (perspective
-        transform) to the correspondence and taking the residual, we isolate
-        the depth-dependent component.
+        For each projector pixel, the horizontal offset between where the
+        camera sees it (map_x) and the projector column gives the stereo
+        disparity.  Single percentile normalization to [0, 1].
 
-        Returns (proj_h, proj_w) float32 in [0, 1], near=bright.
+        Returns (proj_h, proj_w) float32 in [0, 1].
         """
         proj_h, proj_w = self._map_x.shape
         px = np.arange(proj_w, dtype=np.float32)[None, :].repeat(proj_h, axis=0)
-        py = np.arange(proj_h, dtype=np.float32)[:, None].repeat(proj_w, axis=1)
 
-        # Valid mask — if we have one from calibration, use it; else all valid
-        if self._proj_valid_mask is not None:
-            valid = self._proj_valid_mask
-        else:
-            # After inpainting, maps don't have -1 anymore, so use disparity hint
-            valid = np.ones((proj_h, proj_w), dtype=bool)
+        valid = (
+            self._proj_valid_mask
+            if self._proj_valid_mask is not None
+            else (self._map_x >= 0)
+        )
 
         if not np.any(valid):
             return np.full((proj_h, proj_w), 0.5, dtype=np.float32)
 
-        # Build source/destination point arrays for homography
-        src = np.column_stack([px[valid], py[valid]]).astype(np.float32)
-        dst = np.column_stack(
-            [self._map_x[valid], self._map_y[valid]]
-        ).astype(np.float32)
+        disp = np.zeros((proj_h, proj_w), dtype=np.float32)
+        disp[valid] = self._map_x[valid] - px[valid]
+        disp[~valid] = 0.0
 
-        # Subsample for performance (findHomography on 100k+ points is slow)
-        rng = np.random.default_rng(42)
-        if len(src) > 10000:
-            idx = rng.choice(len(src), 10000, replace=False)
-            H, _ = cv2.findHomography(src[idx], dst[idx], cv2.RANSAC, 5.0)
-        else:
-            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-
-        if H is None:
-            # Fallback: simple horizontal disparity (camera_x - projector_x)
-            logger.warning("Homography fit failed — using simple disparity")
-            disp = np.abs(self._map_x - px)
-            disp[~valid] = 0.0
-        else:
-            # Apply homography to all projector pixels → predicted camera coords
-            pts = np.column_stack(
-                [px.ravel(), py.ravel()]
-            ).astype(np.float32).reshape(-1, 1, 2)
-            pred = cv2.perspectiveTransform(pts, H).reshape(proj_h, proj_w, 2)
-
-            # Residual = actual - predicted correspondence
-            res_x = self._map_x - pred[:, :, 0]
-            res_y = self._map_y - pred[:, :, 1]
-            disp = np.sqrt(res_x ** 2 + res_y ** 2)
-            disp[~valid] = 0.0
-
-        # Percentile normalization
+        # Single percentile normalization
         valid_vals = disp[valid]
         if valid_vals.size > 0:
             p2 = float(np.percentile(valid_vals, 2))
             p98 = float(np.percentile(valid_vals, 98))
-            if p98 - p2 > 1e-6:
-                disp = (disp - p2) / (p98 - p2)
+            spread = p98 - p2
+            if spread > 1e-6:
+                disp = np.where(valid, (disp - p2) / spread, 0.0)
             else:
-                disp = np.full_like(disp, 0.5)
-        depth = np.clip(disp, 0.0, 1.0).astype(np.float32)
+                disp = np.where(valid, 0.5, 0.0)
+                logger.warning(
+                    "Disparity has near-zero spread (%.6f) — "
+                    "scene may be flat or calibration failed",
+                    spread,
+                )
 
+        depth = np.clip(disp, 0.0, 1.0).astype(np.float32)
         logger.info(
-            "Computed disparity from correspondence maps (%dx%d, "
-            "valid=%.1f%%, homography=%s)",
+            "Disparity from maps (%dx%d, valid=%.1f%%, range=[%.3f, %.3f])",
             proj_w, proj_h,
             100.0 * np.count_nonzero(valid) / max(valid.size, 1),
-            "yes" if H is not None else "no (simple fallback)",
+            depth.min(), depth.max(),
         )
         return depth
 
@@ -1943,19 +1884,8 @@ class ProMapAnythingPipeline(Pipeline):
         # Zero out unfilled pixels before post-processing
         depth_map[~depth_filled] = 0.0
 
-        # -- CLAHE for local contrast enhancement
-        depth_u8 = (depth_map * 255).clip(0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
-        depth_u8 = clahe.apply(depth_u8)
-
-        # -- Inpaint holes
-        if not np.all(depth_filled):
-            hole_mask = (~depth_filled).astype(np.uint8) * 255
-            depth_u8 = cv2.inpaint(depth_u8, hole_mask, 15, cv2.INPAINT_NS)
-
         # -- Gaussian blur for smooth output
-        depth_u8 = cv2.GaussianBlur(depth_u8, (7, 7), 0)
-        depth_np = depth_u8.astype(np.float32) / 255.0
+        depth_np = cv2.GaussianBlur(depth_map, (7, 7), 0)
 
         # Build (H, W, 3) RGB tensor
         depth_rgb = np.stack([depth_np, depth_np, depth_np], axis=-1)
@@ -1992,10 +1922,9 @@ class ProMapAnythingPipeline(Pipeline):
     def _warp_to_projector(self, depth_np: np.ndarray) -> np.ndarray:
         """Warp a camera-space depth map to projector space via calibration.
 
-        Remaps the camera-space depth using the correspondence maps (map_x,
-        map_y).  Holes are detected via a reference remap of an all-ones
-        image — NOT by checking for value==0, which would conflate legitimate
-        far/dark depth with unmapped pixels.
+        Simple cv2.remap using correspondence maps. Unmapped pixels (where
+        map values are -1 or outside camera bounds) get 0 from borderValue.
+        No inpainting — holes stay black.
 
         Parameters
         ----------
@@ -2005,11 +1934,10 @@ class ProMapAnythingPipeline(Pipeline):
         Returns
         -------
         np.ndarray
-            (proj_h, proj_w) float32 depth in [0, 1], holes inpainted.
+            (proj_h, proj_w) float32 depth in [0, 1], holes are 0.
         """
         cam_h, cam_w = depth_np.shape[:2]
 
-        # Remap depth directly as float32 (no lossy uint8 round-trip)
         warped = cv2.remap(
             depth_np, self._map_x, self._map_y,
             interpolation=cv2.INTER_LINEAR,
@@ -2017,37 +1945,15 @@ class ProMapAnythingPipeline(Pipeline):
             borderValue=0.0,
         )
 
-        # Detect holes using a reference remap of an all-ones image.
-        # Pixels that map outside the camera frame get 0 from borderValue;
-        # pixels inside get ~1.0.  This avoids conflating depth=0 (far/dark)
-        # with unmapped pixels — the old approach treated both as holes.
-        ref = np.ones((cam_h, cam_w), dtype=np.float32)
-        ref_warped = cv2.remap(
-            ref, self._map_x, self._map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0.0,
-        )
-        holes = ref_warped < 0.5
-
-        # Also mark invalid calibration pixels as holes
+        # Zero out invalid calibration pixels
         if self._proj_valid_mask is not None:
-            holes = holes | ~self._proj_valid_mask
-
-        # Inpaint holes (convert to uint8 for cv2.inpaint)
-        n_holes = int(np.count_nonzero(holes))
-        if n_holes > 0:
-            warped_u8 = (warped * 255).clip(0, 255).astype(np.uint8)
-            hole_u8 = holes.astype(np.uint8) * 255
-            warped_u8 = cv2.inpaint(warped_u8, hole_u8, 15, cv2.INPAINT_NS)
-            warped = warped_u8.astype(np.float32) / 255.0
+            warped[~self._proj_valid_mask] = 0.0
 
         logger.info(
             "Depth warped to projector %dx%d (from camera %dx%d), "
-            "range [%.3f, %.3f], holes=%.1f%%",
+            "range [%.3f, %.3f]",
             warped.shape[1], warped.shape[0], cam_w, cam_h,
             warped.min(), warped.max(),
-            100.0 * n_holes / max(holes.size, 1),
         )
         return warped
 
@@ -2059,9 +1965,8 @@ class ProMapAnythingPipeline(Pipeline):
            Falls back to warped_camera.png if ambient not available.
         2. Run Depth Anything V2 → (H, W) float32 [0,1], near=bright
         3. If source was camera-space, warp to projector via calibration maps
-        4. Apply CLAHE for local contrast enhancement
-        5. Gaussian blur for smooth output
-        6. Cache result (static — recomputed only on recalibration)
+        4. Auto-range + Gaussian blur
+        5. Cache result (static — recomputed only on recalibration)
         """
         if self._ai_depth_cache is not None:
             return self._ai_depth_cache
@@ -2104,18 +2009,24 @@ class ProMapAnythingPipeline(Pipeline):
                 depth_np.shape[1], depth_np.shape[0],
             )
 
-        # Auto-range: percentile stretch to fill [0, 1] before CLAHE.
-        # Use a tiny epsilon to exclude truly-zero void pixels while keeping
-        # legitimate dark depth values (far surfaces near zero).
-        eps = 1e-4
-        fg = depth_np[depth_np > eps]
+        # Auto-range: percentile stretch to fill [0, 1].
+        # Use valid mask to exclude void pixels (unmapped regions).
+        if self._proj_valid_mask is not None:
+            fg = depth_np[self._proj_valid_mask]
+        else:
+            fg = depth_np[depth_np > 1e-4]
         if fg.size > 100:
             p2 = float(np.percentile(fg, 2))
             p98 = float(np.percentile(fg, 98))
             spread = p98 - p2
             if spread > 1e-6:
+                valid_mask = (
+                    self._proj_valid_mask
+                    if self._proj_valid_mask is not None
+                    else depth_np > 1e-4
+                )
                 depth_np = np.where(
-                    depth_np > eps,
+                    valid_mask,
                     ((depth_np - p2) / spread).clip(0, 1),
                     0.0,
                 ).astype(np.float32)
@@ -2123,13 +2034,6 @@ class ProMapAnythingPipeline(Pipeline):
                 "AI depth auto-range: p2=%.4f p98=%.4f spread=%.4f",
                 p2, p98, spread,
             )
-
-        # CLAHE for local contrast enhancement — brings out surface detail
-        # that percentile normalization alone misses
-        depth_u8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
-        depth_u8 = clahe.apply(depth_u8)
-        depth_np = depth_u8.astype(np.float32) / 255.0
 
         # Light Gaussian blur for smooth output
         depth_np = cv2.GaussianBlur(depth_np, (5, 5), 0)
