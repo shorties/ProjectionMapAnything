@@ -32,6 +32,7 @@ import io
 import json
 import logging
 import threading
+import time as _time
 import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -46,6 +47,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 _BOUNDARY = b"promapframe"
+_OVERLAY_TIMEOUT_SEC = 300.0  # 5 minutes auto-expire for overlay mode
 _PROJECTOR_CONFIG_PATH = Path.home() / ".projectionmapanything_projector.json"
 _CALIBRATION_JSON_PATH = Path.home() / ".projectionmapanything_calibration.json"
 _CALIBRATION_NPZ_PATH = Path.home() / ".projectionmapanything_calibration.npz"
@@ -545,6 +547,54 @@ function postConfig() {
 }
 postConfig();
 setInterval(postConfig, 30000);
+
+// ---- MJPEG stall detection via /status polling ----
+// If frame_age > 5s and WebRTC isn't active, reconnect the MJPEG stream.
+setInterval(() => {
+  fetch('/status').then(r => r.json()).then(s => {
+    if (s.frame_age_sec > 5 && !webrtcHasVideo) {
+      mjpegEl.src = '/stream?t=' + Date.now();
+    }
+  }).catch(() => {});
+}, 5000);
+
+// ---- WebRTC video freeze detection ----
+// If WebRTC video hasn't produced a new frame in 10s, fall back to MJPEG.
+let lastRtcFrameTime = 0;
+function checkRtcFreeze() {
+  if (!webrtcHasVideo) return;
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    // Use requestVideoFrameCallback for accurate freeze detection
+    webrtcEl.requestVideoFrameCallback(function onFrame(now) {
+      lastRtcFrameTime = now;
+      if (webrtcHasVideo) {
+        webrtcEl.requestVideoFrameCallback(onFrame);
+      }
+    });
+  }
+}
+// Start monitoring once WebRTC gets video
+const origUpdateLayers = updateLayers;
+updateLayers = function() {
+  origUpdateLayers();
+  if (webrtcHasVideo && lastRtcFrameTime === 0) {
+    lastRtcFrameTime = performance.now();
+    checkRtcFreeze();
+  }
+};
+setInterval(() => {
+  if (webrtcHasVideo && lastRtcFrameTime > 0) {
+    const elapsed = performance.now() - lastRtcFrameTime;
+    if (elapsed > 10000) {
+      // WebRTC frozen for >10s — fall back to MJPEG
+      webrtcHasVideo = false;
+      lastRtcFrameTime = 0;
+      updateLayers();
+      setRtcStatus('failed', 'WebRTC frozen — using MJPEG');
+      scheduleRTCRetry(5000);
+    }
+  }
+}, 3000);
 </script>
 </body></html>
 """
@@ -687,8 +737,12 @@ class FrameStreamer:
 
         # Overlay mode: project a static image (coverage map, etc.)
         # When True, submit_frame() is suppressed (like calibration_active).
-        # Only cleared by POST /api/project-overlay {image: "off"}.
+        # Only cleared by POST /api/project-overlay {image: "off"} or auto-timeout.
         self._overlay_active = False
+        self._overlay_start_time: float = 0.0  # monotonic time when overlay was activated
+
+        # Frame freshness tracking (monotonic)
+        self._last_frame_time: float = 0.0
 
         # Calibration results for download
         self._calibration_files: dict[str, bytes] = {}
@@ -1343,6 +1397,8 @@ class FrameStreamer:
                     self_handler._handle_calibration_export()
                 elif path == "/calibrate/intrinsics/status":
                     self_handler._handle_intrinsics_status()
+                elif path == "/status":
+                    self_handler._handle_status()
                 elif path == "/api/params":
                     self_handler._handle_get_params()
                 elif path == "/scope/ice-servers":
@@ -1462,15 +1518,53 @@ class FrameStreamer:
                 with streamer._lock:
                     jpeg = streamer._frame_jpeg
                 if jpeg is not None:
+                    age = (
+                        _time.monotonic() - streamer._last_frame_time
+                        if streamer._last_frame_time > 0 else -1.0
+                    )
                     self_handler.send_response(200)
                     self_handler.send_header("Content-Type", "image/jpeg")
                     self_handler.send_header("Content-Length", str(len(jpeg)))
                     self_handler.send_header("Cache-Control", "no-cache")
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.send_header("Access-Control-Expose-Headers", "X-Frame-Age")
+                    self_handler.send_header("X-Frame-Age", f"{age:.1f}")
                     self_handler.end_headers()
                     self_handler.wfile.write(jpeg)
                 else:
                     self_handler.send_response(204)
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
                     self_handler.end_headers()
+
+            def _handle_status(self_handler) -> None:  # noqa: N805
+                """Debug status endpoint — JSON with all stream state."""
+                now = _time.monotonic()
+                age = now - streamer._last_frame_time if streamer._last_frame_time > 0 else -1.0
+                # Determine why frames might be suppressed
+                reason = None
+                if not streamer._running:
+                    reason = "server_stopped"
+                elif streamer._calibration_active:
+                    reason = "calibration_active"
+                elif streamer._overlay_active:
+                    reason = "overlay_active"
+                status = {
+                    "running": streamer._running,
+                    "calibration_active": streamer._calibration_active,
+                    "overlay_active": streamer._overlay_active,
+                    "stream_clients": streamer._stream_client_count,
+                    "has_frame": streamer._frame_jpeg is not None,
+                    "frame_age_sec": round(age, 1),
+                    "frame_suppressed_reason": reason,
+                }
+                body = json.dumps(status).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Cache-Control", "no-cache")
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
 
             def _handle_projector(self_handler) -> None:  # noqa: N805
                 """Fullscreen projector viewer — drag to projector, click for fullscreen.
@@ -1544,6 +1638,7 @@ class FrameStreamer:
                 if image_name == "off":
                     # Stop overlay so normal frames resume on the projector.
                     streamer._overlay_active = False
+                    streamer._overlay_start_time = 0.0
                     body = json.dumps({"ok": True, "overlay": "off"}).encode()
                 else:
                     # Map short names to filenames
@@ -1561,6 +1656,7 @@ class FrameStreamer:
                             # Use submit_calibration_frame to bypass suppression
                             streamer.submit_calibration_frame(rgb)
                             streamer._overlay_active = True
+                            streamer._overlay_start_time = _time.monotonic()
                             body = json.dumps({"ok": True, "overlay": image_name}).encode()
                         else:
                             body = json.dumps({"ok": False, "error": "Failed to read image"}).encode()
@@ -2010,7 +2106,20 @@ class FrameStreamer:
 
         Thread-safe — may be called from any thread.
         """
-        if not self._running or self._calibration_active or self._overlay_active:
+        if not self._running:
+            return
+        # Auto-expire overlay after timeout so frames aren't suppressed forever
+        if self._overlay_active:
+            if (
+                self._overlay_start_time > 0
+                and _time.monotonic() - self._overlay_start_time > _OVERLAY_TIMEOUT_SEC
+            ):
+                self._overlay_active = False
+                self._overlay_start_time = 0.0
+                logger.info("Overlay auto-expired after %.0fs", _OVERLAY_TIMEOUT_SEC)
+            else:
+                return
+        if self._calibration_active:
             return
         # Skip encoding entirely when no one needs the frames:
         # no MJPEG stream clients AND dashboard preview is off.
@@ -2032,6 +2141,7 @@ class FrameStreamer:
             if jpeg is not None:
                 with self._lock:
                     self._frame_jpeg = jpeg
+                self._last_frame_time = _time.monotonic()
                 self._new_frame.set()
         finally:
             self._encoding.release()
@@ -2054,6 +2164,7 @@ class FrameStreamer:
         if jpeg is not None:
             with self._lock:
                 self._frame_jpeg = jpeg
+            self._last_frame_time = _time.monotonic()
             self._new_frame.set()
 
     def submit_input_preview(self, rgb: np.ndarray) -> None:

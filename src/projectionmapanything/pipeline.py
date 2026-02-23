@@ -317,6 +317,10 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             return self._call_inner(**kwargs)
         except Exception as exc:
             logger.error("__call__ CRASHED: %s: %s", type(exc).__name__, exc, exc_info=True)
+            # Clear stuck flags so frame delivery isn't permanently suppressed
+            self._calibrating = False
+            if self._streamer is not None:
+                self._streamer.calibration_active = False
             # Return test card as fallback so pipeline doesn't go silent
             return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
 
@@ -726,6 +730,10 @@ class ProMapAnythingPipeline(Pipeline):
                 "Depth preprocessor CRASHED: %s: %s",
                 type(exc).__name__, exc, exc_info=True,
             )
+            # Clear stuck flags so frame delivery isn't permanently suppressed
+            self._calibrating = False
+            if self._streamer is not None:
+                self._streamer.calibration_active = False
             # Return a grey frame at expected resolution as fallback
             out_w = kwargs.get("width", None)
             out_h = kwargs.get("height", None)
@@ -2139,6 +2147,20 @@ class ProMapAnythingProjectorPipeline(Pipeline):
         if video is None:
             raise ValueError("Projector postprocessor received no video input")
 
+        try:
+            return self._call_inner_post(video, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "Projector postprocessor CRASHED: %s: %s",
+                type(exc).__name__, exc, exc_info=True,
+            )
+            # Pass through input frame unchanged so the stream doesn't go dark
+            frame = video[0].squeeze(0).to(device=self.device, dtype=torch.float32)
+            if frame.max() > 1.5:
+                frame = frame / 255.0
+            return {"video": frame.unsqueeze(0).clamp(0, 1)}
+
+    def _call_inner_post(self, video: torch.Tensor, **kwargs) -> dict:
         frame = video[0].squeeze(0).to(device=self.device, dtype=torch.float32)
         if frame.max() > 1.5:
             frame = frame / 255.0
