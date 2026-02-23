@@ -164,7 +164,8 @@ const rtcStatusEl = document.getElementById('rtcStatus');
 
 // ---- Layer state ----
 let calibActive = false;
-let webrtcConnected = false;
+let webrtcConnected = false;  // ICE connected
+let webrtcHasVideo = false;   // video element actually has frames
 let pc = null;           // RTCPeerConnection
 let rtcRetryTimer = null;
 let rtcHideTimer = null;
@@ -174,8 +175,8 @@ function setRtcStatus(cls, text) {
   rtcStatusEl.textContent = text;
   clearTimeout(rtcHideTimer);
   if (cls === 'connected') {
-    // Auto-hide after 4s when connected
-    rtcHideTimer = setTimeout(() => { rtcStatusEl.classList.add('hide'); }, 4000);
+    // Auto-hide after 6s when connected
+    rtcHideTimer = setTimeout(() => { rtcStatusEl.classList.add('hide'); }, 6000);
   }
 }
 
@@ -184,16 +185,36 @@ function updateLayers() {
     // Calibration: canvas on top (z-index 10), hide WebRTC/MJPEG battle
     mjpegEl.style.zIndex = '2';
     webrtcEl.style.zIndex = '1';
-  } else if (webrtcConnected) {
-    // Normal + WebRTC: AI output on top
+  } else if (webrtcConnected && webrtcHasVideo) {
+    // Normal + WebRTC with actual video: AI output on top
     webrtcEl.style.zIndex = '2';
     mjpegEl.style.zIndex = '1';
   } else {
-    // Fallback: MJPEG on top
+    // Fallback: MJPEG on top (WebRTC behind — may be connected but no frames)
     mjpegEl.style.zIndex = '2';
     webrtcEl.style.zIndex = '1';
   }
 }
+
+// Detect when the WebRTC video element actually receives frames
+webrtcEl.addEventListener('playing', () => {
+  // Check that the video has real dimensions (not 0x0)
+  if (webrtcEl.videoWidth > 0 && webrtcEl.videoHeight > 0) {
+    webrtcHasVideo = true;
+    updateLayers();
+    setRtcStatus('connected', 'WebRTC live ' + webrtcEl.videoWidth + 'x' + webrtcEl.videoHeight);
+  }
+});
+webrtcEl.addEventListener('loadeddata', () => {
+  if (webrtcEl.videoWidth > 0 && webrtcEl.videoHeight > 0) {
+    webrtcHasVideo = true;
+    updateLayers();
+    setRtcStatus('connected', 'WebRTC live ' + webrtcEl.videoWidth + 'x' + webrtcEl.videoHeight);
+  }
+});
+// If video pauses or empties, fall back to MJPEG
+webrtcEl.addEventListener('emptied', () => { webrtcHasVideo = false; updateLayers(); });
+webrtcEl.addEventListener('pause', () => { webrtcHasVideo = false; updateLayers(); });
 
 // ---- WebRTC connection ----
 async function connectWebRTC() {
@@ -265,12 +286,13 @@ async function connectWebRTC() {
       const st = pc.iceConnectionState;
       if (st === 'connected' || st === 'completed') {
         webrtcConnected = true;
-        updateLayers();
-        setRtcStatus('connected', 'WebRTC connected');
+        // Don't updateLayers yet — wait for actual video frames (playing/loadeddata)
+        setRtcStatus('connecting', 'WebRTC ICE ok, waiting for video...');
       } else if (st === 'checking') {
         setRtcStatus('connecting', 'WebRTC checking...');
       } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
         webrtcConnected = false;
+        webrtcHasVideo = false;
         updateLayers();
         setRtcStatus('failed', 'WebRTC ' + st + ' — retrying...');
         scheduleRTCRetry(3000);
