@@ -4,14 +4,16 @@ Projects binary Gray code stripe patterns, captures them with a camera,
 and decodes the per-pixel correspondence to build a dense mapping from
 projector pixels to camera pixels (map_x, map_y) usable with ``cv2.remap``.
 
-The decode pipeline (simplified, matching the HTML scanner approach):
+The decode pipeline (RoomAlive-informed):
 1. Multi-frame averaged captures for noise rejection
-2. Per-bit comparison (pos > neg) with confidence accumulation
-3. Vectorized Gray-to-binary decode
-4. Confidence-weighted accumulation into projector-space maps
-5. Light median filter (3x3) for noise
-6. Inpainting remaining holes
-7. Disparity map computed as cam_x - proj_x
+2. Per-bit comparison (pos > neg) with per-bit reliability threshold
+3. MSB-only validity gating (LSBs excluded from mask, per RoomAlive)
+4. Vectorized Gray-to-binary decode
+5. Explicit boundary validation (decoded values in projector range)
+6. Confidence-weighted accumulation into projector-space maps
+7. Light median filter (3x3) for noise
+8. Inpainting remaining holes
+9. Disparity map computed as cam_x - proj_x
 """
 
 from __future__ import annotations
@@ -131,6 +133,7 @@ class CalibrationState:
         max_brightness: int = 255,
         change_threshold: float = 5.0,
         stability_threshold: float = 3.0,
+        bit_threshold: float = 10.0,
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
@@ -139,6 +142,7 @@ class CalibrationState:
         self.max_brightness = max(10, min(255, max_brightness))
         self.change_threshold = change_threshold
         self.stability_threshold = stability_threshold
+        self.bit_threshold = bit_threshold
 
         # Gray code bit counts
         self.bits_x = _num_bits(proj_w)
@@ -506,25 +510,28 @@ class CalibrationState:
     def _decode(self) -> None:
         """Decode captured Gray code patterns into a camera->projector mapping.
 
-        Simplified pipeline matching the HTML scanner approach:
+        RoomAlive-informed pipeline:
         1. Decode each bit: compare positive vs inverted pattern
-        2. Accumulate per-axis confidence: sum of |pos - neg|
-        3. Vectorized Gray-to-binary conversion
-        4. Filter by confidence threshold
-        5. Confidence-weighted accumulation into projector-space maps
-        6. Light median filter (3x3) for noise
-        7. Inpaint remaining holes
-        8. Compute disparity map (cam_x - proj_x)
+        2. Per-bit reliability threshold (|pos - neg| > bit_threshold)
+        3. Only MSB bits (i < nBits - 4) affect validity mask (LSBs too noisy)
+        4. Vectorized Gray-to-binary conversion
+        5. Explicit boundary validation (decoded values in range)
+        6. Confidence-weighted accumulation into projector-space maps
+        7. Light median filter (3x3) for noise
+        8. Inpaint remaining holes
+        9. Compute disparity map (cam_x - proj_x)
         """
         white_f = self._get_averaged(0)
         ref_shape = white_f.shape[:2]
         black_f = self._get_averaged(1, target_shape=ref_shape)
 
         h, w = ref_shape
+        bt = self.bit_threshold
 
         logger.info(
-            "Decode: camera %dx%d, projector %dx%d, %d+%d bits",
-            w, h, self.proj_w, self.proj_h, self.bits_x, self.bits_y,
+            "Decode: camera %dx%d, projector %dx%d, %d+%d bits, "
+            "bit_threshold=%.1f",
+            w, h, self.proj_w, self.proj_h, self.bits_x, self.bits_y, bt,
         )
         logger.info(
             "  WHITE ref: min=%.1f max=%.1f mean=%.1f",
@@ -535,10 +542,16 @@ class CalibrationState:
             black_f.min(), black_f.max(), black_f.mean(),
         )
 
-        # -- Decode X (column) Gray codes with confidence --------------------
+        # -- Decode X (column) Gray codes with per-bit reliability -----------
         base = 2  # skip white + black
         decoded_x = np.zeros((h, w), dtype=np.int32)
+        valid_x = np.ones((h, w), dtype=bool)
         conf_x = np.zeros((h, w), dtype=np.float32)
+
+        # RoomAlive insight: only update validity mask for higher-order bits.
+        # LSBs (last 4 bits) are inherently noisy and shouldn't invalidate
+        # pixels that decoded correctly on the important coarse bits.
+        msb_cutoff_x = max(0, self.bits_x - 4)
 
         for capture_idx in range(self.bits_x):
             actual_bit = (self.bits_x - 1) - capture_idx  # MSB first
@@ -554,23 +567,34 @@ class CalibrationState:
 
             pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
             neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
-            bit_val = (pos_f > neg_f).astype(np.int32)
+            diff = pos_f - neg_f
+            bit_val = (diff > 0).astype(np.int32)
             decoded_x |= bit_val << actual_bit
-            conf_x += np.abs(pos_f - neg_f)
+
+            # Per-bit reliability
+            abs_diff = np.abs(diff)
+            bit_reliable = abs_diff > bt
+            conf_x += abs_diff
+
+            # Only MSB bits affect validity (RoomAlive: i < nBits - 4)
+            if capture_idx < msb_cutoff_x:
+                valid_x &= bit_reliable
 
             logger.info(
-                "  X bit %d (capture %d): pos=%.1f neg=%.1f "
-                "diff: min=%.1f max=%.1f mean=%.1f",
-                actual_bit, capture_idx, pos_f.mean(), neg_f.mean(),
-                np.abs(pos_f - neg_f).min(),
-                np.abs(pos_f - neg_f).max(),
-                np.abs(pos_f - neg_f).mean(),
+                "  X bit %d (capture %d): diff mean=%.1f, "
+                "reliable=%.1f%%, msb_gate=%s",
+                actual_bit, capture_idx, abs_diff.mean(),
+                100.0 * np.count_nonzero(bit_reliable) / max(h * w, 1),
+                "yes" if capture_idx < msb_cutoff_x else "no (LSB)",
             )
 
-        # -- Decode Y (row) Gray codes with confidence ----------------------
+        # -- Decode Y (row) Gray codes with per-bit reliability --------------
         base_y = base + self.bits_x * 2
         decoded_y = np.zeros((h, w), dtype=np.int32)
+        valid_y = np.ones((h, w), dtype=bool)
         conf_y = np.zeros((h, w), dtype=np.float32)
+
+        msb_cutoff_y = max(0, self.bits_y - 4)
 
         for capture_idx in range(self.bits_y):
             actual_bit = (self.bits_y - 1) - capture_idx  # MSB first
@@ -586,17 +610,23 @@ class CalibrationState:
 
             pos_f = self._get_averaged(pos_idx, target_shape=ref_shape)
             neg_f = self._get_averaged(neg_idx, target_shape=ref_shape)
-            bit_val = (pos_f > neg_f).astype(np.int32)
+            diff = pos_f - neg_f
+            bit_val = (diff > 0).astype(np.int32)
             decoded_y |= bit_val << actual_bit
-            conf_y += np.abs(pos_f - neg_f)
+
+            abs_diff = np.abs(diff)
+            bit_reliable = abs_diff > bt
+            conf_y += abs_diff
+
+            if capture_idx < msb_cutoff_y:
+                valid_y &= bit_reliable
 
             logger.info(
-                "  Y bit %d (capture %d): pos=%.1f neg=%.1f "
-                "diff: min=%.1f max=%.1f mean=%.1f",
-                actual_bit, capture_idx, pos_f.mean(), neg_f.mean(),
-                np.abs(pos_f - neg_f).min(),
-                np.abs(pos_f - neg_f).max(),
-                np.abs(pos_f - neg_f).mean(),
+                "  Y bit %d (capture %d): diff mean=%.1f, "
+                "reliable=%.1f%%, msb_gate=%s",
+                actual_bit, capture_idx, abs_diff.mean(),
+                100.0 * np.count_nonzero(bit_reliable) / max(h * w, 1),
+                "yes" if capture_idx < msb_cutoff_y else "no (LSB)",
             )
 
         # -- Vectorized Gray-to-binary decode --------------------------------
@@ -614,21 +644,19 @@ class CalibrationState:
             shift >>= 1
         decoded_y = binary_y
 
-        # -- Filter by confidence + bounds -----------------------------------
-        conf_thresh_x = 15.0 * self.bits_x
-        conf_thresh_y = 15.0 * self.bits_y
+        # -- Filter by per-bit reliability + explicit bounds -----------------
         valid_mask = (
-            (conf_x > conf_thresh_x)
-            & (conf_y > conf_thresh_y)
-            & (decoded_x < self.proj_w)
-            & (decoded_y < self.proj_h)
+            valid_x
+            & valid_y
+            & (decoded_x >= 0) & (decoded_x < self.proj_w)
+            & (decoded_y >= 0) & (decoded_y < self.proj_h)
         )
         n_valid = int(np.count_nonzero(valid_mask))
         logger.info(
-            "  Valid pixels after confidence filter: %d/%d (%.1f%%) "
-            "[thresh_x=%.0f, thresh_y=%.0f]",
+            "  Valid pixels after per-bit reliability filter: %d/%d (%.1f%%) "
+            "[bit_threshold=%.1f, msb_cutoff_x=%d, msb_cutoff_y=%d]",
             n_valid, h * w, 100.0 * n_valid / max(h * w, 1),
-            conf_thresh_x, conf_thresh_y,
+            bt, msb_cutoff_x, msb_cutoff_y,
         )
 
         # -- Weighted accumulation into projector-space maps -----------------
@@ -688,7 +716,6 @@ class CalibrationState:
         self.cam_h = h
 
         # -- Compute disparity map (cam_x - proj_x) -------------------------
-        # For each projector pixel, horizontal disparity = camera_x - projector_x
         px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
             self.proj_h, axis=0,
         )
@@ -864,6 +891,55 @@ def save_camera_intrinsics(
     logger.info(
         "Saved camera intrinsics to %s (fx=%.1f, fy=%.1f, error=%.4f px)",
         p.name, K_cam[0, 0], K_cam[1, 1], reprojection_error,
+    )
+
+
+def save_procam_intrinsics(
+    K_cam: np.ndarray,
+    dist_cam: np.ndarray,
+    cam_size: tuple[int, int],
+    cam_error: float,
+    K_proj: np.ndarray,
+    dist_proj: np.ndarray,
+    proj_size: tuple[int, int],
+    proj_error: float,
+    path: str | Path | None = None,
+) -> None:
+    """Save both camera and projector intrinsics to JSON.
+
+    Parameters
+    ----------
+    K_cam, K_proj : np.ndarray
+        (3, 3) float64 camera/projector matrix.
+    dist_cam, dist_proj : np.ndarray
+        Distortion coefficients.
+    cam_size, proj_size : tuple[int, int]
+        (width, height) of calibration images.
+    cam_error, proj_error : float
+        Mean reprojection error in pixels.
+    path : str | Path | None
+        Output path. Defaults to ``_INTRINSICS_PATH``.
+    """
+    p = Path(path) if path is not None else _INTRINSICS_PATH
+    data = {
+        "version": 2,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_width": cam_size[0],
+        "image_height": cam_size[1],
+        "reprojection_error": float(cam_error),
+        "K_cam": K_cam.tolist(),
+        "dist_cam": dist_cam.flatten().tolist(),
+        "projector_width": proj_size[0],
+        "projector_height": proj_size[1],
+        "projector_reprojection_error": float(proj_error),
+        "K_proj": K_proj.tolist(),
+        "dist_proj": dist_proj.flatten().tolist(),
+    }
+    p.write_text(json.dumps(data, indent=2))
+    logger.info(
+        "Saved procam intrinsics to %s (cam fx=%.1f err=%.4f, "
+        "proj fx=%.1f err=%.4f)",
+        p.name, K_cam[0, 0], cam_error, K_proj[0, 0], proj_error,
     )
 
 

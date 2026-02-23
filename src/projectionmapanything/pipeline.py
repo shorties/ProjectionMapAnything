@@ -1173,11 +1173,42 @@ class ProMapAnythingPipeline(Pipeline):
         start: bool,
         kwargs: dict,
     ) -> dict | None:
-        """Run Gray code calibration inline, overriding projector output.
+        """Run Gray code calibration or intrinsics calibration inline.
 
         Returns a preprocessor output dict while calibrating, or None
         to fall through to normal depth processing.
         """
+        # -- Intrinsics calibration (projected checkerboards) -----------------
+        # Runs independently of Gray code calibration, triggered via dashboard.
+        if (
+            self._streamer is not None
+            and getattr(self._streamer, "_intrinsics_active", False)
+        ):
+            # Convert frame to uint8 RGB for OpenCV corner detection
+            cam_np = frame.squeeze(0).cpu().numpy()
+            if cam_np.dtype != np.uint8:
+                if cam_np.max() <= 1.5:
+                    cam_np = (cam_np * 255.0).clip(0, 255)
+                cam_np = cam_np.astype(np.uint8)
+
+            pattern = self._streamer.step_intrinsics_calibration(cam_np)
+
+            if pattern is not None:
+                # Submit pattern to MJPEG stream (already done in step)
+                # Output grey to AI model while intrinsics calibrating
+                out_w = kwargs.get("width", None)
+                out_h = kwargs.get("height", None)
+                if out_w is None or out_h is None:
+                    out_w, out_h = self._get_generation_resolution(kwargs)
+                else:
+                    out_w, out_h = int(out_w), int(out_h)
+                grey = torch.full(
+                    (int(out_h), int(out_w), 3), 0.5,
+                    dtype=torch.float32, device=self.device,
+                )
+                return {"video": grey.unsqueeze(0)}
+            # Intrinsics calibration just finished — fall through to normal
+
         # Read calibration params via _p() (dashboard override > kwargs > default)
         cal_brightness = int(self._p("calibration_brightness", kwargs, 128))
 

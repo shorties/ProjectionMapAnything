@@ -400,6 +400,109 @@ window.addEventListener('resize', () => {
 _CONTROL_PANEL_HTML = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
 
 
+# ── Checkerboard intrinsics calibration utilities ────────────────────────────
+
+
+def generate_checkerboard(
+    proj_w: int,
+    proj_h: int,
+    board_cols: int,
+    board_rows: int,
+    square_px: int,
+    offset_x: int,
+    offset_y: int,
+    white_level: int = 255,
+) -> np.ndarray:
+    """Generate a checkerboard image at projector resolution.
+
+    Black background with white border around the checkerboard area.
+    Returns (proj_h, proj_w, 3) uint8 RGB.
+    """
+    img = np.zeros((proj_h, proj_w), dtype=np.uint8)
+    n_sq_x = board_cols + 1
+    n_sq_y = board_rows + 1
+
+    # White border (1 square-width padding)
+    border = square_px
+    bx0 = max(0, offset_x - border)
+    by0 = max(0, offset_y - border)
+    bx1 = min(proj_w, offset_x + n_sq_x * square_px + border)
+    by1 = min(proj_h, offset_y + n_sq_y * square_px + border)
+    img[by0:by1, bx0:bx1] = white_level
+
+    # Black squares on top
+    for r in range(n_sq_y):
+        for c in range(n_sq_x):
+            if (r + c) % 2 == 0:
+                sx = offset_x + c * square_px
+                sy = offset_y + r * square_px
+                sx0 = max(0, min(sx, proj_w))
+                sy0 = max(0, min(sy, proj_h))
+                sx1 = max(0, min(sx + square_px, proj_w))
+                sy1 = max(0, min(sy + square_px, proj_h))
+                if sx1 > sx0 and sy1 > sy0:
+                    img[sy0:sy1, sx0:sx1] = 0
+
+    return np.stack([img] * 3, axis=-1)
+
+
+def generate_checkerboard_positions(
+    proj_w: int,
+    proj_h: int,
+    board_cols: int,
+    board_rows: int,
+    square_px: int,
+) -> list[dict]:
+    """Generate checkerboard positions spread across the projector.
+
+    Returns list of dicts with offset_x, offset_y, and label.
+    """
+    n_sq_x = board_cols + 1
+    n_sq_y = board_rows + 1
+    board_w = n_sq_x * square_px
+    board_h = n_sq_y * square_px
+    border = square_px
+    margin = border + square_px // 2
+
+    min_x = margin
+    max_x = max(min_x, proj_w - board_w - margin)
+    min_y = margin
+    max_y = max(min_y, proj_h - board_h - margin)
+    cx = (min_x + max_x) // 2
+    cy = (min_y + max_y) // 2
+
+    return [
+        {"offset_x": cx, "offset_y": cy, "label": "center"},
+        {"offset_x": min_x, "offset_y": min_y, "label": "top-left"},
+        {"offset_x": max_x, "offset_y": min_y, "label": "top-right"},
+        {"offset_x": min_x, "offset_y": max_y, "label": "bottom-left"},
+        {"offset_x": max_x, "offset_y": max_y, "label": "bottom-right"},
+        {"offset_x": cx, "offset_y": min_y, "label": "top-center"},
+        {"offset_x": cx, "offset_y": max_y, "label": "bottom-center"},
+    ]
+
+
+def get_projected_corner_positions(
+    board_cols: int,
+    board_rows: int,
+    square_px: int,
+    offset_x: int,
+    offset_y: int,
+) -> np.ndarray:
+    """Get projector-pixel coordinates of inner corners.
+
+    Returns (board_rows * board_cols, 1, 2) float32.
+    """
+    corners = np.zeros((board_rows * board_cols, 1, 2), dtype=np.float32)
+    for r in range(board_rows):
+        for c in range(board_cols):
+            corners[r * board_cols + c, 0] = (
+                offset_x + (c + 1) * square_px,
+                offset_y + (r + 1) * square_px,
+            )
+    return corners
+
+
 class FrameStreamer:
     """MJPEG HTTP streaming server for projector output.
 
@@ -605,9 +708,338 @@ class FrameStreamer:
             "has_custom_mask": mask_path.is_file(),
         }
 
-    # -- REMOVED: Standalone calibration, camera intrinsics, auto camera calibration
-    # All calibration is now handled by the pipeline (calibration.py) via
-    # the start_calibration toggle in Scope settings.
+    # -- Projected checkerboard intrinsics calibration --------------------------
+
+    def start_intrinsics_calibration(
+        self,
+        proj_w: int,
+        proj_h: int,
+        square_px: int | None = None,
+    ) -> dict:
+        """Begin projected checkerboard intrinsics calibration.
+
+        Projects checkerboards at multiple positions. The pipeline calls
+        ``step_intrinsics_calibration()`` each frame with the camera image.
+
+        Returns status dict with 'ok' and calibration parameters.
+        """
+        if square_px is None or square_px <= 0:
+            square_px = min(proj_w, proj_h) // 12
+
+        board_cols = 7
+        board_rows = 5
+
+        positions = generate_checkerboard_positions(
+            proj_w, proj_h, board_cols, board_rows, square_px,
+        )
+
+        self._intrinsics_active = True
+        self._intrinsics_proj_w = proj_w
+        self._intrinsics_proj_h = proj_h
+        self._intrinsics_square_px = square_px
+        self._intrinsics_board_cols = board_cols
+        self._intrinsics_board_rows = board_rows
+        self._intrinsics_positions = positions
+        self._intrinsics_current_idx = 0
+        self._intrinsics_captures: list[dict] = []
+        self._intrinsics_settle_start = 0.0
+        self._intrinsics_settled = False
+        self._intrinsics_timeout_start = 0.0
+        self._intrinsics_result: dict | None = None
+        self._intrinsics_error: str | None = None
+        self._intrinsics_detected = 0
+        self._intrinsics_skipped = 0
+
+        # Show first checkerboard pattern
+        self._calibration_active = True
+        self._submit_intrinsics_pattern()
+
+        logger.info(
+            "Intrinsics calibration started: %dx%d, %dx%d board, "
+            "square=%dpx, %d positions",
+            proj_w, proj_h, board_cols, board_rows,
+            square_px, len(positions),
+        )
+        return {
+            "ok": True,
+            "square_px": square_px,
+            "positions": len(positions),
+            "board_size": [board_cols, board_rows],
+        }
+
+    def stop_intrinsics_calibration(self) -> None:
+        """Cancel intrinsics calibration."""
+        self._intrinsics_active = False
+        self._calibration_active = False
+        logger.info("Intrinsics calibration cancelled")
+
+    def step_intrinsics_calibration(
+        self, camera_frame: np.ndarray,
+    ) -> np.ndarray | None:
+        """Process one frame during intrinsics calibration.
+
+        Parameters
+        ----------
+        camera_frame : np.ndarray
+            uint8 (H, W, 3) RGB camera image.
+
+        Returns
+        -------
+        np.ndarray | None
+            The checkerboard pattern to project (H, W, 3) uint8, or None
+            if calibration is complete.
+        """
+        import time as _t
+
+        if not getattr(self, "_intrinsics_active", False):
+            return None
+
+        idx = self._intrinsics_current_idx
+        positions = self._intrinsics_positions
+
+        # All positions done — finish
+        if idx >= len(positions):
+            self._finish_intrinsics_calibration()
+            return None
+
+        now = _t.monotonic()
+
+        # Settle check — wait 500ms after pattern change
+        if not self._intrinsics_settled:
+            if self._intrinsics_settle_start == 0.0:
+                self._intrinsics_settle_start = now
+                self._intrinsics_timeout_start = now
+            if now - self._intrinsics_settle_start < 0.5:
+                return self._get_intrinsics_pattern()
+            self._intrinsics_settled = True
+            self._intrinsics_timeout_start = now
+
+        # Detect corners
+        gray = cv2.cvtColor(camera_frame, cv2.COLOR_RGB2GRAY)
+        board_size = (self._intrinsics_board_cols, self._intrinsics_board_rows)
+        flags = (
+            cv2.CALIB_CB_ADAPTIVE_THRESH
+            | cv2.CALIB_CB_NORMALIZE_IMAGE
+        )
+        found, corners = cv2.findChessboardCorners(gray, board_size, flags)
+
+        if found and corners is not None:
+            # Sub-pixel refinement
+            criteria = (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+                30, 0.001,
+            )
+            corners = cv2.cornerSubPix(
+                gray, corners, (11, 11), (-1, -1), criteria,
+            )
+
+            # Build object points
+            sq = self._intrinsics_square_px
+            cols = self._intrinsics_board_cols
+            rows = self._intrinsics_board_rows
+            obj_pts = np.zeros((rows * cols, 3), dtype=np.float32)
+            for r in range(rows):
+                for c in range(cols):
+                    obj_pts[r * cols + c] = (c * sq, r * sq, 0.0)
+
+            # Get projected corner positions
+            pos = positions[idx]
+            proj_corners = get_projected_corner_positions(
+                cols, rows, sq, pos["offset_x"], pos["offset_y"],
+            )
+
+            self._intrinsics_captures.append({
+                "obj_pts": obj_pts,
+                "img_pts": corners,
+                "proj_pts": proj_corners,
+                "cam_size": (gray.shape[1], gray.shape[0]),
+                "label": pos["label"],
+            })
+            self._intrinsics_detected += 1
+
+            logger.info(
+                "Intrinsics: position %d/%d (%s) — %d corners detected",
+                idx + 1, len(positions), pos["label"], len(corners),
+            )
+
+            # Advance to next position
+            self._intrinsics_current_idx += 1
+            self._intrinsics_settled = False
+            self._intrinsics_settle_start = 0.0
+            if self._intrinsics_current_idx < len(positions):
+                self._submit_intrinsics_pattern()
+                return self._get_intrinsics_pattern()
+            else:
+                self._finish_intrinsics_calibration()
+                return None
+
+        # Timeout: skip after 3s
+        if now - self._intrinsics_timeout_start > 3.0:
+            pos = positions[idx]
+            self._intrinsics_skipped += 1
+            logger.warning(
+                "Intrinsics: position %d/%d (%s) — detection timeout, skipping",
+                idx + 1, len(positions), pos["label"],
+            )
+            self._intrinsics_current_idx += 1
+            self._intrinsics_settled = False
+            self._intrinsics_settle_start = 0.0
+            if self._intrinsics_current_idx < len(positions):
+                self._submit_intrinsics_pattern()
+                return self._get_intrinsics_pattern()
+            else:
+                self._finish_intrinsics_calibration()
+                return None
+
+        return self._get_intrinsics_pattern()
+
+    def _submit_intrinsics_pattern(self) -> None:
+        """Submit the current checkerboard pattern to the MJPEG stream."""
+        pattern = self._get_intrinsics_pattern()
+        if pattern is not None:
+            self.submit_calibration_frame(pattern)
+
+    def _get_intrinsics_pattern(self) -> np.ndarray | None:
+        """Generate the current checkerboard pattern image."""
+        idx = self._intrinsics_current_idx
+        positions = self._intrinsics_positions
+        if idx >= len(positions):
+            return None
+        pos = positions[idx]
+        return generate_checkerboard(
+            self._intrinsics_proj_w,
+            self._intrinsics_proj_h,
+            self._intrinsics_board_cols,
+            self._intrinsics_board_rows,
+            self._intrinsics_square_px,
+            pos["offset_x"],
+            pos["offset_y"],
+        )
+
+    def _finish_intrinsics_calibration(self) -> None:
+        """Run camera + projector intrinsics calibration from collected data."""
+        from .calibration import save_camera_intrinsics, save_procam_intrinsics
+
+        self._intrinsics_active = False
+        self._calibration_active = False
+        captures = self._intrinsics_captures
+
+        if len(captures) < 3:
+            self._intrinsics_error = (
+                f"Need at least 3 detections, got {len(captures)}"
+            )
+            logger.warning("Intrinsics: %s", self._intrinsics_error)
+            return
+
+        # Unpack captured data
+        all_obj_pts = [c["obj_pts"] for c in captures]
+        all_img_pts = [c["img_pts"] for c in captures]
+        all_proj_pts = [c["proj_pts"] for c in captures]
+        cam_size = captures[0]["cam_size"]
+        proj_size = (self._intrinsics_proj_w, self._intrinsics_proj_h)
+
+        # Phase 1: Camera intrinsics
+        try:
+            ret_cam, K_cam, dist_cam, rvecs, tvecs = cv2.calibrateCamera(
+                all_obj_pts, all_img_pts, cam_size, None, None,
+            )
+        except Exception as exc:
+            self._intrinsics_error = f"Camera calibration failed: {exc}"
+            logger.error("Intrinsics: %s", self._intrinsics_error)
+            return
+
+        logger.info(
+            "Intrinsics: camera fx=%.1f fy=%.1f cx=%.1f cy=%.1f err=%.4f",
+            K_cam[0, 0], K_cam[1, 1], K_cam[0, 2], K_cam[1, 2], ret_cam,
+        )
+
+        # Phase 2: Projector intrinsics via 3D points from camera poses
+        try:
+            proj_obj_pts_3d = []
+            for i in range(len(rvecs)):
+                R, _ = cv2.Rodrigues(rvecs[i])
+                t = tvecs[i].reshape(3)
+                pts_cam = (R @ all_obj_pts[i].T).T + t
+                proj_obj_pts_3d.append(pts_cam.astype(np.float32))
+
+            # Initial guess for projector intrinsics
+            K_proj_init = np.eye(3, dtype=np.float64)
+            K_proj_init[0, 0] = K_proj_init[1, 1] = float(
+                max(proj_size[0], proj_size[1])
+            )
+            K_proj_init[0, 2] = proj_size[0] / 2.0
+            K_proj_init[1, 2] = proj_size[1] / 2.0
+
+            ret_proj, K_proj, dist_proj, _, _ = cv2.calibrateCamera(
+                proj_obj_pts_3d,
+                all_proj_pts,
+                proj_size,
+                K_proj_init,
+                None,
+                flags=cv2.CALIB_USE_INTRINSIC_GUESS,
+            )
+        except Exception as exc:
+            # Projector calibration failed — save camera only
+            logger.warning(
+                "Intrinsics: projector calibration failed: %s — "
+                "saving camera intrinsics only",
+                exc,
+            )
+            save_camera_intrinsics(K_cam, dist_cam, cam_size, ret_cam)
+            self._intrinsics_result = {
+                "cam_fx": float(K_cam[0, 0]),
+                "cam_fy": float(K_cam[1, 1]),
+                "cam_error": float(ret_cam),
+                "detections": len(captures),
+            }
+            return
+
+        logger.info(
+            "Intrinsics: projector fx=%.1f fy=%.1f cx=%.1f cy=%.1f err=%.4f",
+            K_proj[0, 0], K_proj[1, 1], K_proj[0, 2], K_proj[1, 2], ret_proj,
+        )
+
+        # Save both camera and projector intrinsics
+        save_procam_intrinsics(
+            K_cam, dist_cam, cam_size, ret_cam,
+            K_proj, dist_proj, proj_size, ret_proj,
+        )
+
+        self._intrinsics_result = {
+            "cam_fx": float(K_cam[0, 0]),
+            "cam_fy": float(K_cam[1, 1]),
+            "cam_error": float(ret_cam),
+            "proj_fx": float(K_proj[0, 0]),
+            "proj_fy": float(K_proj[1, 1]),
+            "proj_error": float(ret_proj),
+            "detections": len(captures),
+        }
+        logger.info("Intrinsics calibration complete: %s", self._intrinsics_result)
+
+    def get_intrinsics_status(self) -> dict:
+        """Return current intrinsics calibration status."""
+        active = getattr(self, "_intrinsics_active", False)
+        result = getattr(self, "_intrinsics_result", None)
+        error = getattr(self, "_intrinsics_error", None)
+        positions = getattr(self, "_intrinsics_positions", [])
+        current = getattr(self, "_intrinsics_current_idx", 0)
+        detected = getattr(self, "_intrinsics_detected", 0)
+        skipped = getattr(self, "_intrinsics_skipped", 0)
+
+        status: dict = {
+            "active": active,
+            "current": current,
+            "total": len(positions),
+            "detected": detected,
+            "skipped": skipped,
+        }
+        if active and current < len(positions):
+            status["label"] = positions[current].get("label", "")
+        if result is not None:
+            status["result"] = result
+        if error is not None:
+            status["error"] = error
+        return status
 
     # -- Calibration export/import ---------------------------------------------
 
@@ -731,6 +1163,8 @@ class FrameStreamer:
                     self_handler._handle_upload_status()
                 elif path == "/calibration/export":
                     self_handler._handle_calibration_export()
+                elif path == "/calibrate/intrinsics/status":
+                    self_handler._handle_intrinsics_status()
                 elif path == "/api/params":
                     self_handler._handle_get_params()
                 elif path == "/scope/ice-servers":
@@ -748,6 +1182,10 @@ class FrameStreamer:
                     self_handler._handle_upload()
                 elif path == "/calibration/import":
                     self_handler._handle_calibration_import()
+                elif path == "/calibrate/intrinsics/start":
+                    self_handler._handle_intrinsics_start()
+                elif path == "/calibrate/intrinsics/stop":
+                    self_handler._handle_intrinsics_stop()
                 elif path == "/api/params":
                     self_handler._handle_post_params()
                 elif path == "/scope/offer":
@@ -1224,7 +1662,58 @@ class FrameStreamer:
                     self_handler.send_response(500)
                     self_handler.end_headers()
 
+            # -- Intrinsics calibration endpoints ----------------------------
 
+            def _handle_intrinsics_start(self_handler) -> None:  # noqa: N805
+                """Start projected checkerboard intrinsics calibration."""
+                try:
+                    length = int(self_handler.headers.get("Content-Length", 0))
+                    raw = self_handler.rfile.read(length) if length > 0 else b"{}"
+                    params = json.loads(raw)
+                    pw = int(params.get("proj_w", 1920))
+                    ph = int(params.get("proj_h", 1080))
+                    sq = params.get("square_px")
+                    if sq is not None:
+                        sq = int(sq)
+                    result = streamer.start_intrinsics_calibration(pw, ph, sq)
+                    body = json.dumps(result).encode()
+                    self_handler.send_response(200)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(body)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(body)
+                except Exception as exc:
+                    body = json.dumps({"ok": False, "error": str(exc)}).encode()
+                    self_handler.send_response(500)
+                    self_handler.send_header("Content-Type", "application/json")
+                    self_handler.send_header("Content-Length", str(len(body)))
+                    self_handler.send_header("Access-Control-Allow-Origin", "*")
+                    self_handler.end_headers()
+                    self_handler.wfile.write(body)
+
+            def _handle_intrinsics_stop(self_handler) -> None:  # noqa: N805
+                """Stop intrinsics calibration."""
+                streamer.stop_intrinsics_calibration()
+                body = json.dumps({"ok": True}).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_intrinsics_status(self_handler) -> None:  # noqa: N805
+                """Return intrinsics calibration progress and results."""
+                data = streamer.get_intrinsics_status()
+                body = json.dumps(data).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.send_header("Cache-Control", "no-cache")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
 
             def log_message(self_handler, format, *args) -> None:  # noqa: N805
                 # Suppress per-request HTTP logging — the MJPEG stream fires

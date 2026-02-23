@@ -136,7 +136,95 @@
     </div>
   </details>
 
-  <!-- Calibration (Gray code via Scope pipeline — no browser UI needed) -->
+  <!-- Calibration -->
+  <details id="calib-section">
+    <summary>Calibration</summary>
+    <div class="sec">
+      <div class="ctrl">
+        <span class="ctrl-label">Projector W</span>
+        <input type="number" id="cal-proj-w" value="1920" min="320" max="7680" style="width:70px;" />
+      </div>
+      <div class="ctrl">
+        <span class="ctrl-label">Projector H</span>
+        <input type="number" id="cal-proj-h" value="1080" min="240" max="4320" style="width:70px;" />
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-p" id="cal-start-btn" onclick="startCalibration()">Start Calibration</button>
+        <button class="btn btn-s hidden" id="cal-stop-btn" onclick="stopCalibration()">Stop</button>
+      </div>
+      <div id="cal-progress-wrap" class="hidden">
+        <div class="prog-wrap">
+          <div class="prog-bar" id="cal-prog-bar" style="width:0%"></div>
+          <div class="prog-text" id="cal-prog-text">0%</div>
+        </div>
+        <div class="ctrl" style="margin-top:4px;">
+          <span class="ctrl-label">Phase</span>
+          <span class="muted" id="cal-phase">—</span>
+        </div>
+        <div class="ctrl">
+          <span class="ctrl-label">Pattern</span>
+          <span class="muted" id="cal-pattern">—</span>
+        </div>
+        <div class="ctrl">
+          <span class="ctrl-label">Coverage</span>
+          <span class="muted" id="cal-coverage">—</span>
+        </div>
+      </div>
+      <div id="cal-errors" class="hidden">
+        <div class="hint err" id="cal-error-text"></div>
+      </div>
+      <div id="cal-results" class="hidden">
+        <div class="muted" id="cal-result-meta"></div>
+        <div class="thumb-row" id="cal-thumbs"></div>
+        <div id="cal-files"></div>
+        <div class="btn-row" style="margin-top:6px;">
+          <button class="btn btn-s btn-sm" onclick="downloadAllCal()">Download All</button>
+          <button class="btn btn-s btn-sm" onclick="exportCalibration()">Export .zip</button>
+          <label class="btn btn-s btn-sm" style="cursor:pointer;">
+            Import .zip
+            <input type="file" id="cal-import-file" accept=".zip" style="display:none;" onchange="importCalibration()" />
+          </label>
+        </div>
+        <div class="hint" id="cal-transfer-status"></div>
+      </div>
+
+      <!-- Intrinsics (collapsed sub-section) -->
+      <details style="background:#141820;border-radius:6px;margin-top:6px;">
+        <summary style="font-size:11px;padding:8px 10px;">Intrinsics (Camera + Projector)</summary>
+        <div class="sec">
+          <div class="ctrl">
+            <span class="ctrl-label">Square px</span>
+            <input type="number" id="intr-square-px" value="0" min="0" max="500" style="width:60px;" />
+            <span class="muted" style="font-size:10px;">(0 = auto)</span>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-p btn-sm" id="intr-start-btn" onclick="startIntrinsics()">Auto Intrinsics</button>
+            <button class="btn btn-s btn-sm hidden" id="intr-stop-btn" onclick="stopIntrinsics()">Stop</button>
+          </div>
+          <div id="intr-progress-wrap" class="hidden">
+            <div class="prog-wrap">
+              <div class="prog-bar" id="intr-prog-bar" style="width:0%"></div>
+              <div class="prog-text" id="intr-prog-text">0%</div>
+            </div>
+            <div class="ctrl" style="margin-top:4px;">
+              <span class="ctrl-label">Position</span>
+              <span class="muted" id="intr-position">—</span>
+            </div>
+            <div class="ctrl">
+              <span class="ctrl-label">Detection</span>
+              <span class="muted" id="intr-detection">—</span>
+            </div>
+          </div>
+          <div id="intr-results" class="hidden">
+            <div class="hint ok" id="intr-result-text"></div>
+          </div>
+          <div id="intr-errors" class="hidden">
+            <div class="hint err" id="intr-error-text"></div>
+          </div>
+        </div>
+      </details>
+    </div>
+  </details>
 
   <!-- Depth -->
   <details>
@@ -345,17 +433,6 @@
     </div>
   </details>
 
-  <!-- Results -->
-  <details class="hidden" id="results-section">
-    <summary>Results</summary>
-    <div class="sec">
-      <div class="muted" id="result-meta"></div>
-      <div class="thumb-row" id="result-thumbs"></div>
-      <div id="result-files"></div>
-      <button class="btn btn-s btn-sm" onclick="downloadAll()">Download All</button>
-    </div>
-  </details>
-
   <!-- Status -->
   <details>
     <summary>Status</summary>
@@ -368,14 +445,6 @@
         </div>
       </div>
       <div class="muted" id="proj-resolution"></div>
-      <div class="btn-row">
-        <button class="btn btn-s btn-sm" onclick="exportCalibration()">Export .zip</button>
-        <label class="btn btn-s btn-sm" style="cursor:pointer;">
-          Import .zip
-          <input type="file" id="import-file" accept=".zip" style="display:none;" onchange="importCalibration()" />
-        </label>
-      </div>
-      <div class="hint" id="transfer-status"></div>
       <div class="ctrl">
         <span class="ctrl-label">Scope</span>
         <input type="text" id="scope-url" placeholder="Scope URL" spellcheck="false" />
@@ -509,23 +578,81 @@ function updateProj() {
 }
 updateProj(); setInterval(updateProj, 5000);
 
-// -- Calibration results polling (pipeline Gray code results) --
-let resultFiles = [];
+// -- Calibration --
+let calResultFiles = [];
 let lastCalibTs = '';
+let calPolling = false;
 
 function triggerDl(name) {
   const a = document.createElement('a');
   a.href = '/calibration/download/' + encodeURIComponent(name);
   a.download = name; document.body.appendChild(a); a.click(); a.remove();
 }
-function downloadAll() { let d = 0; resultFiles.forEach(n => { setTimeout(() => triggerDl(n), d); d += 300; }); }
+function downloadAllCal() { let d = 0; calResultFiles.forEach(n => { setTimeout(() => triggerDl(n), d); d += 300; }); }
 
-function updateCalib(data) {
-  const results = document.getElementById('results-section');
-  if (data.complete && data.files && data.files.length > 0) {
-    results.classList.remove('hidden');
-    resultFiles = data.files;
-    const meta = document.getElementById('result-meta');
+function startCalibration() {
+  param('start_calibration', true);
+  document.getElementById('cal-start-btn').classList.add('hidden');
+  document.getElementById('cal-stop-btn').classList.remove('hidden');
+  document.getElementById('cal-progress-wrap').classList.remove('hidden');
+  document.getElementById('cal-results').classList.add('hidden');
+  document.getElementById('cal-errors').classList.add('hidden');
+  calPolling = true;
+  pollCalibrationStatus();
+}
+
+function stopCalibration() {
+  param('start_calibration', false);
+  document.getElementById('cal-start-btn').classList.remove('hidden');
+  document.getElementById('cal-stop-btn').classList.add('hidden');
+  calPolling = false;
+}
+
+function updateCalibUI(data) {
+  const isActive = data.active;
+  const isComplete = data.complete && data.files && data.files.length > 0;
+
+  // Progress
+  if (isActive || (data.progress > 0 && data.progress < 1)) {
+    document.getElementById('cal-progress-wrap').classList.remove('hidden');
+    const pct = Math.round(data.progress * 100);
+    document.getElementById('cal-prog-bar').style.width = pct + '%';
+    document.getElementById('cal-prog-text').textContent = pct + '%';
+    document.getElementById('cal-phase').textContent = data.phase || '—';
+    document.getElementById('cal-pattern').textContent = data.pattern_info || '—';
+    if (data.coverage_pct > 0) {
+      document.getElementById('cal-coverage').textContent = data.coverage_pct.toFixed(1) + '%';
+    }
+  }
+
+  // Show/hide start/stop buttons
+  if (isActive) {
+    document.getElementById('cal-start-btn').classList.add('hidden');
+    document.getElementById('cal-stop-btn').classList.remove('hidden');
+  } else if (!calPolling) {
+    document.getElementById('cal-start-btn').classList.remove('hidden');
+    document.getElementById('cal-stop-btn').classList.add('hidden');
+  }
+
+  // Errors
+  if (data.errors && data.errors.length > 0) {
+    document.getElementById('cal-errors').classList.remove('hidden');
+    document.getElementById('cal-error-text').textContent = data.errors.join('; ');
+  } else {
+    document.getElementById('cal-errors').classList.add('hidden');
+  }
+
+  // Done — show results
+  if (isComplete) {
+    if (!isActive) {
+      document.getElementById('cal-progress-wrap').classList.add('hidden');
+      document.getElementById('cal-start-btn').classList.remove('hidden');
+      document.getElementById('cal-stop-btn').classList.add('hidden');
+      calPolling = false;
+    }
+    document.getElementById('cal-results').classList.remove('hidden');
+    calResultFiles = data.files;
+    const meta = document.getElementById('cal-result-meta');
     let txt = '';
     if (data.timestamp) txt += new Date(data.timestamp).toLocaleString();
     if (data.coverage_pct > 0) txt += ' \u2014 ' + data.coverage_pct.toFixed(1) + '% coverage';
@@ -533,7 +660,7 @@ function updateCalib(data) {
 
     if (data.timestamp !== lastCalibTs) {
       lastCalibTs = data.timestamp;
-      const filesDiv = document.getElementById('result-files');
+      const filesDiv = document.getElementById('cal-files');
       filesDiv.innerHTML = '';
       data.files.forEach(name => {
         const row = document.createElement('div');
@@ -543,7 +670,7 @@ function updateCalib(data) {
           name.replace(/'/g, "\\'") + '\')">DL</button>';
         filesDiv.appendChild(row);
       });
-      const thumbDiv = document.getElementById('result-thumbs');
+      const thumbDiv = document.getElementById('cal-thumbs');
       thumbDiv.innerHTML = '';
       data.files.filter(n => n.endsWith('.png')).forEach(name => {
         const t = document.createElement('div');
@@ -553,17 +680,108 @@ function updateCalib(data) {
         thumbDiv.appendChild(t);
       });
     }
-  } else { results.classList.add('hidden'); }
+  } else {
+    document.getElementById('cal-results').classList.add('hidden');
+  }
 }
 
-async function calibPoll() {
+async function pollCalibrationStatus() {
   try {
     const data = await (await fetch('/calibration/status')).json();
-    updateCalib(data);
+    updateCalibUI(data);
+    // Sync projector resolution from config
+    if (!calPolling) {
+      try {
+        const cfg = await (await fetch('/config')).json();
+        if (cfg && cfg.width) {
+          document.getElementById('cal-proj-w').value = cfg.width;
+          document.getElementById('cal-proj-h').value = cfg.height;
+        }
+      } catch {}
+    }
   } catch {}
-  setTimeout(calibPoll, 5000);
+  setTimeout(pollCalibrationStatus, calPolling ? 1000 : 5000);
 }
-calibPoll();
+pollCalibrationStatus();
+
+// -- Intrinsics calibration --
+let intrPolling = false;
+
+function startIntrinsics() {
+  const pw = parseInt(document.getElementById('cal-proj-w').value) || 1920;
+  const ph = parseInt(document.getElementById('cal-proj-h').value) || 1080;
+  const sq = parseInt(document.getElementById('intr-square-px').value) || 0;
+  const body = { proj_w: pw, proj_h: ph };
+  if (sq > 0) body.square_px = sq;
+  fetch('/calibrate/intrinsics/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      document.getElementById('intr-start-btn').classList.add('hidden');
+      document.getElementById('intr-stop-btn').classList.remove('hidden');
+      document.getElementById('intr-progress-wrap').classList.remove('hidden');
+      document.getElementById('intr-results').classList.add('hidden');
+      document.getElementById('intr-errors').classList.add('hidden');
+      if (d.square_px) document.getElementById('intr-square-px').value = d.square_px;
+      intrPolling = true;
+      pollIntrinsicsStatus();
+    } else {
+      document.getElementById('intr-errors').classList.remove('hidden');
+      document.getElementById('intr-error-text').textContent = d.error || 'Failed to start';
+    }
+  }).catch(e => {
+    document.getElementById('intr-errors').classList.remove('hidden');
+    document.getElementById('intr-error-text').textContent = e.message;
+  });
+}
+
+function stopIntrinsics() {
+  fetch('/calibrate/intrinsics/stop', { method: 'POST' }).catch(() => {});
+  document.getElementById('intr-start-btn').classList.remove('hidden');
+  document.getElementById('intr-stop-btn').classList.add('hidden');
+  intrPolling = false;
+}
+
+async function pollIntrinsicsStatus() {
+  if (!intrPolling) return;
+  try {
+    const data = await (await fetch('/calibrate/intrinsics/status')).json();
+    if (data.active) {
+      document.getElementById('intr-progress-wrap').classList.remove('hidden');
+      const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
+      document.getElementById('intr-prog-bar').style.width = pct + '%';
+      document.getElementById('intr-prog-text').textContent = data.current + '/' + data.total;
+      document.getElementById('intr-position').textContent =
+        'Position ' + (data.current + 1) + '/' + data.total +
+        (data.label ? ' (' + data.label + ')' : '');
+      document.getElementById('intr-detection').textContent =
+        data.detected + ' detected, ' + data.skipped + ' skipped';
+    } else if (data.result) {
+      intrPolling = false;
+      document.getElementById('intr-start-btn').classList.remove('hidden');
+      document.getElementById('intr-stop-btn').classList.add('hidden');
+      document.getElementById('intr-progress-wrap').classList.add('hidden');
+      document.getElementById('intr-results').classList.remove('hidden');
+      const r = data.result;
+      let txt = 'Camera: fx=' + r.cam_fx.toFixed(1) + ' fy=' + r.cam_fy.toFixed(1) +
+                ' (err=' + r.cam_error.toFixed(3) + 'px)';
+      if (r.proj_fx) txt += '\nProjector: fx=' + r.proj_fx.toFixed(1) + ' fy=' + r.proj_fy.toFixed(1) +
+                ' (err=' + r.proj_error.toFixed(3) + 'px)';
+      document.getElementById('intr-result-text').textContent = txt;
+      document.getElementById('intr-result-text').style.whiteSpace = 'pre-line';
+    } else if (data.error) {
+      intrPolling = false;
+      document.getElementById('intr-start-btn').classList.remove('hidden');
+      document.getElementById('intr-stop-btn').classList.add('hidden');
+      document.getElementById('intr-progress-wrap').classList.add('hidden');
+      document.getElementById('intr-errors').classList.remove('hidden');
+      document.getElementById('intr-error-text').textContent = data.error;
+    }
+  } catch {}
+  if (intrPolling) setTimeout(pollIntrinsicsStatus, 1000);
+}
 
 // -- Upload --
 async function uploadCustom() {
@@ -586,7 +804,7 @@ async function uploadCustom() {
 
 // -- Transfer --
 function exportCalibration() {
-  const st = document.getElementById('transfer-status');
+  const st = document.getElementById('cal-transfer-status');
   st.textContent = 'Exporting...'; st.className = 'hint';
   fetch('/calibration/export').then(r => {
     if (!r.ok) throw new Error('No calibration');
@@ -600,8 +818,8 @@ function exportCalibration() {
 }
 
 async function importCalibration() {
-  const f = document.getElementById('import-file');
-  const st = document.getElementById('transfer-status');
+  const f = document.getElementById('cal-import-file');
+  const st = document.getElementById('cal-transfer-status');
   if (!f.files || !f.files[0]) return;
   st.textContent = 'Importing...'; st.className = 'hint';
   try {
