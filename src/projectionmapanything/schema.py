@@ -208,6 +208,20 @@ class ProMapAnythingConfig(BasePipelineConfig):
 
     # -- Calibration controls -------------------------------------------------
 
+    webrtc_projector: bool = Field(
+        default=False,
+        description=(
+            "Force the projector page to show Scope's WebRTC stream "
+            "directly, bypassing calibration patterns and MJPEG relay. "
+            "No postprocessor needed — raw AI output via WebRTC."
+        ),
+        json_schema_extra=ui_field_config(
+            order=0,
+            label="WebRTC Projector",
+            category="configuration",
+        ),
+    )
+
     start_calibration: bool = Field(
         default=False,
         description=(
@@ -217,7 +231,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "Toggle OFF to cancel."
         ),
         json_schema_extra=ui_field_config(
-            order=0,
+            order=1,
             label="Start Calibration",
             category="configuration",
         ),
@@ -230,7 +244,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "then toggle OFF. The next calibration will overwrite the file."
         ),
         json_schema_extra=ui_field_config(
-            order=1,
+            order=2,
             label="Reset Calibration",
             category="configuration",
         ),
@@ -246,7 +260,7 @@ class ProMapAnythingConfig(BasePipelineConfig):
             "frames, 2 captures — for local low-latency setups)."
         ),
         json_schema_extra=ui_field_config(
-            order=2,
+            order=3,
             label="Calibration Speed",
             category="configuration",
         ),
