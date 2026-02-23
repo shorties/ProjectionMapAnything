@@ -657,9 +657,10 @@ class ProMapAnythingPipeline(Pipeline):
         self._reset_armed = False
         self._ambient_frame: torch.Tensor | None = None
 
-        # Load calibration
+        # Load calibration (JSON sidecar or NPZ-only fallback)
         cal_path = _DEFAULT_CALIBRATION_PATH
-        if cal_path.is_file():
+        cal_npz = cal_path.with_suffix(".npz")
+        if cal_path.is_file() or cal_npz.is_file():
             mx, my, pw, ph, ts, disp = load_calibration(cal_path)
             self._map_x = mx
             self._map_y = my

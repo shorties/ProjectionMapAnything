@@ -6,7 +6,7 @@ projector pixels to camera pixels (map_x, map_y) usable with ``cv2.remap``.
 
 The decode pipeline (ported from standalone app):
 1. Multi-frame averaged captures for noise rejection
-2. Per-bit comparison (pos > neg) with ALL-bit reliability gating
+2. Per-bit comparison (pos > neg) with top-half MSB reliability gating
 3. Vectorized Gray-to-binary decode
 4. Morphological cleanup (close + open)
 5. Spatial consistency check (reject local outliers)
@@ -587,7 +587,7 @@ class CalibrationState:
 
         Pipeline (ported from standalone app's proven decode):
         1. Shadow mask from white-black reference
-        2. Decode each bit with ALL-bit reliability gating
+        2. Decode each bit with top-half MSB reliability gating
         3. Vectorized Gray-to-binary conversion
         4. Morphological cleanup (close + open)
         5. Spatial consistency check (reject local outliers)
@@ -654,6 +654,10 @@ class CalibrationState:
         decoded_x = np.zeros((h, w), dtype=np.int32)
         valid_x = shadow_mask.copy()
 
+        # Gate top half of bits for validity — coarse bits have high
+        # contrast even through MJPEG; fine LSBs are too noisy to gate on.
+        msb_gate_count_x = max(2, self.bits_x // 2)
+
         for capture_idx in range(self.bits_x):
             actual_bit = (self.bits_x - 1) - capture_idx  # MSB first
             pos_idx = base + capture_idx * 2
@@ -672,22 +676,25 @@ class CalibrationState:
             bit_val = (diff > 0).astype(np.int32)
             decoded_x |= bit_val << actual_bit
 
-            # ALL bits gate validity (standalone app method)
             abs_diff = np.abs(diff)
-            valid_x &= abs_diff > bt
+            if capture_idx < msb_gate_count_x:
+                valid_x &= abs_diff > bt
 
             if capture_idx < 3 or capture_idx == self.bits_x - 1:
                 logger.info(
                     "  X bit %d (capture %d): diff mean=%.1f, "
-                    "reliable(>%.1f)=%.1f%%",
+                    "reliable(>%.1f)=%.1f%%, gate=%s",
                     actual_bit, capture_idx, abs_diff.mean(), bt,
                     100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
+                    "yes" if capture_idx < msb_gate_count_x else "no",
                 )
 
         # -- Decode Y (row) Gray codes --------------------------------------
         base_y = base + self.bits_x * 2
         decoded_y = np.zeros((h, w), dtype=np.int32)
         valid_y = shadow_mask.copy()
+
+        msb_gate_count_y = max(2, self.bits_y // 2)
 
         for capture_idx in range(self.bits_y):
             actual_bit = (self.bits_y - 1) - capture_idx  # MSB first
@@ -708,14 +715,16 @@ class CalibrationState:
             decoded_y |= bit_val << actual_bit
 
             abs_diff = np.abs(diff)
-            valid_y &= abs_diff > bt
+            if capture_idx < msb_gate_count_y:
+                valid_y &= abs_diff > bt
 
             if capture_idx < 3 or capture_idx == self.bits_y - 1:
                 logger.info(
                     "  Y bit %d (capture %d): diff mean=%.1f, "
-                    "reliable(>%.1f)=%.1f%%",
+                    "reliable(>%.1f)=%.1f%%, gate=%s",
                     actual_bit, capture_idx, abs_diff.mean(), bt,
                     100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
+                    "yes" if capture_idx < msb_gate_count_y else "no",
                 )
 
         # -- Vectorized Gray-to-binary decode --------------------------------
@@ -1158,41 +1167,69 @@ def save_calibration(
 def load_calibration(
     path: str | Path,
 ) -> tuple[np.ndarray, np.ndarray, int, int, str, np.ndarray | None]:
-    """Load calibration mapping from JSON+NPZ or legacy JSON.
+    """Load calibration mapping from JSON+NPZ, NPZ-only, or legacy JSON.
 
     Returns (map_x, map_y, proj_w, proj_h, timestamp_iso, disparity_map).
     disparity_map may be None for older calibrations.
     """
     p = Path(path)
-    data = json.loads(p.read_text())
-    timestamp = data.get("timestamp", "unknown")
 
-    # New format (v2): metadata JSON + NPZ binary
-    if data.get("version", 1) >= 2:
-        npz_path = p.parent / data["npz_file"]
+    # Try JSON sidecar first
+    if p.is_file():
+        data = json.loads(p.read_text())
+        timestamp = data.get("timestamp", "unknown")
+
+        # New format (v2): metadata JSON + NPZ binary
+        if data.get("version", 1) >= 2:
+            npz_path = p.parent / data["npz_file"]
+            npz = np.load(npz_path)
+            disparity = (
+                npz["disparity"].astype(np.float32)
+                if "disparity" in npz.files
+                else None
+            )
+            return (
+                npz["map_x"].astype(np.float32),
+                npz["map_y"].astype(np.float32),
+                int(data["projector_width"]),
+                int(data["projector_height"]),
+                timestamp,
+                disparity,
+            )
+
+        # Legacy format (v1): arrays embedded in JSON
+        map_x = np.array(data["map_x"], dtype=np.float32)
+        map_y = np.array(data["map_y"], dtype=np.float32)
+        return (
+            map_x, map_y,
+            data["projector_width"], data["projector_height"],
+            timestamp, None,
+        )
+
+    # Fallback: NPZ-only (JSON sidecar missing)
+    npz_path = p.with_suffix(".npz")
+    if npz_path.is_file():
         npz = np.load(npz_path)
+        meta = npz["meta"]  # [proj_w, proj_h]
+        proj_w, proj_h = int(meta[0]), int(meta[1])
         disparity = (
             npz["disparity"].astype(np.float32)
             if "disparity" in npz.files
             else None
         )
+        logger.warning(
+            "Loaded calibration from NPZ only (JSON sidecar missing): %s",
+            npz_path,
+        )
         return (
             npz["map_x"].astype(np.float32),
             npz["map_y"].astype(np.float32),
-            int(data["projector_width"]),
-            int(data["projector_height"]),
-            timestamp,
+            proj_w, proj_h,
+            "unknown",
             disparity,
         )
 
-    # Legacy format (v1): arrays embedded in JSON
-    map_x = np.array(data["map_x"], dtype=np.float32)
-    map_y = np.array(data["map_y"], dtype=np.float32)
-    return (
-        map_x, map_y,
-        data["projector_width"], data["projector_height"],
-        timestamp, None,
-    )
+    raise FileNotFoundError(f"No calibration found at {p} or {npz_path}")
 
 
 def load_calibration_meta(path: str | Path) -> dict:
