@@ -185,11 +185,15 @@ function setRtcStatus(cls, text) {
 
 function updateLayers() {
   if (webrtcProjector) {
-    // WebRTC override: force WebRTC on top, hide calibration and MJPEG
+    // WebRTC override: force WebRTC on top, hide calibration and MJPEG entirely
     webrtcEl.style.zIndex = '10';
-    mjpegEl.style.zIndex = '1';
+    mjpegEl.style.display = 'none';
     calibCanvas.style.display = 'none';
-  } else if (calibActive) {
+    return;
+  }
+  // Normal mode: ensure MJPEG is visible
+  mjpegEl.style.display = '';
+  if (calibActive) {
     // Calibration: canvas on top (z-index 10), hide WebRTC/MJPEG battle
     mjpegEl.style.zIndex = '2';
     webrtcEl.style.zIndex = '1';
@@ -1564,6 +1568,8 @@ class FrameStreamer:
                     reason = "calibration_active"
                 elif streamer._overlay_active:
                     reason = "overlay_active"
+                elif streamer.webrtc_projector:
+                    reason = "webrtc_projector"
                 status = {
                     "running": streamer._running,
                     "calibration_active": streamer._calibration_active,
@@ -2137,6 +2143,8 @@ class FrameStreamer:
             else:
                 return
         if self._calibration_active:
+            return
+        if self.webrtc_projector:
             return
         # Skip encoding entirely when no one needs the frames:
         # no MJPEG stream clients AND dashboard preview is off.
