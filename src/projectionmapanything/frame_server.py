@@ -138,27 +138,50 @@ _PROJECTOR_HTML = """\
   }
   #restore.show { display: block; }
   #restore.fade { opacity: 0; transition: opacity 0.5s; }
+  #rtcStatus {
+    position: fixed; top: 8px; right: 8px; z-index: 20;
+    padding: 4px 10px; border-radius: 4px;
+    font: 11px/1.4 monospace; pointer-events: none;
+    transition: opacity 2s;
+  }
+  #rtcStatus.connected { background: rgba(0,180,0,0.7); color: #fff; }
+  #rtcStatus.connecting { background: rgba(200,150,0,0.7); color: #fff; }
+  #rtcStatus.failed { background: rgba(200,0,0,0.7); color: #fff; }
+  #rtcStatus.hide { opacity: 0; }
 </style>
 </head><body>
 <canvas id="calibCanvas"></canvas>
 <video id="webrtc" autoplay playsinline muted></video>
 <img id="mjpeg" src="/stream" />
 <div id="restore">Press F11 for fullscreen (persists during calibration)</div>
+<div id="rtcStatus" class="connecting">WebRTC...</div>
 
 <script>
 const webrtcEl = document.getElementById('webrtc');
 const mjpegEl = document.getElementById('mjpeg');
 const restoreBanner = document.getElementById('restore');
+const rtcStatusEl = document.getElementById('rtcStatus');
 
 // ---- Layer state ----
 let calibActive = false;
 let webrtcConnected = false;
 let pc = null;           // RTCPeerConnection
 let rtcRetryTimer = null;
+let rtcHideTimer = null;
+
+function setRtcStatus(cls, text) {
+  rtcStatusEl.className = cls;
+  rtcStatusEl.textContent = text;
+  clearTimeout(rtcHideTimer);
+  if (cls === 'connected') {
+    // Auto-hide after 4s when connected
+    rtcHideTimer = setTimeout(() => { rtcStatusEl.classList.add('hide'); }, 4000);
+  }
+}
 
 function updateLayers() {
   if (calibActive) {
-    // Calibration: MJPEG shows patterns on top
+    // Calibration: canvas on top (z-index 10), hide WebRTC/MJPEG battle
     mjpegEl.style.zIndex = '2';
     webrtcEl.style.zIndex = '1';
   } else if (webrtcConnected) {
@@ -177,12 +200,26 @@ async function connectWebRTC() {
   // Tear down previous connection
   if (pc) {
     pc.oniceconnectionstatechange = null;
+    pc.onicecandidate = null;
     pc.ontrack = null;
     pc.close();
     pc = null;
   }
   webrtcConnected = false;
   updateLayers();
+  setRtcStatus('connecting', 'WebRTC connecting...');
+
+  // Buffer ICE candidates until we have the session ID from the answer
+  let candidateBuffer = [];
+  let sessionId = null;
+
+  function sendCandidates(sid, candidates) {
+    fetch('/scope/ice/' + sid, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidates }),
+    }).catch(() => {});
+  }
 
   try {
     // 1. Get ICE servers
@@ -207,24 +244,44 @@ async function connectWebRTC() {
       }
     };
 
-    // 5. ICE connection state monitoring
+    // 5. ICE candidate handler — set BEFORE createOffer to catch all candidates.
+    //    Candidates are buffered until we get the sessionId from the answer.
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate) return;
+      const c = {
+        candidate: ev.candidate.candidate,
+        sdpMid: ev.candidate.sdpMid,
+        sdpMLineIndex: ev.candidate.sdpMLineIndex,
+      };
+      if (sessionId) {
+        sendCandidates(sessionId, [c]);
+      } else {
+        candidateBuffer.push(c);
+      }
+    };
+
+    // 6. ICE connection state monitoring
     pc.oniceconnectionstatechange = () => {
       const st = pc.iceConnectionState;
       if (st === 'connected' || st === 'completed') {
         webrtcConnected = true;
         updateLayers();
+        setRtcStatus('connected', 'WebRTC connected');
+      } else if (st === 'checking') {
+        setRtcStatus('connecting', 'WebRTC checking...');
       } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
         webrtcConnected = false;
         updateLayers();
+        setRtcStatus('failed', 'WebRTC ' + st + ' — retrying...');
         scheduleRTCRetry(3000);
       }
     };
 
-    // 6. Create offer
+    // 7. Create offer
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // 7. Send offer to Scope via our proxy
+    // 8. Send offer to Scope via our proxy
     const offerResp = await fetch('/scope/offer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -233,35 +290,25 @@ async function connectWebRTC() {
     if (!offerResp.ok) throw new Error('Offer: ' + offerResp.status);
     const answer = await offerResp.json();
 
-    // 8. Set remote description
+    // 9. Set remote description
     await pc.setRemoteDescription(new RTCSessionDescription({
       type: answer.type,
       sdp: answer.sdp,
     }));
 
-    // 9. Trickle ICE candidates
-    const sessionId = answer.sessionId;
-    if (sessionId) {
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-          fetch('/scope/ice/' + sessionId, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              candidates: [{
-                candidate: ev.candidate.candidate,
-                sdpMid: ev.candidate.sdpMid,
-                sdpMLineIndex: ev.candidate.sdpMLineIndex,
-              }],
-            }),
-          }).catch(() => {});
-        }
-      };
+    // 10. Flush buffered ICE candidates now that we have the session ID
+    sessionId = answer.sessionId;
+    if (sessionId && candidateBuffer.length > 0) {
+      sendCandidates(sessionId, candidateBuffer);
+      candidateBuffer = [];
     }
+
+    setRtcStatus('connecting', 'WebRTC negotiating...');
   } catch (err) {
     // Scope not running or network error — retry later
     webrtcConnected = false;
     updateLayers();
+    setRtcStatus('failed', 'WebRTC error: ' + err.message);
     scheduleRTCRetry(10000);
   }
 }
