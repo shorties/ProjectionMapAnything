@@ -922,12 +922,30 @@ class ProMapAnythingPipeline(Pipeline):
         near_clip: float,
         far_clip: float,
     ) -> torch.Tensor:
-        """Apply edge erosion, contrast, and depth clipping."""
-        if erosion <= 0 and abs(contrast - 1.0) < 0.01 and near_clip <= 0.0 and far_clip >= 1.0:
-            return rgb
+        """Apply auto-range, edge erosion, contrast, and depth clipping.
 
+        Auto-range stretches the depth values to fill [0, 1] using
+        percentile normalization (p2/p98).  This runs unconditionally
+        so that poorly-defined depth maps (narrow dynamic range) are
+        automatically improved without requiring manual contrast tuning.
+        """
         img = rgb.cpu().numpy()
         gray = img.mean(axis=-1)
+
+        # -- Auto-range: percentile stretch to fill [0, 1] ------------------
+        # Pixels near zero are background/holes — exclude from stats
+        fg = gray[gray > 0.01]
+        if fg.size > 100:
+            p2 = float(np.percentile(fg, 2))
+            p98 = float(np.percentile(fg, 98))
+            spread = p98 - p2
+            if spread < 0.5:
+                # Depth is poorly defined — stretch to full range
+                gray = np.where(
+                    gray > 0.01,
+                    ((gray - p2) / max(spread, 1e-6)).clip(0, 1),
+                    0.0,
+                )
 
         if near_clip > 0.0 or far_clip < 1.0:
             mask = (gray >= near_clip) & (gray <= far_clip)
