@@ -269,12 +269,22 @@ class CalibrationState:
         on a ``<canvas>`` at native pixel resolution — zero JPEG compression
         or CSS scaling artifacts.
 
+        Includes ``proj_w`` and ``proj_h`` so the canvas renders at exactly
+        the resolution the calibration expects (avoids mismatch with
+        client-reported screen resolution).
+
         Returns ``None`` when no pattern should be displayed (IDLE, DECODING, DONE).
         """
         if self.phase == CalibrationPhase.WHITE:
-            return {"type": "white", "brightness": self.max_brightness}
+            return {
+                "type": "white", "brightness": self.max_brightness,
+                "proj_w": self.proj_w, "proj_h": self.proj_h,
+            }
         if self.phase == CalibrationPhase.BLACK:
-            return {"type": "black"}
+            return {
+                "type": "black",
+                "proj_w": self.proj_w, "proj_h": self.proj_h,
+            }
         if self.phase == CalibrationPhase.PATTERNS:
             total_x = 2 * self.bits_x
             idx = self._pattern_index
@@ -285,6 +295,7 @@ class CalibrationState:
                 return {
                     "type": "graycode", "axis": 0, "bit": bit,
                     "inverted": inverted, "brightness": self.max_brightness,
+                    "proj_w": self.proj_w, "proj_h": self.proj_h,
                 }
             else:
                 y_idx = idx - total_x
@@ -294,6 +305,7 @@ class CalibrationState:
                 return {
                     "type": "graycode", "axis": 1, "bit": bit,
                     "inverted": inverted, "brightness": self.max_brightness,
+                    "proj_w": self.proj_w, "proj_h": self.proj_h,
                 }
         return None
 

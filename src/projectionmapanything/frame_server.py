@@ -1646,10 +1646,12 @@ class FrameStreamer:
                 """Return the current calibration pattern params for client-side canvas rendering."""
                 params = streamer._calibration_pattern_params
                 if params is not None:
-                    # Include projector resolution so the canvas knows what size to render
-                    cfg = streamer._client_config or {}
-                    proj_w = cfg.get("width", 1920)
-                    proj_h = cfg.get("height", 1080)
+                    # Use resolution from the CalibrationState (embedded in
+                    # params) to ensure the canvas renders at exactly the
+                    # resolution the calibration expects — avoids mismatch
+                    # with client-reported screen resolution.
+                    proj_w = params.get("proj_w", 1920)
+                    proj_h = params.get("proj_h", 1080)
                     data = {
                         "active": True,
                         "params": params,

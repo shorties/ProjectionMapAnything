@@ -959,15 +959,17 @@ class ProMapAnythingPipeline(Pipeline):
         gray = img.mean(axis=-1)
 
         # -- Auto-range: always percentile stretch to fill [0, 1] ----------
-        # Pixels near zero are background/holes — exclude from stats
-        fg = gray[gray > 0.01]
+        # Use a very small epsilon to exclude truly-zero pixels (void/border)
+        # while keeping legitimate dark depth values (near-zero but non-zero).
+        eps = 1e-4
+        fg = gray[gray > eps]
         if fg.size > 100:
             p2 = float(np.percentile(fg, 2))
             p98 = float(np.percentile(fg, 98))
             spread = p98 - p2
             if spread > 1e-6:
                 gray = np.where(
-                    gray > 0.01,
+                    gray > eps,
                     ((gray - p2) / spread).clip(0, 1),
                     0.0,
                 )
@@ -1604,7 +1606,7 @@ class ProMapAnythingPipeline(Pipeline):
         if valid is not None:
             fg = depth[valid]
         else:
-            fg = depth[depth > 0.01]
+            fg = depth[depth > 1e-4]
         if fg.size > 100:
             p2 = float(np.percentile(fg, 2))
             p98 = float(np.percentile(fg, 98))
@@ -1990,15 +1992,10 @@ class ProMapAnythingPipeline(Pipeline):
     def _warp_to_projector(self, depth_np: np.ndarray) -> np.ndarray:
         """Warp a camera-space depth map to projector space via calibration.
 
-        Uses the same cv2.remap approach as the warped camera RGB (which is
-        known to work correctly from publish_calibration_results).
-
-        Pipeline:
-        1. Convert depth to uint8 BGR (same format as camera RGB warp)
-        2. cv2.remap with borderValue=0 (matching the RGB warp)
-        3. Detect holes (all-black pixels + invalid mask)
-        4. Inpaint holes with Navier-Stokes method
-        5. Convert back to float32
+        Remaps the camera-space depth using the correspondence maps (map_x,
+        map_y).  Holes are detected via a reference remap of an all-ones
+        image — NOT by checking for value==0, which would conflate legitimate
+        far/dark depth with unmapped pixels.
 
         Parameters
         ----------
@@ -2012,38 +2009,45 @@ class ProMapAnythingPipeline(Pipeline):
         """
         cam_h, cam_w = depth_np.shape[:2]
 
-        # Step 1: Convert to uint8 BGR — same pipeline as warped camera RGB
-        depth_u8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
-        depth_bgr = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2BGR)
-
-        # Step 2: cv2.remap with borderValue=0 — same as publish_calibration_results
-        warped_bgr = cv2.remap(
-            depth_bgr, self._map_x, self._map_y,
+        # Remap depth directly as float32 (no lossy uint8 round-trip)
+        warped = cv2.remap(
+            depth_np, self._map_x, self._map_y,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+            borderValue=0.0,
         )
 
-        # Step 3: Detect holes — unmapped regions + invalid calibration pixels
-        holes = np.all(warped_bgr == 0, axis=2)
+        # Detect holes using a reference remap of an all-ones image.
+        # Pixels that map outside the camera frame get 0 from borderValue;
+        # pixels inside get ~1.0.  This avoids conflating depth=0 (far/dark)
+        # with unmapped pixels — the old approach treated both as holes.
+        ref = np.ones((cam_h, cam_w), dtype=np.float32)
+        ref_warped = cv2.remap(
+            ref, self._map_x, self._map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        holes = ref_warped < 0.5
+
+        # Also mark invalid calibration pixels as holes
         if self._proj_valid_mask is not None:
             holes = holes | ~self._proj_valid_mask
 
-        # Step 4: Inpaint holes
-        if np.any(holes):
+        # Inpaint holes (convert to uint8 for cv2.inpaint)
+        n_holes = int(np.count_nonzero(holes))
+        if n_holes > 0:
+            warped_u8 = (warped * 255).clip(0, 255).astype(np.uint8)
             hole_u8 = holes.astype(np.uint8) * 255
-            warped_bgr = cv2.inpaint(warped_bgr, hole_u8, 15, cv2.INPAINT_NS)
-
-        # Step 5: Convert back to float32 grayscale
-        warped_gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-        warped = warped_gray.astype(np.float32) / 255.0
+            warped_u8 = cv2.inpaint(warped_u8, hole_u8, 15, cv2.INPAINT_NS)
+            warped = warped_u8.astype(np.float32) / 255.0
 
         logger.info(
             "Depth warped to projector %dx%d (from camera %dx%d), "
             "range [%.3f, %.3f], holes=%.1f%%",
             warped.shape[1], warped.shape[0], cam_w, cam_h,
             warped.min(), warped.max(),
-            100.0 * np.count_nonzero(holes) / max(holes.size, 1),
+            100.0 * n_holes / max(holes.size, 1),
         )
         return warped
 
@@ -2100,15 +2104,18 @@ class ProMapAnythingPipeline(Pipeline):
                 depth_np.shape[1], depth_np.shape[0],
             )
 
-        # Auto-range: percentile stretch to fill [0, 1] before CLAHE
-        fg = depth_np[depth_np > 0.01]
+        # Auto-range: percentile stretch to fill [0, 1] before CLAHE.
+        # Use a tiny epsilon to exclude truly-zero void pixels while keeping
+        # legitimate dark depth values (far surfaces near zero).
+        eps = 1e-4
+        fg = depth_np[depth_np > eps]
         if fg.size > 100:
             p2 = float(np.percentile(fg, 2))
             p98 = float(np.percentile(fg, 98))
             spread = p98 - p2
             if spread > 1e-6:
                 depth_np = np.where(
-                    depth_np > 0.01,
+                    depth_np > eps,
                     ((depth_np - p2) / spread).clip(0, 1),
                     0.0,
                 ).astype(np.float32)
