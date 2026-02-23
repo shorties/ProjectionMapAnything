@@ -133,7 +133,8 @@ class CalibrationState:
         max_brightness: int = 255,
         change_threshold: float = 5.0,
         stability_threshold: float = 3.0,
-        bit_threshold: float = 10.0,
+        bit_threshold: float = 5.0,
+        shadow_threshold: float = 40.0,
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
@@ -143,6 +144,7 @@ class CalibrationState:
         self.change_threshold = change_threshold
         self.stability_threshold = stability_threshold
         self.bit_threshold = bit_threshold
+        self.shadow_threshold = shadow_threshold
 
         # Gray code bit counts
         self.bits_x = _num_bits(proj_w)
@@ -188,10 +190,10 @@ class CalibrationState:
 
         logger.info(
             "CalibrationState: %dx%d, %d patterns (%d bits_x, %d bits_y), "
-            "settle=%d (timeout), capture=%d",
+            "settle=%d (timeout), capture=%d, bit_thresh=%.1f, shadow_thresh=%.1f",
             proj_w, proj_h, self.total_patterns,
             self.bits_x, self.bits_y,
-            settle_frames, capture_frames,
+            settle_frames, capture_frames, bit_threshold, shadow_threshold,
         )
 
     # -- Public API -----------------------------------------------------------
@@ -510,16 +512,17 @@ class CalibrationState:
     def _decode(self) -> None:
         """Decode captured Gray code patterns into a camera->projector mapping.
 
-        RoomAlive-informed pipeline:
-        1. Decode each bit: compare positive vs inverted pattern
-        2. Per-bit reliability threshold (|pos - neg| > bit_threshold)
-        3. Only MSB bits (i < nBits - 4) affect validity mask (LSBs too noisy)
-        4. Vectorized Gray-to-binary conversion
-        5. Explicit boundary validation (decoded values in range)
-        6. Confidence-weighted accumulation into projector-space maps
-        7. Light median filter (3x3) for noise
-        8. Inpaint remaining holes
-        9. Compute disparity map (cam_x - proj_x)
+        Pipeline (informed by OpenCV structured_light + RoomAlive):
+        1. Shadow mask from white-black reference (OpenCV blackThreshold)
+        2. Decode each bit: compare positive vs inverted pattern
+        3. Per-bit reliability threshold (OpenCV whiteThreshold)
+        4. Only top MSB bits gate validity (RoomAlive: LSBs too noisy)
+        5. Vectorized Gray-to-binary conversion
+        6. Explicit boundary validation (decoded values in projector range)
+        7. Confidence-weighted accumulation into projector-space maps
+        8. Light median filter (3x3) for noise
+        9. Inpaint remaining holes
+        10. Compute disparity map (cam_x - proj_x)
         """
         white_f = self._get_averaged(0)
         ref_shape = white_f.shape[:2]
@@ -527,11 +530,13 @@ class CalibrationState:
 
         h, w = ref_shape
         bt = self.bit_threshold
+        st = self.shadow_threshold
 
         logger.info(
             "Decode: camera %dx%d, projector %dx%d, %d+%d bits, "
-            "bit_threshold=%.1f",
-            w, h, self.proj_w, self.proj_h, self.bits_x, self.bits_y, bt,
+            "bit_threshold=%.1f, shadow_threshold=%.1f",
+            w, h, self.proj_w, self.proj_h,
+            self.bits_x, self.bits_y, bt, st,
         )
         logger.info(
             "  WHITE ref: min=%.1f max=%.1f mean=%.1f",
@@ -542,16 +547,40 @@ class CalibrationState:
             black_f.min(), black_f.max(), black_f.mean(),
         )
 
-        # -- Decode X (column) Gray codes with per-bit reliability -----------
+        # -- Shadow mask (OpenCV convention) ---------------------------------
+        # Pixels where white-black > shadow_threshold are illuminated by the
+        # projector. Everything else is in shadow or outside coverage.
+        # This is the critical first filter — without it, noise pixels
+        # decode to random projector coordinates and pollute the maps.
+        shadow_mask = (white_f - black_f) > st
+        n_shadow = int(np.count_nonzero(shadow_mask))
+        logger.info(
+            "  Shadow mask: %d/%d pixels illuminated (%.1f%%) "
+            "[shadow_threshold=%.1f, white-black range: %.1f..%.1f]",
+            n_shadow, h * w, 100.0 * n_shadow / max(h * w, 1),
+            st, (white_f - black_f).min(), (white_f - black_f).max(),
+        )
+
+        if n_shadow == 0:
+            logger.error(
+                "  ZERO illuminated pixels! The camera may not be seeing "
+                "the projector patterns. Check: (1) projector is on and "
+                "visible to camera, (2) camera feed is working, "
+                "(3) calibration_brightness is high enough. "
+                "white mean=%.1f, black mean=%.1f, diff mean=%.1f",
+                white_f.mean(), black_f.mean(), (white_f - black_f).mean(),
+            )
+
+        # -- Decode X (column) Gray codes -----------------------------------
         base = 2  # skip white + black
         decoded_x = np.zeros((h, w), dtype=np.int32)
-        valid_x = np.ones((h, w), dtype=bool)
+        valid_x = shadow_mask.copy()  # start from shadow mask
         conf_x = np.zeros((h, w), dtype=np.float32)
 
-        # RoomAlive insight: only update validity mask for higher-order bits.
-        # LSBs (last 4 bits) are inherently noisy and shouldn't invalidate
-        # pixels that decoded correctly on the important coarse bits.
-        msb_cutoff_x = max(0, self.bits_x - 4)
+        # Only the top 2 MSB bits gate validity — these are the coarsest
+        # stripes with the highest contrast. Finer bits are too noisy to
+        # use as a validity gate (especially through webcam/MJPEG compression).
+        msb_gate_count_x = min(2, self.bits_x)
 
         for capture_idx in range(self.bits_x):
             actual_bit = (self.bits_x - 1) - capture_idx  # MSB first
@@ -571,30 +600,31 @@ class CalibrationState:
             bit_val = (diff > 0).astype(np.int32)
             decoded_x |= bit_val << actual_bit
 
-            # Per-bit reliability
+            # Per-bit reliability (OpenCV whiteThreshold equivalent)
             abs_diff = np.abs(diff)
-            bit_reliable = abs_diff > bt
             conf_x += abs_diff
 
-            # Only MSB bits affect validity (RoomAlive: i < nBits - 4)
-            if capture_idx < msb_cutoff_x:
+            # Only the top N MSB bits gate validity
+            if capture_idx < msb_gate_count_x:
+                bit_reliable = abs_diff > bt
                 valid_x &= bit_reliable
 
-            logger.info(
-                "  X bit %d (capture %d): diff mean=%.1f, "
-                "reliable=%.1f%%, msb_gate=%s",
-                actual_bit, capture_idx, abs_diff.mean(),
-                100.0 * np.count_nonzero(bit_reliable) / max(h * w, 1),
-                "yes" if capture_idx < msb_cutoff_x else "no (LSB)",
-            )
+            if capture_idx < 3 or capture_idx == self.bits_x - 1:
+                logger.info(
+                    "  X bit %d (capture %d): diff mean=%.1f, "
+                    "reliable(>%.1f)=%.1f%%, gate=%s",
+                    actual_bit, capture_idx, abs_diff.mean(), bt,
+                    100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
+                    "yes" if capture_idx < msb_gate_count_x else "no",
+                )
 
-        # -- Decode Y (row) Gray codes with per-bit reliability --------------
+        # -- Decode Y (row) Gray codes --------------------------------------
         base_y = base + self.bits_x * 2
         decoded_y = np.zeros((h, w), dtype=np.int32)
-        valid_y = np.ones((h, w), dtype=bool)
+        valid_y = shadow_mask.copy()  # start from shadow mask
         conf_y = np.zeros((h, w), dtype=np.float32)
 
-        msb_cutoff_y = max(0, self.bits_y - 4)
+        msb_gate_count_y = min(2, self.bits_y)
 
         for capture_idx in range(self.bits_y):
             actual_bit = (self.bits_y - 1) - capture_idx  # MSB first
@@ -615,19 +645,20 @@ class CalibrationState:
             decoded_y |= bit_val << actual_bit
 
             abs_diff = np.abs(diff)
-            bit_reliable = abs_diff > bt
             conf_y += abs_diff
 
-            if capture_idx < msb_cutoff_y:
+            if capture_idx < msb_gate_count_y:
+                bit_reliable = abs_diff > bt
                 valid_y &= bit_reliable
 
-            logger.info(
-                "  Y bit %d (capture %d): diff mean=%.1f, "
-                "reliable=%.1f%%, msb_gate=%s",
-                actual_bit, capture_idx, abs_diff.mean(),
-                100.0 * np.count_nonzero(bit_reliable) / max(h * w, 1),
-                "yes" if capture_idx < msb_cutoff_y else "no (LSB)",
-            )
+            if capture_idx < 3 or capture_idx == self.bits_y - 1:
+                logger.info(
+                    "  Y bit %d (capture %d): diff mean=%.1f, "
+                    "reliable(>%.1f)=%.1f%%, gate=%s",
+                    actual_bit, capture_idx, abs_diff.mean(), bt,
+                    100.0 * np.count_nonzero(abs_diff > bt) / max(h * w, 1),
+                    "yes" if capture_idx < msb_gate_count_y else "no",
+                )
 
         # -- Vectorized Gray-to-binary decode --------------------------------
         binary_x = decoded_x.copy()
@@ -644,7 +675,7 @@ class CalibrationState:
             shift >>= 1
         decoded_y = binary_y
 
-        # -- Filter by per-bit reliability + explicit bounds -----------------
+        # -- Combine shadow mask + per-bit reliability + bounds ---------------
         valid_mask = (
             valid_x
             & valid_y
@@ -653,10 +684,16 @@ class CalibrationState:
         )
         n_valid = int(np.count_nonzero(valid_mask))
         logger.info(
-            "  Valid pixels after per-bit reliability filter: %d/%d (%.1f%%) "
-            "[bit_threshold=%.1f, msb_cutoff_x=%d, msb_cutoff_y=%d]",
+            "  Shadow mask: %d, valid_x: %d, valid_y: %d, "
+            "in-bounds: %d, final valid: %d/%d (%.1f%%)",
+            n_shadow,
+            int(np.count_nonzero(valid_x)),
+            int(np.count_nonzero(valid_y)),
+            int(np.count_nonzero(
+                (decoded_x >= 0) & (decoded_x < self.proj_w)
+                & (decoded_y >= 0) & (decoded_y < self.proj_h)
+            )),
             n_valid, h * w, 100.0 * n_valid / max(h * w, 1),
-            bt, msb_cutoff_x, msb_cutoff_y,
         )
 
         # -- Weighted accumulation into projector-space maps -----------------
