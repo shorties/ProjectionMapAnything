@@ -129,6 +129,7 @@ class CalibrationState:
         proj_h: int,
         *,
         settle_frames: int = 60,
+        settle_timeout_sec: float = 15.0,
         capture_frames: int = 3,
         max_brightness: int = 255,
         change_threshold: float = 5.0,
@@ -138,7 +139,8 @@ class CalibrationState:
     ):
         self.proj_w = proj_w
         self.proj_h = proj_h
-        self.settle_frames = settle_frames  # timeout fallback only
+        self.settle_frames = settle_frames  # frame-count fallback
+        self.settle_timeout_sec = settle_timeout_sec  # primary time-based timeout
         self.capture_frames = max(1, capture_frames)
         self.max_brightness = max(10, min(255, max_brightness))
         self.change_threshold = change_threshold
@@ -190,10 +192,12 @@ class CalibrationState:
 
         logger.info(
             "CalibrationState: %dx%d, %d patterns (%d bits_x, %d bits_y), "
-            "settle=%d (timeout), capture=%d, bit_thresh=%.1f, shadow_thresh=%.1f",
+            "settle_timeout=%.0fs (frame_fallback=%d), capture=%d, "
+            "bit_thresh=%.1f, shadow_thresh=%.1f",
             proj_w, proj_h, self.total_patterns,
             self.bits_x, self.bits_y,
-            settle_frames, capture_frames, bit_threshold, shadow_threshold,
+            settle_timeout_sec, settle_frames, capture_frames,
+            bit_threshold, shadow_threshold,
         )
 
     # -- Public API -----------------------------------------------------------
@@ -308,18 +312,28 @@ class CalibrationState:
                     )
                     return self._current_pattern(device)
 
-                # Timeout: no change detected after max settle frames
-                if self._settle_counter >= self.settle_frames:
+                # Timeout: time-based primary, frame-count fallback.
+                # CRITICAL: on timeout, SKIP the pattern — do NOT capture
+                # garbage.  On high-latency setups (RunPod MJPEG) the
+                # camera may still show the PREVIOUS pattern, so capturing
+                # would poison the decode.
+                timed_out = (
+                    elapsed >= self.settle_timeout_sec
+                    or self._settle_counter >= self.settle_frames
+                )
+                if timed_out:
                     logger.warning(
                         "Settle timeout: %d frames / %.1fs — no change "
-                        "detected (diff=%.1f)",
+                        "detected (diff=%.1f). SKIPPING pattern — camera "
+                        "may not see projector.",
                         self._settle_counter, elapsed, structural_diff,
                     )
                     self._waiting_for_settle = False
-                    self._frame_count = 0
-                else:
-                    self._prev_settle_frame = gray_f.copy()
-                    return self._current_pattern(device)
+                    # Skip this pattern entirely — advance without capturing
+                    return self._advance_to_next_pattern(device)
+
+                self._prev_settle_frame = gray_f.copy()
+                return self._current_pattern(device)
             else:
                 # Phase 2: change detected, wait for stability
                 frame_diff = float(
@@ -367,6 +381,18 @@ class CalibrationState:
             return self._current_pattern(device)
 
         # -- Advance to next pattern ------------------------------------------
+        return self._advance_to_next_pattern(device)
+
+    # -- Internal helpers -----------------------------------------------------
+
+    def _advance_to_next_pattern(
+        self, device: torch.device,
+    ) -> torch.Tensor | None:
+        """Advance the calibration to the next pattern phase.
+
+        Handles WHITE → BLACK → PATTERNS → DECODING transitions.
+        Returns the next pattern tensor, or None if entering DECODING.
+        """
         if self.phase == CalibrationPhase.WHITE:
             self.phase = CalibrationPhase.BLACK
             self._begin_settle()
@@ -387,8 +413,6 @@ class CalibrationState:
             return self._current_pattern(device)
 
         return None
-
-    # -- Internal helpers -----------------------------------------------------
 
     def _begin_settle(self) -> None:
         """Reset change-detection settle state for the next pattern."""
@@ -524,6 +548,16 @@ class CalibrationState:
         9. Inpaint remaining holes
         10. Compute disparity map (cam_x - proj_x)
         """
+        # Guard: white and black references are required for shadow mask.
+        # If either was skipped (settle timeout), calibration cannot proceed.
+        if not self._captures[0] or not self._captures[1]:
+            logger.error(
+                "Missing white/black reference captures (white=%d, black=%d). "
+                "Calibration aborted — camera may not see projector patterns.",
+                len(self._captures[0]), len(self._captures[1]),
+            )
+            return
+
         white_f = self._get_averaged(0)
         ref_shape = white_f.shape[:2]
         black_f = self._get_averaged(1, target_shape=ref_shape)

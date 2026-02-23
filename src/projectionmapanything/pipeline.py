@@ -399,6 +399,7 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             self._calib = CalibrationState(
                 self.proj_w, self.proj_h,
                 settle_frames=self._settle_frames,
+                settle_timeout_sec=15.0,
                 capture_frames=self._capture_frames,
                 max_brightness=self._cal_brightness,
             )
@@ -530,7 +531,11 @@ class ProMapAnythingCalibratePipeline(Pipeline):
         pattern_info = self._calib.get_pattern_info()
 
         if self._calib._waiting_for_settle:
-            pattern_info += f" settling {self._calib._settle_counter}/{self._calib.settle_frames}"
+            settle_elapsed = _time.monotonic() - self._calib._settle_start_time
+            pattern_info += (
+                f" settling {settle_elapsed:.0f}s"
+                f"/{self._calib.settle_timeout_sec:.0f}s"
+            )
 
         self._streamer.update_calibration_progress(progress, phase, pattern_info)
 
@@ -1248,7 +1253,11 @@ class ProMapAnythingPipeline(Pipeline):
         # 0.85 = default (1 capture per pattern)
         # 1.0 = local fast (1 capture per pattern)
         cal_speed = float(self._p("calibration_speed", kwargs, 0.85))
-        settle_frames = 60  # timeout only — change detection exits much earlier
+        # settle_timeout_sec is the primary timeout (time-based).
+        # On timeout the pattern is SKIPPED (not captured with garbage).
+        # Remote/RunPod needs long timeout due to MJPEG round-trip latency.
+        settle_timeout_sec = 30.0 if cal_speed < 0.5 else 15.0
+        settle_frames = 300 if cal_speed < 0.5 else 120  # frame-count fallback
         capture_frames = 3 if cal_speed < 0.5 else 2
         # Noise thresholds: tighter at slow speed for accuracy, relaxed at fast
         change_threshold = 5.0 if cal_speed < 0.5 else 5.0
@@ -1273,6 +1282,7 @@ class ProMapAnythingPipeline(Pipeline):
             self._calib = CalibrationState(
                 self.proj_w, self.proj_h,
                 settle_frames=settle_frames,
+                settle_timeout_sec=settle_timeout_sec,
                 capture_frames=capture_frames,
                 max_brightness=cal_brightness,
                 change_threshold=change_threshold,
@@ -1285,9 +1295,9 @@ class ProMapAnythingPipeline(Pipeline):
                 self._streamer.clear_calibration_results()
             logger.info(
                 "Inline calibration started (Gray code, %d patterns, %dx%d, "
-                "speed=%.1f, capture=%d)",
+                "speed=%.1f, capture=%d, settle_timeout=%.0fs)",
                 self._calib.total_patterns, self.proj_w, self.proj_h,
-                cal_speed, capture_frames,
+                cal_speed, capture_frames, settle_timeout_sec,
             )
 
         # -- Step calibration -----------------------------------------------
@@ -1299,6 +1309,14 @@ class ProMapAnythingPipeline(Pipeline):
                 phase = self._calib.phase.name
                 progress = self._calib.progress
                 pattern_info = self._calib.get_pattern_info()
+                if self._calib._waiting_for_settle:
+                    settle_elapsed = (
+                        _time.monotonic() - self._calib._settle_start_time
+                    )
+                    pattern_info += (
+                        f" settling {settle_elapsed:.0f}s"
+                        f"/{self._calib.settle_timeout_sec:.0f}s"
+                    )
                 self._streamer.update_calibration_progress(
                     progress, phase, pattern_info,
                 )
