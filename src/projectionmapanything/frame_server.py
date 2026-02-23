@@ -136,7 +136,7 @@ _PROJECTOR_HTML = """\
 </head><body>
 <video id="webrtc" autoplay playsinline muted></video>
 <img id="mjpeg" src="/stream" />
-<div id="restore">Click or press any key to restore fullscreen</div>
+<div id="restore">Press F11 for fullscreen (persists during calibration)</div>
 
 <script>
 const webrtcEl = document.getElementById('webrtc');
@@ -282,7 +282,9 @@ setInterval(pollCalibration, 1000);
 pollCalibration();
 
 // ---- Fullscreen state tracking ----
-let wasFullscreen = false;
+// Two fullscreen modes: API fullscreen (requestFullscreen) exits on focus
+// loss, F11 fullscreen (browser chrome) persists. We prefer F11 for
+// calibration since the dashboard steals focus.
 let fadeTimer = null;
 
 function goFullscreen() {
@@ -293,7 +295,7 @@ function showBanner() {
   restoreBanner.classList.add('show');
   restoreBanner.classList.remove('fade');
   clearTimeout(fadeTimer);
-  fadeTimer = setTimeout(() => { restoreBanner.classList.add('fade'); }, 4000);
+  fadeTimer = setTimeout(() => { restoreBanner.classList.add('fade'); }, 6000);
 }
 
 function hideBanner() {
@@ -316,55 +318,21 @@ function updateFSClass() {
 
 // ---- Fullscreen change tracking ----
 document.addEventListener('fullscreenchange', () => {
-  const isFS = !!document.fullscreenElement;
   updateFSClass();
-  if (isFS) {
-    wasFullscreen = true;
-    hideBanner();
-  } else if (wasFullscreen) {
-    if (!isWindowFullscreen()) showBanner();
-  }
   setTimeout(postConfig, 300);
 });
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    wasFullscreen = false;
-    hideBanner();
-  }
-});
-
-// ---- Restore fullscreen on user activation ----
-function tryRestore(e) {
-  if (wasFullscreen && !document.fullscreenElement) {
-    goFullscreen();
-  }
-}
-document.addEventListener('click', tryRestore);
-document.addEventListener('keydown', tryRestore);
-document.addEventListener('pointerdown', tryRestore);
-document.addEventListener('touchstart', tryRestore);
-
+// Click toggles API fullscreen (for initial setup / non-calibration use)
 document.body.addEventListener('click', () => {
-  if (!document.fullscreenElement) goFullscreen();
-});
-
-window.addEventListener('focus', () => {
-  updateFSClass();
-  if (wasFullscreen && !document.fullscreenElement && !isWindowFullscreen()) {
+  if (!document.fullscreenElement && !isWindowFullscreen()) {
     goFullscreen();
-    showBanner();
   }
 });
 
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) {
-    updateFSClass();
-    if (wasFullscreen && !document.fullscreenElement && !isWindowFullscreen()) {
-      goFullscreen();
-      showBanner();
-    }
-  }
+// Track F11 fullscreen via resize
+window.addEventListener('resize', () => {
+  updateFSClass();
+  setTimeout(postConfig, 500);
 });
 
 setInterval(updateFSClass, 2000);
@@ -379,8 +347,11 @@ function postConfig() {
   const apiFS = !!document.fullscreenElement;
   const windowFS = isWindowFullscreen();
   const isFS = apiFS || windowFS;
-  const w = isFS ? screen.width : window.innerWidth;
-  const h = isFS ? screen.height : window.innerHeight;
+  // Always use window inner size — works for both F11 and API fullscreen.
+  // For API fullscreen, innerWidth/Height = screen size. For F11, same.
+  // For windowed, reports actual window size.
+  const w = window.innerWidth;
+  const h = window.innerHeight;
   fetch('/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -389,10 +360,6 @@ function postConfig() {
 }
 postConfig();
 setInterval(postConfig, 30000);
-window.addEventListener('resize', () => {
-  updateFSClass();
-  setTimeout(postConfig, 500);
-});
 </script>
 </body></html>
 """
@@ -532,6 +499,11 @@ class FrameStreamer:
 
         # Calibration priority: when True, submit_frame() is suppressed
         self._calibration_active = False
+
+        # Overlay mode: project a static image (coverage map, etc.)
+        # When True, submit_frame() is suppressed (like calibration_active).
+        # Only cleared by POST /api/project-overlay {image: "off"}.
+        self._overlay_active = False
 
         # Calibration results for download
         self._calibration_files: dict[str, bytes] = {}
@@ -1188,6 +1160,8 @@ class FrameStreamer:
                     self_handler._handle_intrinsics_stop()
                 elif path == "/api/params":
                     self_handler._handle_post_params()
+                elif path == "/api/project-overlay":
+                    self_handler._handle_project_overlay()
                 elif path == "/scope/offer":
                     self_handler._handle_scope_proxy_post("/api/v1/webrtc/offer")
                 else:
@@ -1339,6 +1313,54 @@ class FrameStreamer:
                     else:
                         streamer._param_overrides[k] = v
                 body = json.dumps({"ok": True, "params": streamer._param_overrides}).encode()
+                self_handler.send_response(200)
+                self_handler.send_header("Content-Type", "application/json")
+                self_handler.send_header("Content-Length", str(len(body)))
+                self_handler.send_header("Access-Control-Allow-Origin", "*")
+                self_handler.end_headers()
+                self_handler.wfile.write(body)
+
+            def _handle_project_overlay(self_handler) -> None:  # noqa: N805
+                """Project an overlay image on the projector stream.
+
+                POST body: ``{"image": "coverage_map"}`` or ``{"image": "off"}``
+                Loads the named PNG from ~/.projectionmapanything_results/
+                and pushes it as a calibration frame (bypasses normal stream).
+                """
+                length = int(self_handler.headers.get("Content-Length", 0))
+                raw = self_handler.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+                image_name = data.get("image", "off")
+
+                if image_name == "off":
+                    # Stop overlay so normal frames resume on the projector.
+                    streamer._overlay_active = False
+                    body = json.dumps({"ok": True, "overlay": "off"}).encode()
+                else:
+                    # Map short names to filenames
+                    name_map = {
+                        "coverage_map": "coverage_map.png",
+                        "warped_camera": "warped_camera.png",
+                        "depth_disparity": "depth_disparity.png",
+                    }
+                    filename = name_map.get(image_name, image_name)
+                    img_path = _RESULTS_DIR / filename
+                    if img_path.is_file():
+                        img = cv2.imread(str(img_path))
+                        if img is not None:
+                            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            # Use submit_calibration_frame to bypass suppression
+                            streamer.submit_calibration_frame(rgb)
+                            streamer._overlay_active = True
+                            body = json.dumps({"ok": True, "overlay": image_name}).encode()
+                        else:
+                            body = json.dumps({"ok": False, "error": "Failed to read image"}).encode()
+                    else:
+                        body = json.dumps({"ok": False, "error": f"File not found: {filename}"}).encode()
+
                 self_handler.send_response(200)
                 self_handler.send_header("Content-Type", "application/json")
                 self_handler.send_header("Content-Length", str(len(body)))
@@ -1755,7 +1777,7 @@ class FrameStreamer:
 
         Thread-safe — may be called from any thread.
         """
-        if not self._running or self._calibration_active:
+        if not self._running or self._calibration_active or self._overlay_active:
             return
         # Skip encoding entirely when no one needs the frames:
         # no MJPEG stream clients AND dashboard preview is off.

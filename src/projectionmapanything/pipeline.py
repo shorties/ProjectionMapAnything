@@ -320,14 +320,22 @@ class ProMapAnythingCalibratePipeline(Pipeline):
             # Return test card as fallback so pipeline doesn't go silent
             return {"video": self._test_card.unsqueeze(0).clamp(0, 1)}
 
+    def _p(self, key: str, kwargs: dict, default=None):
+        """Read a parameter: dashboard override > Scope kwargs > default."""
+        if self._streamer is not None:
+            ov = self._streamer._param_overrides.get(key)
+            if ov is not None:
+                return ov
+        return kwargs.get(key, default)
+
     def _call_inner(self, **kwargs) -> dict:
         video = kwargs.get("video")
         if video is None:
             raise ValueError("Calibration pipeline requires video input")
 
         frame = video[0]  # (1, H, W, C) [0, 255]
-        start = kwargs.get("start_calibration", False)
-        reset = kwargs.get("reset_calibration", False)
+        start = self._p("start_calibration", kwargs, False)
+        reset = self._p("reset_calibration", kwargs, False)
 
         # Update projector resolution from input-side fields
         new_pw = kwargs.get("projector_width", self.proj_w)
@@ -894,6 +902,10 @@ class ProMapAnythingPipeline(Pipeline):
         if self._streamer is not None and self._streamer.is_running:
             preview_np = (rgb.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
             self._streamer.submit_input_preview(preview_np)
+            # Also push depth to main projector stream (useful when no
+            # postprocessor is loaded — makes depth visible on the projector).
+            if not self._streamer._overlay_active:
+                self._streamer.submit_frame(preview_np)
 
         # -- Resize to match what Scope / the main pipeline expects -----------
         out_w = kwargs.get("width", None)
@@ -1387,7 +1399,11 @@ class ProMapAnythingPipeline(Pipeline):
                     rgb_np = (t.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
                     self._streamer.submit_calibration_frame(rgb_np)
 
-        # While calibrating, output current depth (or grey) to the AI model.
+        # -- Calibration already done, still toggled on — normal depth ---------
+        if start and self._calib_done:
+            return None
+
+        # While calibrating, output grey to the AI model.
         # The AI keeps generating — its output just won't reach the projector
         # because calibration_active=True suppresses normal streamer frames.
         out_w = kwargs.get("width", None)

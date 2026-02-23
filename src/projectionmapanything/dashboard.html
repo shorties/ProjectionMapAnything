@@ -148,6 +148,7 @@
         <span class="ctrl-label">Projector H</span>
         <input type="number" id="cal-proj-h" value="1080" min="240" max="4320" style="width:70px;" />
       </div>
+      <p style="color:#888;font-size:11px;margin:4px 0 6px;">Tip: Use F11 on the projector window — F11 fullscreen persists during calibration.</p>
       <div class="btn-row">
         <button class="btn btn-p" id="cal-start-btn" onclick="startCalibration()">Start Calibration</button>
         <button class="btn btn-s hidden" id="cal-stop-btn" onclick="stopCalibration()">Stop</button>
@@ -184,6 +185,11 @@
             Import .zip
             <input type="file" id="cal-import-file" accept=".zip" style="display:none;" onchange="importCalibration()" />
           </label>
+        </div>
+        <div class="btn-row" style="margin-top:4px;">
+          <button class="btn btn-p btn-sm" id="overlay-coverage-btn" onclick="projectOverlay('coverage_map')">Project Coverage</button>
+          <button class="btn btn-s btn-sm" id="overlay-warped-btn" onclick="projectOverlay('warped_camera')">Project Warped</button>
+          <button class="btn btn-s btn-sm hidden" id="overlay-off-btn" onclick="projectOverlay('off')">Stop Overlay</button>
         </div>
         <div class="hint" id="cal-transfer-status"></div>
       </div>
@@ -606,6 +612,21 @@ function stopCalibration() {
   document.getElementById('cal-start-btn').classList.remove('hidden');
   document.getElementById('cal-stop-btn').classList.add('hidden');
   calPolling = false;
+}
+
+function projectOverlay(name) {
+  fetch('/api/project-overlay', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({image: name})
+  }).then(r => r.json()).then(data => {
+    const offBtn = document.getElementById('overlay-off-btn');
+    if (name === 'off') {
+      offBtn.classList.add('hidden');
+    } else if (data.ok) {
+      offBtn.classList.remove('hidden');
+    }
+  }).catch(() => {});
 }
 
 function updateCalibUI(data) {
