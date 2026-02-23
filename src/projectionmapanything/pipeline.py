@@ -760,12 +760,6 @@ class ProMapAnythingPipeline(Pipeline):
 
         frame = video[0]  # (1, H, W, C) [0, 255]
 
-        # -- WebRTC projector toggle ------------------------------------------
-        if self._streamer is not None:
-            self._streamer.webrtc_projector = bool(
-                self._p("webrtc_projector", kwargs, False)
-            )
-
         # -- Reset calibration (rising edge) ----------------------------------
         reset_cal = self._p("reset_calibration", kwargs, False)
         if reset_cal and not self._reset_armed:

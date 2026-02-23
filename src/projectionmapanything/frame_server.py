@@ -168,7 +168,6 @@ const rtcStatusEl = document.getElementById('rtcStatus');
 let calibActive = false;
 let webrtcConnected = false;  // ICE connected
 let webrtcHasVideo = false;   // video element actually has frames
-let webrtcProjector = false;  // server-side toggle: force WebRTC on top
 let pc = null;           // RTCPeerConnection
 let rtcRetryTimer = null;
 let rtcHideTimer = null;
@@ -184,15 +183,6 @@ function setRtcStatus(cls, text) {
 }
 
 function updateLayers() {
-  if (webrtcProjector) {
-    // WebRTC override: force WebRTC on top, hide calibration and MJPEG entirely
-    webrtcEl.style.zIndex = '10';
-    mjpegEl.style.display = 'none';
-    calibCanvas.style.display = 'none';
-    return;
-  }
-  // Normal mode: ensure MJPEG is visible
-  mjpegEl.style.display = '';
   if (calibActive) {
     // Calibration: canvas on top (z-index 10), hide WebRTC/MJPEG battle
     mjpegEl.style.zIndex = '2';
@@ -558,18 +548,12 @@ function postConfig() {
 postConfig();
 setInterval(postConfig, 30000);
 
-// ---- MJPEG stall detection + WebRTC projector toggle via /status polling ----
+// ---- MJPEG stall detection via /status polling ----
+// If frame_age > 5s and WebRTC isn't active, reconnect the MJPEG stream.
 setInterval(() => {
   fetch('/status').then(r => r.json()).then(s => {
-    // MJPEG stall recovery
     if (s.frame_age_sec > 5 && !webrtcHasVideo) {
       mjpegEl.src = '/stream?t=' + Date.now();
-    }
-    // WebRTC projector override from preprocessor toggle
-    const flag = !!s.webrtc_projector;
-    if (flag !== webrtcProjector) {
-      webrtcProjector = flag;
-      updateLayers();
     }
   }).catch(() => {});
 }, 5000);
@@ -750,10 +734,6 @@ class FrameStreamer:
 
         # Calibration priority: when True, submit_frame() is suppressed
         self._calibration_active = False
-
-        # WebRTC projector override: when True, /projector page forces WebRTC
-        # layer on top, hiding MJPEG and calibration layers.
-        self.webrtc_projector = False
 
         # Overlay mode: project a static image (coverage map, etc.)
         # When True, submit_frame() is suppressed (like calibration_active).
@@ -1568,13 +1548,10 @@ class FrameStreamer:
                     reason = "calibration_active"
                 elif streamer._overlay_active:
                     reason = "overlay_active"
-                elif streamer.webrtc_projector:
-                    reason = "webrtc_projector"
                 status = {
                     "running": streamer._running,
                     "calibration_active": streamer._calibration_active,
                     "overlay_active": streamer._overlay_active,
-                    "webrtc_projector": streamer.webrtc_projector,
                     "stream_clients": streamer._stream_client_count,
                     "has_frame": streamer._frame_jpeg is not None,
                     "frame_age_sec": round(age, 1),
@@ -2143,8 +2120,6 @@ class FrameStreamer:
             else:
                 return
         if self._calibration_active:
-            return
-        if self.webrtc_projector:
             return
         # Skip encoding entirely when no one needs the frames:
         # no MJPEG stream clients AND dashboard preview is off.
