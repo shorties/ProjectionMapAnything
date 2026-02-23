@@ -924,9 +924,12 @@ class ProMapAnythingPipeline(Pipeline):
         if self._streamer is not None and self._streamer.is_running:
             preview_np = (rgb.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
             self._streamer.submit_input_preview(preview_np)
-            # Also push depth to main projector stream (useful when no
-            # postprocessor is loaded — makes depth visible on the projector).
-            if not getattr(self._streamer, "_overlay_active", False):
+            # Push depth to projector stream only when no postprocessor is
+            # loaded (otherwise the postprocessor handles projector output).
+            if (
+                not self._streamer.postprocessor_active
+                and not getattr(self._streamer, "_overlay_active", False)
+            ):
                 self._streamer.submit_frame(preview_np)
 
         # -- Resize to match what Scope / the main pipeline expects -----------
@@ -2129,6 +2132,9 @@ class ProMapAnythingProjectorPipeline(Pipeline):
         self.device = device or torch.device("cpu")
         port = kwargs.get("stream_port", 8765)
         self._streamer = get_or_create_streamer(port)
+        # Tell the preprocessor to stop pushing depth to the projector stream
+        if self._streamer is not None:
+            self._streamer.postprocessor_active = True
         logger.info("Projector postprocessor: streaming on port %d", port)
 
     def _get_projector_resolution(self) -> tuple[int, int] | None:

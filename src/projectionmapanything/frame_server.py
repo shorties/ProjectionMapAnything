@@ -761,6 +761,10 @@ class FrameStreamer:
         self._input_lock = threading.Lock()
         self._input_new_frame = threading.Event()
 
+        # When True, a postprocessor is actively submitting AI output frames.
+        # The preprocessor checks this to avoid pushing depth to the projector.
+        self.postprocessor_active = False
+
         # Subject isolation mask (shared between pre/postprocessor)
         self._isolation_mask: np.ndarray | None = None
 
