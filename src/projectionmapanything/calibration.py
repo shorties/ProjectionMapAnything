@@ -821,12 +821,55 @@ class CalibrationState:
         self.cam_w = w
         self.cam_h = h
 
-        # -- Compute disparity map (cam_x - proj_x) -------------------------
+        # -- Compute disparity map (homography residual) ----------------------
+        # Raw (cam_x - proj_x) is dominated by the planar projection
+        # relationship and produces a smooth gradient even for flat scenes.
+        # Instead, fit a homography (perspective transform) to the
+        # projector→camera mapping and use the RESIDUAL displacement as
+        # depth — closer objects deviate more from the planar model.
         px = np.arange(self.proj_w, dtype=np.float32)[None, :].repeat(
             self.proj_h, axis=0,
         )
+        py = np.arange(self.proj_h, dtype=np.float32)[:, None].repeat(
+            self.proj_w, axis=1,
+        )
+
+        src = np.column_stack([px[valid_proj], py[valid_proj]]).astype(np.float32)
+        dst = np.column_stack(
+            [map_x[valid_proj], map_y[valid_proj]],
+        ).astype(np.float32)
+
+        # Subsample for findHomography performance
+        rng = np.random.default_rng(42)
+        if len(src) > 10000:
+            idx = rng.choice(len(src), 10000, replace=False)
+            H, _ = cv2.findHomography(src[idx], dst[idx], cv2.RANSAC, 5.0)
+        elif len(src) > 4:
+            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        else:
+            H = None
+
         disparity = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-        disparity[valid_proj] = map_x[valid_proj] - px[valid_proj]
+
+        if H is not None:
+            # Apply homography to all projector pixels → predicted camera coords
+            pts = np.column_stack(
+                [px.ravel(), py.ravel()],
+            ).astype(np.float32).reshape(-1, 1, 2)
+            pred = cv2.perspectiveTransform(pts, H).reshape(
+                self.proj_h, self.proj_w, 2,
+            )
+            # Residual = actual - predicted correspondence
+            res_x = map_x - pred[:, :, 0]
+            res_y = map_y - pred[:, :, 1]
+            disp = np.sqrt(res_x ** 2 + res_y ** 2)
+            disp[~valid_proj] = 0.0
+            disparity = disp
+            logger.info("  Disparity: homography residual method (H found)")
+        else:
+            # Fallback: simple horizontal disparity
+            disparity[valid_proj] = map_x[valid_proj] - px[valid_proj]
+            logger.warning("  Disparity: homography fit failed — raw cam_x - proj_x")
 
         # Normalize to [0, 1] (near=bright, far=dark)
         valid_vals = disparity[valid_proj]
@@ -837,6 +880,10 @@ class CalibrationState:
                 disparity = (disparity - p2) / (p98 - p2)
             else:
                 disparity = np.full_like(disparity, 0.5)
+            logger.info(
+                "  Disparity normalize: p2=%.4f p98=%.4f spread=%.4f",
+                p2, p98, p98 - p2,
+            )
         disparity = np.clip(disparity, 0.0, 1.0).astype(np.float32)
 
         # Inpaint holes in disparity too

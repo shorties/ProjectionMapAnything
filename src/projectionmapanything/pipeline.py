@@ -1571,21 +1571,25 @@ class ProMapAnythingPipeline(Pipeline):
     def _disparity_depth(self) -> torch.Tensor:
         """Derive depth from calibration correspondence (cached).
 
-        Uses the disparity map from calibration if available, otherwise
-        computes depth from the correspondence maps using homography-
-        residual displacement: fits a perspective transform (homography)
-        to the projector→camera mapping, then uses residual magnitude
-        as depth-dependent parallax (closer objects deviate more from
-        the planar projection model).
+        Always uses homography-residual displacement: fits a perspective
+        transform to the projector→camera mapping, then uses residual
+        magnitude as depth — closer objects deviate more from the planar
+        projection model.
+
+        Falls back to the saved disparity map only if the correspondence
+        maps are not available.
         """
         if self._disparity_depth_cache is not None:
             return self._disparity_depth_cache
 
-        if self._disparity_map is not None:
+        if self._map_x is not None:
+            # Always recompute with homography residual — the saved
+            # disparity from calibration may use the same method now,
+            # but recomputing ensures consistency.
+            depth = self._compute_disparity_from_maps()
+        elif self._disparity_map is not None:
             depth = self._disparity_map.copy()
             logger.info("Using saved disparity map from calibration")
-        elif self._map_x is not None:
-            depth = self._compute_disparity_from_maps()
         else:
             depth = np.full(
                 (self.proj_h, self.proj_w), 0.5, dtype=np.float32,
